@@ -27,7 +27,7 @@ sudo apt-get install -y \
   make \
   python3-dev
 ```
-    *Note: `libjpeg-turbo8-dev` might be `libjpeg62-turbo-dev` or similar on older systems.*
+**Note:** `libjpeg-turbo8-dev` might be `libjpeg62-turbo-dev` or similar on older systems.
 
 2.  **Install via pip:**
 
@@ -206,7 +206,7 @@ A comprehensive example, `screen_to_browser.py`, is located in the `examples` di
 
 **To run this example:**
 
-    *Note: This example assumes you are on a Linux host with a running X11 session and will only work from localhost unless https is added.*
+**Note:** This example assumes you are on a Linux host with a running X11 session and will only work from localhost unless https is added.
 
 1.  Navigate to the `examples` directory within the repository:
     ```bash
