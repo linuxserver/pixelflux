@@ -35,9 +35,9 @@ sudo apt-get install -y \
 pip install pixelflux
 ```
 
-    This command will:
-    *   Build the native `screen_capture_module.so` (or similar) library using CMake during the installation process.
-    *   Install the Python wrapper and the compiled shared library.
+This command will:
+*   Build the native `screen_capture_module.so` (or similar) library using CMake during the installation process.
+*   Install the Python wrapper and the compiled shared library.
 
 **Note:** The current backend is designed and tested for **Linux/X11** environments. Future development aims to support a wider range of framebuffers and platforms.
 
