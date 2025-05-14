@@ -19,7 +19,7 @@ set(FC_COMMON_CMAKE_ARGS
 FetchContent_Declare(
     libyuv_dep
     GIT_REPOSITORY https://chromium.googlesource.com/libyuv/libyuv
-    GIT_TAG origin/stable 
+    GIT_TAG origin/main
     CMAKE_ARGS ${FC_COMMON_CMAKE_ARGS} -DBUILD_SHARED_LIBS=OFF -DTEST=OFF
     FETCHCONTENT_QUIET FALSE
 )
@@ -28,7 +28,7 @@ FetchContent_Declare(
 FetchContent_Declare(
     xxhash_dep
     GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
-    GIT_TAG v0.8.2
+    GIT_TAG v0.8.3
     SOURCE_SUBDIR cmake_unofficial 
     CMAKE_ARGS ${FC_COMMON_CMAKE_ARGS} -DBUILD_SHARED_LIBS=OFF -DXXHASH_BUILD_XXHSUM=OFF
     FETCHCONTENT_QUIET FALSE
@@ -37,22 +37,13 @@ FetchContent_MakeAvailable(libyuv_dep xxhash_dep)
 
 # --- Other (System Libraries) ---
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(X264 REQUIRED x264) # Tries to find libx264.pc
-if(NOT X264_FOUND)
-    message(FATAL_ERROR "System libx264 not found. Please install it (e.g., libx264-dev on Debian/Ubuntu, or x264-devel on Fedora/CentOS). Make sure libx264.pc is in your PKG_CONFIG_PATH.")
-else()
-    message(STATUS "Found system libx264: Headers=${X264_INCLUDE_DIRS}, Libraries=${X264_LIBRARIES}")
-endif()
+pkg_check_modules(X264 REQUIRED x264)
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(X11 REQUIRED) 
 find_package(Threads REQUIRED)
 find_package(JPEG REQUIRED) 
-if(NOT JPEG_FOUND)
-    message(FATAL_ERROR "System libjpeg not found. Please install it (e.g., libjpeg-dev, libjpeg-turbo-dev).")
-else()
-    message(STATUS "Found system libjpeg: Headers=${JPEG_INCLUDE_DIRS}, Libraries=${JPEG_LIBRARIES}")
-endif()
 
+# --- Output ---
 add_library(screen_capture_module SHARED
     screen_capture_module.cpp
 )
@@ -73,17 +64,6 @@ target_link_libraries(screen_capture_module PRIVATE
     ${X264_LIBRARIES}
     ${JPEG_LIBRARIES} 
 )
-
-# Fallback linking
-if(NOT TARGET Python3::Python AND DEFINED Python3_LIBRARIES)
-    target_link_libraries(screen_capture_module PRIVATE ${Python3_LIBRARIES})
-endif()
-if(NOT TARGET Threads::Threads AND DEFINED CMAKE_THREAD_LIBS_INIT)
-    target_link_libraries(screen_capture_module PRIVATE ${CMAKE_THREAD_LIBS_INIT})
-endif()
-if(NOT TARGET JPEG::JPEG AND NOT JPEG_LIBRARIES AND JPEG_LIBRARY)
-    target_link_libraries(screen_capture_module PRIVATE ${JPEG_LIBRARY})
-endif()
 
 # Output
 set_target_properties(screen_capture_module PROPERTIES
