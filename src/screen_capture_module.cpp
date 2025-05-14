@@ -487,7 +487,7 @@ class ScreenCaptureModule {
             N_processing_stripes = 0;
         } else {
             if (local_current_output_mode == OutputMode::H264) {
-                const int MIN_H264_STRIPE_HEIGHT_PX = 128;
+                const int MIN_H264_STRIPE_HEIGHT_PX = 64;
                 if (local_capture_height_actual < MIN_H264_STRIPE_HEIGHT_PX) {
                     N_processing_stripes = 1;
                 } else {

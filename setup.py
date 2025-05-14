@@ -49,9 +49,9 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pixelflux",
-    version="1.0.1",
+    version="1.0.2",
     author="Linuxserver.io",
-    author_email="ryankuba@gmail.com",
+    author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",
     long_description=long_description,
     long_description_content_type="text/markdown",
