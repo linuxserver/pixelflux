@@ -50,6 +50,7 @@ struct MinimalEncoderStore {
   std::vector < bool > initialized_flags;
   std::vector < int > initialized_widths;
   std::vector < int > initialized_heights;
+  std::vector < int > initialized_crfs;
   std::vector < bool > force_idr_flags;
   std::mutex store_mutex;
 
@@ -61,6 +62,7 @@ struct MinimalEncoderStore {
       initialized_flags.resize(new_size, false);
       initialized_widths.resize(new_size, 0);
       initialized_heights.resize(new_size, 0);
+      initialized_crfs.resize(new_size, -1);
       force_idr_flags.resize(new_size, false);
     }
   }
@@ -73,7 +75,6 @@ struct MinimalEncoderStore {
           encoders[i] = nullptr;
         }
         if (pics_in_ptrs[i]) {
-          // Add bounds check for safety in case vectors got cleared differently
           if (i < initialized_flags.size() && initialized_flags[i]) {
             x264_picture_clean(pics_in_ptrs[i]);
           }
@@ -81,12 +82,12 @@ struct MinimalEncoderStore {
           pics_in_ptrs[i] = nullptr;
         }
       }
-      // Clear all vectors to fully reset the state
       encoders.clear();
       pics_in_ptrs.clear();
       initialized_flags.clear();
       initialized_widths.clear();
       initialized_heights.clear();
+      initialized_crfs.clear();
       force_idr_flags.clear();
     }
 
@@ -329,13 +330,12 @@ class ScreenCaptureModule {
       local_current_output_mode = output_mode;
       local_current_h264_crf = h264_crf;
     }
-    // Ensure overall capture dimensions are even if encoding to H.264
     if (local_current_output_mode == OutputMode::H264) {
       if (local_capture_width_actual % 2 != 0) {
-        local_capture_width_actual--; // Shave 1px from the right
+        local_capture_width_actual--;
       }
       if (local_capture_height_actual % 2 != 0) {
-        local_capture_height_actual--; // Shave 1px from the bottom
+        local_capture_height_actual--;
       }
     }
     std::chrono::duration < double > target_frame_duration_seconds =
@@ -406,7 +406,7 @@ class ScreenCaptureModule {
 
     int num_cores = std::max(1, (int) std::thread::hardware_concurrency());
     std::cout << "CPU cores available: " << num_cores << std::endl;
-    int num_stripes = num_cores; //num_cores;
+    int num_stripes = num_cores;
 
     std::vector < uint64_t > previous_hashes(num_stripes, 0);
     std::vector < int > no_motion_frame_counts(num_stripes, 0);
@@ -456,10 +456,9 @@ class ScreenCaptureModule {
         local_current_h264_crf = h264_crf;
       }
 
-      // Ensure capture width is even when encoding H.264
       if (local_current_output_mode == OutputMode::H264) {
         if (local_capture_width_actual % 2 != 0) {
-          local_capture_width_actual--; // Shave 1px from the right if odd
+          local_capture_width_actual--;
         }
       }
 
@@ -473,9 +472,9 @@ class ScreenCaptureModule {
           for (int x = 0; x < local_capture_width_actual; ++x) {
             unsigned char * pixel_ptr =
               shm_data_ptr + (y * bytes_per_line_shm) + (x * bytes_per_pixel_shm);
-            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 0] = pixel_ptr[2]; // R
-            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 1] = pixel_ptr[1]; // G
-            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 2] = pixel_ptr[0]; // B
+            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 0] = pixel_ptr[2];
+            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 1] = pixel_ptr[1];
+            full_rgb_data[(y * local_capture_width_actual + x) * 3 + 2] = pixel_ptr[0];
           }
         }
 
@@ -493,14 +492,14 @@ class ScreenCaptureModule {
                 } else {
                     int max_stripes_by_min_height = local_capture_height_actual / MIN_H264_STRIPE_HEIGHT_PX;
                     N_processing_stripes = std::min(num_stripes, max_stripes_by_min_height);
-                    if (N_processing_stripes == 0) N_processing_stripes = 1; // Ensure at least one if height allows
+                    if (N_processing_stripes == 0) N_processing_stripes = 1;
                 }
-            } else { // JPEG
+            } else {
                 N_processing_stripes = std::min(num_stripes, local_capture_height_actual);
                 if (N_processing_stripes == 0 && local_capture_height_actual > 0) N_processing_stripes = 1;
             }
         }
-        if (N_processing_stripes == 0 && local_capture_height_actual > 0) { // Final safety
+        if (N_processing_stripes == 0 && local_capture_height_actual > 0) {
              N_processing_stripes = 1;
         }
 
@@ -539,24 +538,23 @@ class ScreenCaptureModule {
           int current_stripe_height = 0;
 
           if (local_current_output_mode == OutputMode::H264) {
-            // Check if a valid base height was calculated
             if (h264_base_even > 0) {
               if (i < h264_num_stripes_with_extra_pair) {
                 current_stripe_height = h264_base_even + 2;
               } else {
                 current_stripe_height = h264_base_even;
               }
-            } else { // h264_base_even is 0 or less
-                if (N_processing_stripes == 1) { // Special case: single stripe for entire (small) height
+            } else {
+                if (N_processing_stripes == 1) {
                     current_stripe_height = local_capture_height_actual;
-                    if (current_stripe_height % 2 != 0 && current_stripe_height > 0) { // Ensure even for H264
+                    if (current_stripe_height % 2 != 0 && current_stripe_height > 0) {
                         current_stripe_height--;
                     }
                 } else {
                     current_stripe_height = 0; 
                 }
             }
-          } else { // JPEG
+          } else {
             if (N_processing_stripes > 0) {
                 int base_stripe_height_jpeg = local_capture_height_actual / N_processing_stripes;
                 int remainder_height_jpeg = local_capture_height_actual % N_processing_stripes;
@@ -567,16 +565,14 @@ class ScreenCaptureModule {
             }
           }
 
-          if (local_current_output_mode == OutputMode::H264) { // For H264, current_y_offset is cumulative
+          if (local_current_output_mode == OutputMode::H264) {
             current_y_offset = start_y + current_stripe_height;
-          } // For JPEG, start_y is calculated independently, current_y_offset is not used for its start_y.
+          }
 
-          // Skip processing immediately if stripe height is zero or less
           if (current_stripe_height <= 0) {
             continue;
           }
 
-          // Calculate height to actually copy
           int effective_height_for_copy = std::min(current_stripe_height, local_capture_height_actual - start_y);
           if (effective_height_for_copy <= 0) {
             continue;
@@ -598,6 +594,7 @@ class ScreenCaptureModule {
 
           uint64_t current_hash = calculate_stripe_hash(stripe_rgb_data_for_hash_and_h264);
           bool send_this_stripe = false;
+          bool is_h264_idr_paintover_on_undamaged_this_stripe = false;
 
           if (current_hash == previous_hashes[i]) {
             no_motion_frame_counts[i]++;
@@ -609,8 +606,9 @@ class ScreenCaptureModule {
                   send_this_stripe = true;
                   last_paint_over_hashes[i] = current_hash;
                 }
-              } else { // H264 mode
+              } else {
                 send_this_stripe = true;
+                is_h264_idr_paintover_on_undamaged_this_stripe = true;
                 {
                   std::lock_guard < std::mutex > lock(g_h264_minimal_store.store_mutex);
                   if (i < static_cast < int > (g_h264_minimal_store.force_idr_flags.size())) {
@@ -656,7 +654,12 @@ class ScreenCaptureModule {
                 static_cast < int > (full_rgb_data.size()),
                 quality_to_use,
                 frame_counter));
-            } else { // H264 Mode
+            } else {
+              int crf_for_encode = local_current_h264_crf;
+              if (is_h264_idr_paintover_on_undamaged_this_stripe && local_current_h264_crf > 10) {
+                crf_for_encode = 10;
+              }
+
               std::packaged_task < StripeEncodeResult(int, int, int, int,
                   const unsigned char * , int, int) >
                 task(encode_stripe_h264);
@@ -665,7 +668,7 @@ class ScreenCaptureModule {
                 [task_moved = std::move(task), i, start_y, current_stripe_height,
                   local_capture_width_actual,
                   data_copy = stripe_rgb_data_for_hash_and_h264, fc = frame_counter,
-                  crf_val = local_current_h264_crf
+                  crf_val = crf_for_encode
                 ]
                 () mutable {
                   task_moved(i, start_y, current_stripe_height,
@@ -871,7 +874,7 @@ StripeEncodeResult encode_stripe_jpeg(int thread_id, int stripe_y_start, int str
 
   jpeg_finish_compress( & cinfo);
 
-  int padding_size = 4; // For frame_counter and stripe_y_start
+  int padding_size = 4;
   unsigned char * padded_jpeg_buffer = new unsigned char[jpeg_size_temp + padding_size];
   uint16_t frame_counter_net = htons(static_cast < uint16_t > (frame_counter % 65536));
   uint16_t stripe_y_start_net = htons(static_cast < uint16_t > (stripe_y_start));
@@ -889,7 +892,6 @@ StripeEncodeResult encode_stripe_jpeg(int thread_id, int stripe_y_start, int str
   return result;
 }
 
-// H.264 encoder
 StripeEncodeResult encode_stripe_h264(
   int thread_id,
   int stripe_y_start,
@@ -919,21 +921,34 @@ StripeEncodeResult encode_stripe_h264(
     result.type = StripeDataType::UNKNOWN;
     return result;
   }
-  // Ensure width and height are even for I420
+
   x264_t * current_encoder = nullptr;
   x264_picture_t * current_pic_in_ptr = nullptr;
   {
     std::lock_guard < std::mutex > lock(g_h264_minimal_store.store_mutex);
     g_h264_minimal_store.ensure_size(thread_id);
 
-    bool needs_reinit = false;
-    if (!g_h264_minimal_store.initialized_flags[thread_id]) {
-      needs_reinit = true;
-    } else if (g_h264_minimal_store.initialized_widths[thread_id] != capture_width_actual ||
-      g_h264_minimal_store.initialized_heights[thread_id] != stripe_height) {
+    bool is_first_initialization_for_thread = !g_h264_minimal_store.initialized_flags[thread_id];
+    bool dimensions_changed_for_thread = false;
+    if (!is_first_initialization_for_thread) {
+        dimensions_changed_for_thread = (g_h264_minimal_store.initialized_widths[thread_id] != capture_width_actual ||
+                                         g_h264_minimal_store.initialized_heights[thread_id] != stripe_height);
+    }
 
-      needs_reinit = true;
+    bool needs_crf10_paintover_specific_reinit = false;
+    if (g_h264_minimal_store.initialized_flags[thread_id] &&
+        !dimensions_changed_for_thread && /* Only consider if dimensions are stable */
+        g_h264_minimal_store.force_idr_flags[thread_id] &&
+        current_crf_setting == 10 &&
+        g_h264_minimal_store.initialized_crfs[thread_id] > 10) {
+        needs_crf10_paintover_specific_reinit = true;
+    }
 
+    bool perform_full_reinit = is_first_initialization_for_thread || dimensions_changed_for_thread || needs_crf10_paintover_specific_reinit;
+    bool allow_x264_info_logs = is_first_initialization_for_thread || dimensions_changed_for_thread;
+
+
+    if (perform_full_reinit) {
       if (g_h264_minimal_store.encoders[thread_id]) {
         x264_encoder_close(g_h264_minimal_store.encoders[thread_id]);
         g_h264_minimal_store.encoders[thread_id] = nullptr;
@@ -944,9 +959,7 @@ StripeEncodeResult encode_stripe_h264(
         g_h264_minimal_store.pics_in_ptrs[thread_id] = nullptr;
       }
       g_h264_minimal_store.initialized_flags[thread_id] = false;
-    }
 
-    if (needs_reinit) {
       x264_param_t param;
       if (x264_param_default_preset( & param, "ultrafast", "zerolatency") < 0) {
         std::cerr << "H264 T" << thread_id << ": x264_param_default_preset FAILED." << std::endl;
@@ -954,20 +967,26 @@ StripeEncodeResult encode_stripe_h264(
       } else {
         param.i_width = capture_width_actual;
         param.i_height = stripe_height;
-        param.i_csp = X264_CSP_I420; // Explicitly set, though default preset might do it.
+        param.i_csp = X264_CSP_I420;
         param.i_fps_num = 60;
         param.i_fps_den = 1;
         param.i_keyint_max = 12000;
-        param.rc.f_rf_constant = std::max(0, std::min(51, current_crf_setting)); // adjust for quality/bitrate.
+        param.rc.f_rf_constant = std::max(0, std::min(51, current_crf_setting));
         param.rc.i_rc_method = X264_RC_CRF;
-        param.b_repeat_headers = 1; // Crucial: Embed SPS/PPS with IDR frames.
-        param.b_annexb = 1; // NALUs are prefixed with 00 00 00 01 (or 00 00 01)
+        param.b_repeat_headers = 1;
+        param.b_annexb = 1;
         param.i_sync_lookahead = 0;
         param.i_bframe = 0;
         param.i_threads = 0;
 
-        if (x264_param_apply_profile( & param, "baseline") < 0) { // Baseline for broad compatibility
-          std::cerr << "H264 T" << thread_id << ": Failed to apply baseline profile (non-fatal)." << std::endl;
+        if (!allow_x264_info_logs) {
+            param.i_log_level = X264_LOG_ERROR; // Suppress x264's [info] logs
+        }
+
+        if (x264_param_apply_profile( & param, "baseline") < 0) {
+          if (allow_x264_info_logs) { // Only log our app's message if x264 would also log
+             std::cerr << "H264 T" << thread_id << ": Failed to apply baseline profile (non-fatal)." << std::endl;
+          }
         }
 
         g_h264_minimal_store.encoders[thread_id] = x264_encoder_open( & param);
@@ -994,10 +1013,24 @@ StripeEncodeResult encode_stripe_h264(
               g_h264_minimal_store.initialized_flags[thread_id] = true;
               g_h264_minimal_store.initialized_widths[thread_id] = param.i_width;
               g_h264_minimal_store.initialized_heights[thread_id] = param.i_height;
-              g_h264_minimal_store.force_idr_flags[thread_id] = true; // <<< SET FLAG: Force IDR for the next frame
+              g_h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
+              g_h264_minimal_store.force_idr_flags[thread_id] = true;
             }
           }
         }
+      }
+    } else if (g_h264_minimal_store.initialized_crfs[thread_id] != current_crf_setting) {
+      x264_t* encoder = g_h264_minimal_store.encoders[thread_id];
+      if (encoder) {
+          x264_param_t params_for_reconfig;
+          x264_encoder_parameters(encoder, &params_for_reconfig);
+          params_for_reconfig.rc.f_rf_constant = std::max(0, std::min(51, current_crf_setting));
+          if (x264_encoder_reconfig(encoder, &params_for_reconfig) == 0) {
+              g_h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
+          } else {
+              std::cerr << "H264 T" << thread_id << ": x264_encoder_reconfig for CRF FAILED. Encoder may use old CRF "
+                        << g_h264_minimal_store.initialized_crfs[thread_id] << " instead of " << current_crf_setting << "." << std::endl;
+          }
       }
     }
 
@@ -1022,13 +1055,11 @@ StripeEncodeResult encode_stripe_h264(
   }
 
   int src_stride_rgb24 = capture_width_actual * 3;
-  // libyuv::RAWToI420 expects B,G,R order for the "RAW" format.
-  // x264_picture_t.img.plane order for X264_CSP_I420: [0]=Y, [1]=U (Cb), [2]=V (Cr)
   int conversion_status = libyuv::RAWToI420(
-    stripe_rgb24_data, src_stride_rgb24, // BGR input
-    current_pic_in_ptr -> img.plane[0], current_pic_in_ptr -> img.i_stride[0], // Y
-    current_pic_in_ptr -> img.plane[1], current_pic_in_ptr -> img.i_stride[1], // U (Cb)
-    current_pic_in_ptr -> img.plane[2], current_pic_in_ptr -> img.i_stride[2], // V (Cr)
+    stripe_rgb24_data, src_stride_rgb24,
+    current_pic_in_ptr -> img.plane[0], current_pic_in_ptr -> img.i_stride[0],
+    current_pic_in_ptr -> img.plane[1], current_pic_in_ptr -> img.i_stride[1],
+    current_pic_in_ptr -> img.plane[2], current_pic_in_ptr -> img.i_stride[2],
     capture_width_actual, stripe_height);
 
   if (conversion_status != 0) {
@@ -1043,16 +1074,16 @@ StripeEncodeResult encode_stripe_h264(
   {
     std::lock_guard < std::mutex > lock(g_h264_minimal_store.store_mutex);
     if (g_h264_minimal_store.initialized_flags[thread_id] &&
-      thread_id < static_cast < int > (g_h264_minimal_store.force_idr_flags.size()) && // Bounds check for safety
+      thread_id < static_cast < int > (g_h264_minimal_store.force_idr_flags.size()) &&
       g_h264_minimal_store.force_idr_flags[thread_id]) {
       is_forcing_idr_this_call = true;
     }
   }
 
   if (is_forcing_idr_this_call) {
-    current_pic_in_ptr -> i_type = X264_TYPE_IDR; // Request an IDR frame
+    current_pic_in_ptr -> i_type = X264_TYPE_IDR;
   } else {
-    current_pic_in_ptr -> i_type = X264_TYPE_AUTO; // Let x264 decide
+    current_pic_in_ptr -> i_type = X264_TYPE_AUTO;
   }
 
   x264_nal_t * nals = nullptr;
@@ -1069,25 +1100,22 @@ StripeEncodeResult encode_stripe_h264(
   }
 
   if (frame_size > 0) {
-    // If we forced an IDR, and it was successful, clear the flag.
     if (is_forcing_idr_this_call) {
       if (pic_out.b_keyframe && pic_out.i_type == X264_TYPE_IDR) {
         std::lock_guard < std::mutex > lock(g_h264_minimal_store.store_mutex);
-        if (thread_id < static_cast < int > (g_h264_minimal_store.force_idr_flags.size())) { // Bounds check
+        if (thread_id < static_cast < int > (g_h264_minimal_store.force_idr_flags.size())) {
           g_h264_minimal_store.force_idr_flags[thread_id] = false;
         }
       }
     }
 
     const unsigned char DATA_TYPE_H264_STRIPED = 0x04;
-    unsigned char current_frame_type_for_header = 0x00; // Default: P-frame / non-IDR
+    unsigned char current_frame_type_for_header = 0x00;
 
-    // For the header, 0x01 means keyframe with SPS/PPS (i.e., an IDR frame because b_repeat_headers=1)
     if (pic_out.i_type == X264_TYPE_IDR) {
-      current_frame_type_for_header = 0x01; // IDR Keyframe
+      current_frame_type_for_header = 0x01;
     }
 
-    // Header: dataType(1) + frameType(1) + frameID(2) + stripeYStart(2) + stripeWidth(2) + stripeHeight(2)
     int full_header_size = 10;
     int total_output_size = frame_size + full_header_size;
 
@@ -1115,8 +1143,6 @@ StripeEncodeResult encode_stripe_h264(
     unsigned char * p_current_nal_copy_target = p_payload_destination;
 
     for (int k = 0; k < i_nals; ++k) {
-      // nals[k].p_payload already includes the Annex B start code (00 00 01 or 00 00 00 01)
-      // because param.b_annexb = 1 was set.
       if ((p_current_nal_copy_target - p_payload_destination + nals[k].i_payload) <= frame_size) {
         std::memcpy(p_current_nal_copy_target, nals[k].p_payload, nals[k].i_payload);
         p_current_nal_copy_target += nals[k].i_payload;
@@ -1131,8 +1157,6 @@ StripeEncodeResult encode_stripe_h264(
     }
     result.size = total_output_size;
   } else {
-    // No output NALs from encoder for this frame (e.g. due to B-frame delay, but B-frames are off)
-    // Or if forcing IDR and it couldn't produce one immediately.
     result.data = nullptr;
     result.size = 0;
   }
