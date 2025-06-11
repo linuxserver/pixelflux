@@ -168,7 +168,8 @@ struct CaptureSettings {
   int damage_block_duration;
   OutputMode output_mode;
   int h264_crf;
-  bool h264_fullcolor; // true for 444 full range, false for 420 limited range
+  bool h264_fullcolor;
+  bool h264_fullframe;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -188,7 +189,9 @@ struct CaptureSettings {
       damage_block_duration(30),
       output_mode(OutputMode::JPEG),
       h264_crf(25),
-      h264_fullcolor(false) {} // Default to 420 limited range
+      h264_fullcolor(false),
+      h264_fullframe(false) {}
+
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -197,7 +200,7 @@ struct CaptureSettings {
   CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
                   OutputMode om = OutputMode::JPEG, int crf = 25,
-                  bool h264_fc = false)
+                  bool h264_fc = false, bool h264_ff = false)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -211,7 +214,8 @@ struct CaptureSettings {
       damage_block_duration(dbd),
       output_mode(om),
       h264_crf(crf),
-      h264_fullcolor(h264_fc) {}
+      h264_fullcolor(h264_fc),
+      h264_fullframe(h264_ff) {}
 };
 
 /**
@@ -407,6 +411,7 @@ public:
   int damage_block_duration = 30;
   int h264_crf = 25;
   bool h264_fullcolor = false;
+  bool h264_fullframe = false;
   OutputMode output_mode = OutputMode::H264;
 
   // Control and state variables
@@ -483,6 +488,7 @@ public:
     output_mode = new_settings.output_mode;
     h264_crf = new_settings.h264_crf;
     h264_fullcolor = new_settings.h264_fullcolor;
+    h264_fullframe = new_settings.h264_fullframe;
   }
 
   /**
@@ -497,7 +503,7 @@ public:
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
-      h264_fullcolor);
+      h264_fullcolor, h264_fullframe);
   }
 
 private:
@@ -525,6 +531,7 @@ private:
     int local_current_damage_block_duration;
     int local_current_h264_crf;
     bool local_current_h264_fullcolor;
+    bool local_current_h264_fullframe;
     OutputMode local_current_output_mode;
 
     // Initial settings load from shared members
@@ -544,6 +551,7 @@ private:
       local_current_output_mode = output_mode;
       local_current_h264_crf = h264_crf;
       local_current_h264_fullcolor = h264_fullcolor;
+      local_current_h264_fullframe = h264_fullframe;
     }
 
     // Ensure dimensions are even for H.264 if it's the selected output mode
@@ -691,6 +699,7 @@ private:
         local_current_output_mode = output_mode;
         local_current_h264_crf = h264_crf;
         local_current_h264_fullcolor = h264_fullcolor;
+        local_current_h264_fullframe = h264_fullframe;
       }
 
       // Adjust dimensions for H.264 if mode or dimensions changed
@@ -778,15 +787,19 @@ private:
           N_processing_stripes = 0;
         } else {
           if (local_current_output_mode == OutputMode::H264) {
-            const int MIN_H264_STRIPE_HEIGHT_PX = 16; // Min height for H.264 blocks
-            if (local_capture_height_actual < MIN_H264_STRIPE_HEIGHT_PX) {
+            if (local_current_h264_fullframe) {
               N_processing_stripes = 1;
             } else {
-              int max_stripes_by_min_height =
-                local_capture_height_actual / MIN_H264_STRIPE_HEIGHT_PX;
-              N_processing_stripes =
-                std::min(num_stripes_config, max_stripes_by_min_height);
-              if (N_processing_stripes == 0) N_processing_stripes = 1;
+              const int MIN_H264_STRIPE_HEIGHT_PX = 64;
+              if (local_capture_height_actual < MIN_H264_STRIPE_HEIGHT_PX) {
+                N_processing_stripes = 1;
+              } else {
+                int max_stripes_by_min_height =
+                  local_capture_height_actual / MIN_H264_STRIPE_HEIGHT_PX;
+                N_processing_stripes =
+                  std::min(num_stripes_config, max_stripes_by_min_height);
+                if (N_processing_stripes == 0) N_processing_stripes = 1;
+              }
             }
           } else { // JPEG mode
             N_processing_stripes =
@@ -1095,8 +1108,9 @@ private:
                     << local_capture_height_actual
                     << " Mode: " << (local_current_output_mode == OutputMode::JPEG ? "JPEG" : "H264")
                     << (local_current_output_mode == OutputMode::H264
-                        ? (local_current_h264_fullcolor ? " CS:444 FR" : " CS:420 LR")
-                        : "")
+                        ? (std::string(local_current_h264_fullcolor ? " CS:444 FR" : " CS:420 LR") +
+                           (local_current_h264_fullframe ? " FF" : ""))
+                        : std::string(""))
                     << " Stripes: " << N_processing_stripes
                     << (local_current_output_mode == OutputMode::H264
                         ? " CRF:" + std::to_string(local_current_h264_crf)
@@ -1475,7 +1489,7 @@ StripeEncodeResult encode_stripe_h264(
 
       // Initialize x264 parameters
       x264_param_t param;
-      if (x264_param_default_preset(&param, "ultrafast", "zerolatency") < 0) {
+      if (x264_param_default_preset(&param, "veryfast", "zerolatency") < 0) {
         std::cerr << "H264 T" << thread_id 
                   << ": x264_param_default_preset FAILED." << std::endl;
         result.type = StripeDataType::UNKNOWN; 
@@ -1492,9 +1506,15 @@ StripeEncodeResult encode_stripe_h264(
         param.b_annexb = 1;         // Output Annex B NAL units
         param.i_sync_lookahead = 0; // Required by zerolatency
         param.i_bframe = 0;         // No B-frames for low latency
-        param.i_threads = 1;        // Each stripe encoder runs in its own thread context
+        param.i_threads = -1;
         param.i_log_level = log_x264_info ? X264_LOG_INFO : X264_LOG_ERROR;
-        param.vui.b_fullrange = use_full_range ? 1 : 0; 
+        param.vui.b_fullrange = use_full_range ? 1 : 0;
+        param.vui.i_sar_width = 1;   // Assuming 1:1 SAR for screen content
+        param.vui.i_sar_height = 1;
+        param.vui.i_colorprim = 1;
+        param.vui.i_transfer = 13;   // sRGB transfer characteristics
+        param.vui.i_colmatrix = 1;   // BT.709 matrix (common for sRGB-like content) 
+        param.b_aud = 1;
 
         // Apply profile based on colorspace
         if (param.i_csp == X264_CSP_I444) {
