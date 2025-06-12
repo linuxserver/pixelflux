@@ -1489,7 +1489,7 @@ StripeEncodeResult encode_stripe_h264(
 
       // Initialize x264 parameters
       x264_param_t param;
-      if (x264_param_default_preset(&param, "veryfast", "zerolatency") < 0) {
+      if (x264_param_default_preset(&param, "ultrafast", "zerolatency") < 0) {
         std::cerr << "H264 T" << thread_id 
                   << ": x264_param_default_preset FAILED." << std::endl;
         result.type = StripeDataType::UNKNOWN; 
