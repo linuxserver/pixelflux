@@ -181,10 +181,11 @@ async def main_async_routine():
     g_capture_settings.output_mode = 1 # 1 for H.264
     g_capture_settings.h264_crf = 25
     g_capture_settings.use_paint_over_quality = True 
-    g_capture_settings.paint_over_trigger_frames = 2 
+    g_capture_settings.paint_over_trigger_frames = 5 
     g_capture_settings.damage_block_threshold = 15   
     g_capture_settings.damage_block_duration = 30
-    g_capture_settings.h264_fullcolor = True
+    g_capture_settings.h264_fullcolor = False
+    g_capture_settings.h264_fullframe = False
     # --- End Capture Configuration ---
 
     g_stripe_callback = StripeCallback(py_stripe_callback)
