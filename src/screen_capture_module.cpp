@@ -675,9 +675,9 @@ private:
         }
     }
 
-    std::chrono::duration<double> target_frame_duration_seconds =
-      std::chrono::duration<double>(1.0 / (local_current_target_fps < 1.0 ?
-                                    30.0 : local_current_target_fps));
+    std::chrono::duration < double > target_frame_duration_seconds =
+      std::chrono::duration < double > (1.0 / local_current_target_fps);
+
     auto next_frame_time =
       std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
 
@@ -792,9 +792,7 @@ private:
 
         if (local_current_target_fps != target_fps) {
           local_current_target_fps = target_fps;
-          target_frame_duration_seconds =
-            std::chrono::duration<double>(1.0 / (local_current_target_fps < 1.0 ?
-                                          30.0 : local_current_target_fps));
+          target_frame_duration_seconds = std::chrono::duration < double > (1.0 / local_current_target_fps);
           next_frame_time = intended_current_frame_time + target_frame_duration_seconds;
         }
         local_current_jpeg_quality = jpeg_quality;
@@ -1185,10 +1183,10 @@ private:
                   if (local_current_damage_block_threshold > 0 &&
                       consecutive_stripe_changes[i] >=
                           local_current_damage_block_threshold) {
-                      stripe_is_in_damage_block[i] = true;
-                      stripe_damage_block_frames_remaining[i] =
-                          local_current_damage_block_duration;
-                      stripe_hash_at_damage_block_start[i] = current_hash;
+                      //stripe_is_in_damage_block[i] = true;
+                      //stripe_damage_block_frames_remaining[i] =
+                      //    local_current_damage_block_duration;
+                      //stripe_hash_at_damage_block_start[i] = current_hash;
                   }
                   if (local_current_output_mode == OutputMode::JPEG) {
                       current_jpeg_qualities[i] =
