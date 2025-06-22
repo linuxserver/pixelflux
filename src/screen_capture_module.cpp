@@ -947,40 +947,9 @@ private:
             int cursor_width = cursor_image->width;
             int cursor_height = cursor_image->height;
 
-            // Overlay cursor_image->pixels onto the frame
-            for (int y = 0; y < cursor_height; ++y) {
-              for (int x = 0; x < cursor_width; ++x) {
-                uint32_t src_pixel = cursor_image->pixels[y * cursor_width + x];
-                uint8_t alpha = (src_pixel >> 24) & 0xFF;
-                uint8_t red = (src_pixel >> 16) & 0xFF;
-                uint8_t green = (src_pixel >> 8) & 0xFF;
-                uint8_t blue = src_pixel & 0xFF;
-
-                int target_x = cursor_x + x;
-                int target_y = cursor_y + y;
-
-                if (target_y >= 0 && target_y < local_capture_height_actual &&
-                    target_x >= 0 && target_x < local_capture_width_actual) {
-
-                  unsigned char *dst_pixel = shm_data_ptr +
-                                             target_y * shm_stride_bytes +
-                                             target_x * shm_bytes_per_pixel;
-
-                  if (alpha == 255) {
-                    // Fully opaque, just copy
-                    dst_pixel[0] = blue;
-                    dst_pixel[1] = green;
-                    dst_pixel[2] = red;
-                  } else if (alpha > 0) {
-                    // Blend with existing pixel
-                    dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255; // Blue
-                    dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255; // Green
-                    dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255; // Red
-                  }
-                  // Else, we do nothing with the fully transparent pixel
-                }
-              }
-            }
+            overlay_image(cursor_height, cursor_width, cursor_image->pixels, cursor_x, cursor_y, 
+                          local_capture_height_actual, local_capture_width_actual, 
+                          shm_data_ptr, shm_stride_bytes, shm_bytes_per_pixel);
 
             XFree(cursor_image);
           }
@@ -1459,6 +1428,71 @@ private:
         display = nullptr;
     }
     std::cout << "Capture loop stopped. X resources released." << std::endl;
+  }
+
+  /**
+   * @brief Overlays a 32-bit ARGB image onto a BGR(X) frame buffer with alpha blending support.
+   *
+   * This function takes a source image in 32-bit ARGB format and overlays it at a specified
+   * position (image_x, image_y) onto a destination frame buffer that is assumed to be in
+   * BGR or BGRX format. It supports transparency via the alpha channel:
+   * - Fully opaque pixels are copied directly.
+   * - Partially transparent pixels are blended with the existing pixel color.
+   * - Fully transparent pixels are skipped.
+   *
+   * @param image_height Height of the source image in pixels.
+   * @param image_width Width of the source image in pixels.
+   * @param image_ptr Pointer to the source image data in 32-bit ARGB format.
+   *                  Pixels are stored as uint32_t values: (A << 24) | (R << 16) | (G << 8) | B
+   * @param image_x X-coordinate (left) where the image should be placed on the frame.
+   * @param image_y Y-coordinate (top) where the image should be placed on the frame.
+   * @param frame_height Total height of the destination frame buffer in pixels.
+   * @param frame_width Total width of the destination frame buffer in pixels.
+   * @param frame_ptr Pointer to the destination frame buffer in BGR or BGRX format.
+   *                  Each pixel is represented by 3 or 4 bytes per pixel respectively.
+   * @param frame_stride_bytes Number of bytes per row in the destination frame buffer.
+   * @param frame_bytes_per_pixel Number of bytes used to represent a single pixel in the frame buffer.
+   *                              Expected value is 3 (BGR) or 4 (BGRX).
+   */
+  void overlay_image(int image_height, int image_width, unsigned long *image_ptr, 
+                     int image_x, int image_y, int frame_height, int frame_width, 
+                     unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel) {
+    for (int y = 0; y < image_height; ++y) {
+      for (int x = 0; x < image_width; ++x) {
+        uint32_t src_pixel = image_ptr[y * image_width + x];
+        uint8_t alpha = (src_pixel >> 24) & 0xFF;
+        uint8_t red = (src_pixel >> 16) & 0xFF;
+        uint8_t green = (src_pixel >> 8) & 0xFF;
+        uint8_t blue = src_pixel & 0xFF;
+
+        int target_x = image_x + x;
+        int target_y = image_y + y;
+
+        if (target_y >= 0 && target_y < frame_height &&
+            target_x >= 0 && target_x < frame_width) {
+
+          unsigned char *dst_pixel = frame_ptr +
+                                      target_y * frame_stride_bytes +
+                                      target_x * frame_bytes_per_pixel;
+
+          if (alpha == 255)
+          {
+            // Fully opaque, just copy
+            dst_pixel[0] = blue;
+            dst_pixel[1] = green;
+            dst_pixel[2] = red;
+          }
+          else if (alpha > 0)
+          {
+            // Blend with existing pixel
+            dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255;  // Blue
+            dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255; // Green
+            dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255;   // Red
+          }
+          // Else, we do nothing with the fully transparent pixel
+        }
+      }
+    }
   }
 };
 
