@@ -22,10 +22,13 @@ sudo apt-get install -y \
   gcc \
   libjpeg-turbo8-dev \
   libx11-dev \
+  libxfixes-dev \
   libxext-dev \
   libx264-dev \
   make \
-  python3-dev
+  python3-dev \
+  python3-pip \
+  python3-websockets
 ```
 **Note:** `libjpeg-turbo8-dev` might be `libjpeg62-turbo-dev` or similar on older systems.
 
@@ -144,6 +147,9 @@ class CaptureSettings(ctypes.Structure):
         ("damage_block_duration", ctypes.c_int),    # Frames a stripe stays "damaged" (affects paint-over logic)
         ("output_mode", ctypes.c_int),              # 0 for JPEG, 1 for H264
         ("h264_crf", ctypes.c_int),                 # (H264 mode) CRF value (0-51, lower is better quality/higher bitrate)
+        ("h264_fullcolor", ctypes.c_bool),          # Enable H.264 full color (I444)
+        ("h264_fullframe", ctypes.c_bool),          # Enable H.264 full frame encoding
+        ("capture_cursor", ctypes.c_bool),          # Enable cursor capture
     ]
 ```
 

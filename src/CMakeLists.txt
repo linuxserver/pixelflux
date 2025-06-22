@@ -41,7 +41,8 @@ pkg_check_modules(X264 REQUIRED x264)
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(X11 REQUIRED) 
 find_package(Threads REQUIRED)
-find_package(JPEG REQUIRED) 
+find_package(JPEG REQUIRED)
+find_library(XFIXES_LIB Xfixes REQUIRED)
 
 # --- Output ---
 add_library(screen_capture_module SHARED
@@ -63,6 +64,7 @@ target_link_libraries(screen_capture_module PRIVATE
     xxhash   
     ${X264_LIBRARIES}
     ${JPEG_LIBRARIES} 
+    ${XFIXES_LIB}
 )
 
 # Output

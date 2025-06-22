@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <X11/Xlib.h>
 #include <X11/extensions/XShm.h>
+#include <X11/extensions/Xfixes.h>
 #include <X11/Xutil.h>
 #include <jpeglib.h>
 #include <netinet/in.h>
@@ -169,6 +170,7 @@ struct CaptureSettings {
   int h264_crf;
   bool h264_fullcolor;
   bool h264_fullframe;
+  bool capture_cursor;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -189,7 +191,8 @@ struct CaptureSettings {
       output_mode(OutputMode::JPEG),
       h264_crf(25),
       h264_fullcolor(false),
-      h264_fullframe(false) {}
+      h264_fullframe(false),
+      capture_cursor(false) {}
 
 
   /**
@@ -210,11 +213,13 @@ struct CaptureSettings {
    * @param crf H.264 Constant Rate Factor.
    * @param h264_fc H.264 full color (I444) flag.
    * @param h264_ff H.264 full frame encoding flag.
+   * @param capture_cursor Capture cursor flag.
    */
   CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
                   OutputMode om = OutputMode::JPEG, int crf = 25,
-                  bool h264_fc = false, bool h264_ff = false)
+                  bool h264_fc = false, bool h264_ff = false,
+                  bool capture_cursor = false)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -229,7 +234,8 @@ struct CaptureSettings {
       output_mode(om),
       h264_crf(crf),
       h264_fullcolor(h264_fc),
-      h264_fullframe(h264_ff) {}
+      h264_fullframe(h264_ff),
+      capture_cursor(capture_cursor) {}
 };
 
 /**
@@ -473,6 +479,7 @@ public:
   int h264_crf = 25;
   bool h264_fullcolor = false;
   bool h264_fullframe = false;
+  bool capture_cursor = false;
   OutputMode output_mode = OutputMode::H264;
 
   std::atomic<bool> stop_requested;
@@ -566,6 +573,7 @@ public:
     h264_crf = new_settings.h264_crf;
     h264_fullcolor = new_settings.h264_fullcolor;
     h264_fullframe = new_settings.h264_fullframe;
+    capture_cursor = new_settings.capture_cursor;
   }
 
   /**
@@ -581,7 +589,7 @@ public:
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
-      h264_fullcolor, h264_fullframe);
+      h264_fullcolor, h264_fullframe, capture_cursor);
   }
 
 private:
@@ -620,6 +628,9 @@ private:
     bool local_current_h264_fullcolor;
     bool local_current_h264_fullframe;
     OutputMode local_current_output_mode;
+    bool local_current_capture_cursor;
+    int xfixes_event_base = 0;
+    int xfixes_error_base = 0;
 
     {
       std::lock_guard<std::mutex> lock(settings_mutex);
@@ -638,6 +649,7 @@ private:
       local_current_h264_crf = h264_crf;
       local_current_h264_fullcolor = h264_fullcolor;
       local_current_h264_fullframe = h264_fullframe;
+      local_current_capture_cursor = capture_cursor;
     }
 
     if (local_current_output_mode == OutputMode::H264) {
@@ -697,6 +709,16 @@ private:
       return;
     }
     std::cout << "X Shared Memory Extension available." << std::endl;
+
+    if (local_current_capture_cursor) {
+      if (!XFixesQueryExtension(display, &xfixes_event_base, &xfixes_error_base)) {
+        std::cerr << "Error: XFixes extension not available!" << std::endl;
+        XCloseDisplay(display);
+        return;
+      }
+
+      std::cout << "XFixes Extension available." << std::endl;
+    }
 
     XShmSegmentInfo shminfo;
     memset(&shminfo, 0, sizeof(shminfo));
@@ -810,6 +832,7 @@ private:
         local_current_h264_crf = h264_crf;
         local_current_h264_fullcolor = h264_fullcolor;
         local_current_h264_fullframe = h264_fullframe;
+        local_current_capture_cursor = capture_cursor;
       }
 
       if (local_current_output_mode == OutputMode::H264) {
@@ -914,6 +937,54 @@ private:
         unsigned char* shm_data_ptr = (unsigned char*)shm_image->data;
         int shm_stride_bytes = shm_image->bytes_per_line;
         int shm_bytes_per_pixel = shm_image->bits_per_pixel / 8;
+
+        if (local_current_capture_cursor) {
+          // Get cursor image and position
+          XFixesCursorImage *cursor_image = XFixesGetCursorImage(display);
+          if (cursor_image) {
+            int cursor_x = cursor_image->x;
+            int cursor_y = cursor_image->y;
+            int cursor_width = cursor_image->width;
+            int cursor_height = cursor_image->height;
+
+            // Overlay cursor_image->pixels onto the frame
+            for (int y = 0; y < cursor_height; ++y) {
+              for (int x = 0; x < cursor_width; ++x) {
+                uint32_t src_pixel = cursor_image->pixels[y * cursor_width + x];
+                uint8_t alpha = (src_pixel >> 24) & 0xFF;
+                uint8_t red = (src_pixel >> 16) & 0xFF;
+                uint8_t green = (src_pixel >> 8) & 0xFF;
+                uint8_t blue = src_pixel & 0xFF;
+
+                int target_x = cursor_x + x;
+                int target_y = cursor_y + y;
+
+                if (target_y >= 0 && target_y < local_capture_height_actual &&
+                    target_x >= 0 && target_x < local_capture_width_actual) {
+
+                  unsigned char *dst_pixel = shm_data_ptr +
+                                             target_y * shm_stride_bytes +
+                                             target_x * shm_bytes_per_pixel;
+
+                  if (alpha == 255) {
+                    // Fully opaque, just copy
+                    dst_pixel[0] = blue;
+                    dst_pixel[1] = green;
+                    dst_pixel[2] = red;
+                  } else if (alpha > 0) {
+                    // Blend with existing pixel
+                    dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255; // Blue
+                    dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255; // Green
+                    dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255; // Red
+                  }
+                  // Else, we do nothing with the fully transparent pixel
+                }
+              }
+            }
+
+            XFree(cursor_image);
+          }
+        }
 
         if (local_current_output_mode == OutputMode::H264) {
             if (this->yuv_planes_are_i444_) {
