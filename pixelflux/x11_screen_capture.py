@@ -18,6 +18,7 @@ class CaptureSettings(ctypes.Structure):
         ("h264_crf", ctypes.c_int),
         ("h264_fullcolor", ctypes.c_bool),
         ("h264_fullframe", ctypes.c_bool),
+        ("capture_cursor", ctypes.c_bool),
     ]
 
 class StripeEncodeResult(ctypes.Structure):
