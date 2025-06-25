@@ -186,7 +186,9 @@ async def main_async_routine():
     g_capture_settings.damage_block_duration = 30
     g_capture_settings.h264_fullcolor = False
     g_capture_settings.h264_fullframe = False
-    g_capture_settings.capture_cursor = True
+    g_capture_settings.capture_cursor = False
+    #g_capture_settings.watermark_path = b"/full/path/to/image.png"
+    #g_capture_settings.watermark_location_enum = 6
     # --- End Capture Configuration ---
 
     g_stripe_callback = StripeCallback(py_stripe_callback)

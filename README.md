@@ -150,7 +150,16 @@ class CaptureSettings(ctypes.Structure):
         ("h264_fullcolor", ctypes.c_bool),          # Enable H.264 full color (I444)
         ("h264_fullframe", ctypes.c_bool),          # Enable H.264 full frame encoding
         ("capture_cursor", ctypes.c_bool),          # Enable cursor capture
+        ("watermark_path", ctypes.c_char_p),        # Absolute path to watermark PNG file
+        ("watermark_location_enum", ctypes.c_int),  # 0-6 for values table below 
     ]
+WATERMARK_LOCATION_NONE = 0
+WATERMARK_LOCATION_TL = 1 # Top Left
+WATERMARK_LOCATION_TR = 2 # Top Right
+WATERMARK_LOCATION_BL = 3 # Bottom Left
+WATERMARK_LOCATION_BR = 4 # Bottom Right
+WATERMARK_LOCATION_MI = 5 # Middle
+WATERMARK_LOCATION_AN = 6 # Animated bounces around
 ```
 
 Adjust these settings to fine-tune capture performance and quality.

@@ -45,6 +45,13 @@
 #include <libyuv/convert_from_argb.h>
 #include <libyuv/planar_functions.h>
 #include <x264.h>
+#include <string>
+#include <cmath>
+#ifndef STB_IMAGE_IMPLEMENTATION_DEFINED
+#define STB_IMAGE_IMPLEMENTATION_DEFINED
+#define STB_IMAGE_IMPLEMENTATION
+#endif
+#include "stb_image.h"
 
 /**
  * @brief Manages a pool of H.264 encoders and associated picture buffers.
@@ -150,6 +157,13 @@ enum class StripeDataType {
 };
 
 /**
+ * @brief Enumerates the watermark location identifiers
+ */
+enum class WatermarkLocation {
+  NONE = 0, TL = 1, TR = 2, BL = 3, BR = 4, MI = 5, AN = 6
+};
+
+/**
  * @brief Holds settings for screen capture and encoding.
  * This struct aggregates all configurable parameters for the capture process,
  * including dimensions, frame rate, quality settings, and output mode.
@@ -171,6 +185,8 @@ struct CaptureSettings {
   bool h264_fullcolor;
   bool h264_fullframe;
   bool capture_cursor;
+  const char* watermark_path;
+  WatermarkLocation watermark_location_enum;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -192,7 +208,9 @@ struct CaptureSettings {
       h264_crf(25),
       h264_fullcolor(false),
       h264_fullframe(false),
-      capture_cursor(false) {}
+      capture_cursor(false),
+      watermark_path(nullptr),
+      watermark_location_enum(WatermarkLocation::NONE) {}
 
 
   /**
@@ -219,7 +237,9 @@ struct CaptureSettings {
                   int pojq, bool upoq, int potf, int dbt, int dbd,
                   OutputMode om = OutputMode::JPEG, int crf = 25,
                   bool h264_fc = false, bool h264_ff = false,
-                  bool capture_cursor = false)
+                  bool capture_cursor = false,
+                  const char* wm_path = nullptr,
+                  WatermarkLocation wm_loc = WatermarkLocation::NONE)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -235,7 +255,9 @@ struct CaptureSettings {
       h264_crf(crf),
       h264_fullcolor(h264_fc),
       h264_fullframe(h264_ff),
-      capture_cursor(capture_cursor) {}
+      capture_cursor(capture_cursor),
+      watermark_path(wm_path),
+      watermark_location_enum(wm_loc) {}
 };
 
 /**
@@ -481,6 +503,8 @@ public:
   bool h264_fullframe = false;
   bool capture_cursor = false;
   OutputMode output_mode = OutputMode::H264;
+  std::string watermark_path_internal;
+  WatermarkLocation watermark_location_internal;
 
   std::atomic<bool> stop_requested;
   std::thread capture_thread;
@@ -499,6 +523,15 @@ private:
     int full_frame_u_stride_;
     int full_frame_v_stride_;
     bool yuv_planes_are_i444_;
+    std::vector<uint32_t> watermark_image_data_;
+    int watermark_width_;
+    int watermark_height_;
+    bool watermark_loaded_;
+    int watermark_current_x_;
+    int watermark_current_y_;
+    int watermark_dx_;
+    int watermark_dy_;
+    mutable std::mutex watermark_data_mutex_;
 
 public:
   /**
@@ -507,7 +540,16 @@ public:
    */
   ScreenCaptureModule() : stop_requested(false),
                           full_frame_y_stride_(0), full_frame_u_stride_(0), full_frame_v_stride_(0),
-                          yuv_planes_are_i444_(false) {}
+                          yuv_planes_are_i444_(false),
+                          watermark_path_internal(""),
+                          watermark_location_internal(WatermarkLocation::NONE),
+                          watermark_width_(0),
+                          watermark_height_(0),
+                          watermark_loaded_(false),
+                          watermark_current_x_(0),
+                          watermark_current_y_(0),
+                          watermark_dx_(2),
+                          watermark_dy_(2) {}
 
   /**
    * @brief Destructor for ScreenCaptureModule.
@@ -534,6 +576,9 @@ public:
     frame_counter = 0;
     encoded_frame_count = 0;
     total_stripes_encoded_this_interval = 0;
+    if (!watermark_path_internal.empty() && watermark_location_internal != WatermarkLocation::NONE) {
+        load_watermark_image();
+    }
     capture_thread = std::thread(&ScreenCaptureModule::capture_loop, this);
   }
 
@@ -574,6 +619,16 @@ public:
     h264_fullcolor = new_settings.h264_fullcolor;
     h264_fullframe = new_settings.h264_fullframe;
     capture_cursor = new_settings.capture_cursor;
+    std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
+    bool path_actually_changed_in_settings = (watermark_path_internal != new_wm_path_str);
+  
+    watermark_path_internal = new_wm_path_str;
+    watermark_location_internal = new_settings.watermark_location_enum;
+
+    if (path_actually_changed_in_settings) {
+        std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
+        watermark_loaded_ = false;
+    }
   }
 
   /**
@@ -589,10 +644,98 @@ public:
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
-      h264_fullcolor, h264_fullframe, capture_cursor);
+      h264_fullcolor, h264_fullframe, capture_cursor,
+      watermark_path_internal.c_str(), watermark_location_internal
+      );
   }
 
 private:
+
+  /**
+   * @brief Loads or reloads the watermark image from the configured path.
+   * This function is thread-safe. It reads the watermark path and location
+   * settings under a mutex. If a valid path is provided, it attempts to load
+   * the image using stb_image, converts it to ARGB format, and stores it
+   * internally for overlaying. If the path is empty or loading fails,
+   * any existing watermark is cleared. For animated watermarks, it initializes
+   * or resets the animation parameters.
+   */
+  void load_watermark_image() {
+    std::string path_for_this_load;
+    WatermarkLocation location_for_this_load;
+
+    {
+      std::lock_guard<std::mutex> settings_lock(settings_mutex);
+      path_for_this_load = watermark_path_internal;
+      location_for_this_load = watermark_location_internal;
+    }
+
+    if (path_for_this_load.empty() || location_for_this_load == WatermarkLocation::NONE) {
+      std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
+      if (watermark_loaded_) {
+        std::cout << "Watermark cleared or not configured." << std::endl;
+      }
+      watermark_loaded_ = false;
+      watermark_image_data_.clear();
+      watermark_width_ = 0;
+      watermark_height_ = 0;
+      return;
+    }
+    int temp_w = 0, temp_h = 0, temp_channels = 0;
+    unsigned char* stbi_img_data = stbi_load(path_for_this_load.c_str(), &temp_w, &temp_h, &temp_channels, 4);
+    std::vector<uint32_t> temp_image_data_argb;
+    bool temp_loaded_successfully = false;
+
+    if (stbi_img_data) {
+      if (temp_w > 0 && temp_h > 0) {
+        temp_image_data_argb.resize(static_cast<size_t>(temp_w) * temp_h);
+        for (int y_idx = 0; y_idx < temp_h; ++y_idx) {
+          for (int x_idx = 0; x_idx < temp_w; ++x_idx) {
+            size_t src_pixel_idx = (static_cast<size_t>(y_idx) * temp_w + x_idx) * 4;
+            uint8_t r_val = stbi_img_data[src_pixel_idx + 0];
+            uint8_t g_val = stbi_img_data[src_pixel_idx + 1];
+            uint8_t b_val = stbi_img_data[src_pixel_idx + 2];
+            uint8_t a_val = stbi_img_data[src_pixel_idx + 3];
+            temp_image_data_argb[static_cast<size_t>(y_idx) * temp_w + x_idx] =
+                (static_cast<uint32_t>(a_val) << 24) |
+                (static_cast<uint32_t>(r_val) << 16) |
+                (static_cast<uint32_t>(g_val) << 8)  |
+                static_cast<uint32_t>(b_val);
+          }
+        }
+        temp_loaded_successfully = true;
+      } else {
+         std::cerr << "Watermark image loaded with invalid dimensions: " << path_for_this_load
+                   << " (" << temp_w << "x" << temp_h << ")" << std::endl;
+      }
+      stbi_image_free(stbi_img_data);
+    } else {
+      std::cerr << "Error loading watermark image: " << path_for_this_load
+                << " - " << stbi_failure_reason() << std::endl;
+    }
+    std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
+    if (temp_loaded_successfully) {
+      watermark_image_data_ = std::move(temp_image_data_argb);
+      watermark_width_ = temp_w;
+      watermark_height_ = temp_h;
+      watermark_loaded_ = true;
+      std::cout << "Watermark loaded: " << path_for_this_load
+                << " (" << watermark_width_ << "x" << watermark_height_ << ")" << std::endl;
+
+      if (location_for_this_load == WatermarkLocation::AN) {
+        watermark_current_x_ = 0;
+        watermark_current_y_ = 0;
+        watermark_dx_ = (watermark_dx_ != 0) ? std::abs(watermark_dx_) : 2;
+        watermark_dy_ = (watermark_dy_ != 0) ? std::abs(watermark_dy_) : 2;
+      }
+    } else {
+      watermark_loaded_ = false;
+      watermark_image_data_.clear();
+      watermark_width_ = 0;
+      watermark_height_ = 0;
+    }
+  }
+
   /**
    * @brief Main loop for the screen capture thread.
    * This loop continuously captures frames from the screen using XShm, processes them,
@@ -631,6 +774,8 @@ private:
     bool local_current_capture_cursor;
     int xfixes_event_base = 0;
     int xfixes_error_base = 0;
+    std::string local_watermark_path_setting;
+    WatermarkLocation local_watermark_location_setting;
 
     {
       std::lock_guard<std::mutex> lock(settings_mutex);
@@ -650,6 +795,8 @@ private:
       local_current_h264_fullcolor = h264_fullcolor;
       local_current_h264_fullframe = h264_fullframe;
       local_current_capture_cursor = capture_cursor;
+      local_watermark_path_setting = watermark_path_internal;
+      local_watermark_location_setting = watermark_location_internal;
     }
 
     if (local_current_output_mode == OutputMode::H264) {
@@ -685,6 +832,10 @@ private:
             full_frame_u_stride_ = local_capture_width_actual / 2;
             full_frame_v_stride_ = local_capture_width_actual / 2;
         }
+    }
+
+    if (!local_watermark_path_setting.empty() && local_watermark_location_setting != WatermarkLocation::NONE) {
+        load_watermark_image();
     }
 
     std::chrono::duration < double > target_frame_duration_seconds =
@@ -805,6 +956,8 @@ private:
       int old_w = local_capture_width_actual;
       int old_h = local_capture_height_actual;
       bool yuv_config_changed = false;
+      std::string previous_watermark_path_in_loop = local_watermark_path_setting;
+      WatermarkLocation previous_watermark_location_in_loop = local_watermark_location_setting;
       {
         std::lock_guard<std::mutex> lock(settings_mutex);
         local_capture_width_actual = capture_width;
@@ -833,6 +986,33 @@ private:
         local_current_h264_fullcolor = h264_fullcolor;
         local_current_h264_fullframe = h264_fullframe;
         local_current_capture_cursor = capture_cursor;
+        local_watermark_path_setting = watermark_path_internal;
+        local_watermark_location_setting = watermark_location_internal;
+      }
+
+      bool current_watermark_is_actually_loaded_in_loop;
+      {
+        std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
+        current_watermark_is_actually_loaded_in_loop = watermark_loaded_;
+      }
+
+      bool path_setting_changed_from_last_loop_iter = (local_watermark_path_setting != previous_watermark_path_in_loop);
+      bool location_setting_changed_from_last_loop_iter = (local_watermark_location_setting != previous_watermark_location_in_loop);
+      bool needs_load_due_to_state = (local_watermark_location_setting != WatermarkLocation::NONE &&
+                                      !local_watermark_path_setting.empty() &&
+                                      !current_watermark_is_actually_loaded_in_loop);
+      bool needs_clear_due_to_state = ( (local_watermark_location_setting == WatermarkLocation::NONE || local_watermark_path_setting.empty()) &&
+                                       current_watermark_is_actually_loaded_in_loop);
+
+      if (path_setting_changed_from_last_loop_iter ||
+          location_setting_changed_from_last_loop_iter ||
+          needs_load_due_to_state ||
+          needs_clear_due_to_state ||
+          (local_watermark_location_setting == WatermarkLocation::AN && previous_watermark_location_in_loop != WatermarkLocation::AN)
+          ) {
+          load_watermark_image();
+          previous_watermark_path_in_loop = local_watermark_path_setting;
+          previous_watermark_location_in_loop = local_watermark_location_setting;
       }
 
       if (local_current_output_mode == OutputMode::H264) {
@@ -931,27 +1111,126 @@ private:
         g_h264_minimal_store.reset();
       }
 
-      if (XShmGetImage(display, root_window, shm_image,
-                       local_capture_x_offset, local_capture_y_offset, AllPlanes)) {
-
+      if (XShmGetImage(display, root_window, shm_image, local_capture_x_offset, local_capture_y_offset, AllPlanes)) {
         unsigned char* shm_data_ptr = (unsigned char*)shm_image->data;
         int shm_stride_bytes = shm_image->bytes_per_line;
         int shm_bytes_per_pixel = shm_image->bits_per_pixel / 8;
-
         if (local_current_capture_cursor) {
-          // Get cursor image and position
           XFixesCursorImage *cursor_image = XFixesGetCursorImage(display);
           if (cursor_image) {
-            int cursor_x = cursor_image->x;
-            int cursor_y = cursor_image->y;
-            int cursor_width = cursor_image->width;
-            int cursor_height = cursor_image->height;
+            std::vector<uint32_t> converted_cursor_pixels;
+            if (cursor_image->width > 0 && cursor_image->height > 0) {
+                converted_cursor_pixels.resize(static_cast<size_t>(cursor_image->width) * cursor_image->height);
+                for (int r = 0; r < cursor_image->height; ++r) {
+                    for (int c = 0; c < cursor_image->width; ++c) {
+                        unsigned long raw_pixel = cursor_image->pixels[static_cast<size_t>(r) * cursor_image->width + c];
+                        converted_cursor_pixels[static_cast<size_t>(r) * cursor_image->width + c] = static_cast<uint32_t>(raw_pixel);
+                    }
+                }
+            }
 
-            overlay_image(cursor_height, cursor_width, cursor_image->pixels, cursor_x, cursor_y, 
-                          local_capture_height_actual, local_capture_width_actual, 
-                          shm_data_ptr, shm_stride_bytes, shm_bytes_per_pixel);
-
+            if (!converted_cursor_pixels.empty()) {
+                overlay_image(cursor_image->height, cursor_image->width, 
+                              converted_cursor_pixels.data(),
+                              cursor_image->x - local_capture_x_offset,
+                              cursor_image->y - local_capture_y_offset,
+                              local_capture_height_actual, local_capture_width_actual, 
+                              shm_data_ptr, shm_stride_bytes, shm_bytes_per_pixel);
+            }
             XFree(cursor_image);
+          }
+        }
+
+        bool should_overlay_watermark_this_frame = false;
+        int overlay_wm_x = 0;
+        int overlay_wm_y = 0;
+        int temp_wm_w = 0;
+        int temp_wm_h = 0;
+        std::vector<uint32_t> local_watermark_data_copy;
+
+        {
+          std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
+          if (watermark_loaded_ && local_watermark_location_setting != WatermarkLocation::NONE &&
+              !watermark_image_data_.empty() && watermark_width_ > 0 && watermark_height_ > 0) {
+            
+            should_overlay_watermark_this_frame = true;
+            temp_wm_w = watermark_width_;
+            temp_wm_h = watermark_height_;
+            local_watermark_data_copy = watermark_image_data_;
+
+            if (local_watermark_location_setting == WatermarkLocation::AN) {
+              watermark_current_x_ += watermark_dx_;
+              watermark_current_y_ += watermark_dy_;
+  
+              if (watermark_current_x_ + watermark_width_ > local_capture_width_actual) {
+                watermark_current_x_ = local_capture_width_actual - watermark_width_;
+                if (watermark_current_x_ < 0) {
+                  watermark_current_x_ = 0;
+                }
+                watermark_dx_ *= -1;
+              } else if (watermark_current_x_ < 0) {
+                watermark_current_x_ = 0;
+                watermark_dx_ *= -1;
+              }
+  
+              if (watermark_current_y_ + watermark_height_ > local_capture_height_actual) {
+                watermark_current_y_ = local_capture_height_actual - watermark_height_;
+                if (watermark_current_y_ < 0) {
+                  watermark_current_y_ = 0;
+                }
+                watermark_dy_ *= -1;
+              } else if (watermark_current_y_ < 0) {
+                watermark_current_y_ = 0;
+                watermark_dy_ *= -1;
+              }
+              overlay_wm_x = watermark_current_x_;
+              overlay_wm_y = watermark_current_y_;
+            }
+          }
+        }
+
+        if (should_overlay_watermark_this_frame) {
+          if (local_watermark_location_setting != WatermarkLocation::AN) { 
+            switch (local_watermark_location_setting) {
+              case WatermarkLocation::TL:
+                overlay_wm_x = 0;
+                overlay_wm_y = 0;
+                break;
+              case WatermarkLocation::TR:
+                overlay_wm_x = local_capture_width_actual - temp_wm_w;
+                overlay_wm_y = 0;
+                break;
+              case WatermarkLocation::BL:
+                overlay_wm_x = 0;
+                overlay_wm_y = local_capture_height_actual - temp_wm_h;
+                break;
+              case WatermarkLocation::BR:
+                overlay_wm_x = local_capture_width_actual - temp_wm_w;
+                overlay_wm_y = local_capture_height_actual - temp_wm_h;
+                break;
+              case WatermarkLocation::MI:
+                overlay_wm_x = (local_capture_width_actual - temp_wm_w) / 2;
+                overlay_wm_y = (local_capture_height_actual - temp_wm_h) / 2;
+                break;
+              default:
+                should_overlay_watermark_this_frame = false;
+                break; 
+            }
+          }
+
+          if (should_overlay_watermark_this_frame) { 
+            if (overlay_wm_x < 0) {
+              overlay_wm_x = 0;
+            }
+            if (overlay_wm_y < 0) {
+              overlay_wm_y = 0;
+            }
+            
+            overlay_image(temp_wm_h, temp_wm_w,
+                          local_watermark_data_copy.data(), 
+                          overlay_wm_x, overlay_wm_y,
+                          local_capture_height_actual, local_capture_width_actual,
+                          shm_data_ptr, shm_stride_bytes, shm_bytes_per_pixel);
           }
         }
 
@@ -1454,8 +1733,8 @@ private:
    * @param frame_bytes_per_pixel Number of bytes used to represent a single pixel in the frame buffer.
    *                              Expected value is 3 (BGR) or 4 (BGRX).
    */
-  void overlay_image(int image_height, int image_width, unsigned long *image_ptr, 
-                     int image_x, int image_y, int frame_height, int frame_width, 
+  void overlay_image(int image_height, int image_width, const uint32_t *image_ptr,
+                     int image_x, int image_y, int frame_height, int frame_width,
                      unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel) {
     for (int y = 0; y < image_height; ++y) {
       for (int x = 0; x < image_width; ++x) {
@@ -1477,19 +1756,16 @@ private:
 
           if (alpha == 255)
           {
-            // Fully opaque, just copy
             dst_pixel[0] = blue;
             dst_pixel[1] = green;
             dst_pixel[2] = red;
           }
           else if (alpha > 0)
           {
-            // Blend with existing pixel
-            dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255;  // Blue
-            dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255; // Green
-            dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255;   // Red
+            dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255;
+            dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255;
+            dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255;
           }
-          // Else, we do nothing with the fully transparent pixel
         }
       }
     }
@@ -1536,10 +1812,13 @@ extern "C" {
       ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
       module->modify_settings(settings);
 
-      std::lock_guard<std::mutex> lock(module->settings_mutex);
-      module->stripe_callback = callback;
-      module->user_data = user_data;
-      module->start_capture();
+      {
+          std::lock_guard<std::mutex> lock(module->settings_mutex);
+          module->stripe_callback = callback;
+          module->user_data = user_data;
+      }
+
+      module->start_capture(); 
     }
   }
 

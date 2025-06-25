@@ -19,7 +19,17 @@ class CaptureSettings(ctypes.Structure):
         ("h264_fullcolor", ctypes.c_bool),
         ("h264_fullframe", ctypes.c_bool),
         ("capture_cursor", ctypes.c_bool),
+        ("watermark_path", ctypes.c_char_p),
+        ("watermark_location_enum", ctypes.c_int),
     ]
+
+WATERMARK_LOCATION_NONE = 0
+WATERMARK_LOCATION_TL = 1
+WATERMARK_LOCATION_TR = 2
+WATERMARK_LOCATION_BL = 3
+WATERMARK_LOCATION_BR = 4
+WATERMARK_LOCATION_MI = 5
+WATERMARK_LOCATION_AN = 6
 
 class StripeEncodeResult(ctypes.Structure):
     _fields_ = [
