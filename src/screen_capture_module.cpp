@@ -887,12 +887,7 @@ public:
   // Input: None.
   // Output: None.
   ScreenCaptureModule() : stop_requested(false) {
-    std::lock_guard<std::mutex> lock(g_nvenc_mutex);
-    if (LoadNvencApi()) {
-      is_nvidia_system_detected = true;
-    } else {
-      is_nvidia_system_detected = false;
-    }
+    is_nvidia_system_detected = false;
   }
 
   // Destructor for ScreenCaptureModule. Ensures capture is stopped.
@@ -904,10 +899,26 @@ public:
   // Initializes or resets encoder states.
   // Input: None.
   // Output: None.
-  void start_capture() {
+void start_capture() {
     if (capture_thread.joinable()) {
-      stop_capture();
+        stop_capture();
     }
+
+    // =======================================================================
+    // FIX: Reload the NVENC API here, at the start of every capture session.
+    // This ensures that if it was unloaded by stop_capture(), it's re-loaded
+    // for the new session.
+    {
+        // Use a local lock, as LoadNvencApi uses the global g_nvenc_mutex
+        std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+        if (LoadNvencApi()) {
+            is_nvidia_system_detected = true;
+        } else {
+            is_nvidia_system_detected = false;
+        }
+    }
+    // =======================================================================
+
     g_h264_minimal_store.reset();
 
     nvenc_operational = false;
@@ -920,7 +931,7 @@ public:
     total_nvenc_frames_encoded_this_interval = 0;
 
     capture_thread = std::thread(&ScreenCaptureModule::capture_loop, this);
-  }
+}
 
   // Stops the screen capture thread and cleans up NVENC resources.
   // Input: None.
