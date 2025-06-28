@@ -47,11 +47,61 @@
 #include <x264.h>
 #include <string>
 #include <cmath>
+#include <dlfcn.h>
+#include "nvEncodeAPI.h"
 #ifndef STB_IMAGE_IMPLEMENTATION_DEFINED
 #define STB_IMAGE_IMPLEMENTATION_DEFINED
 #define STB_IMAGE_IMPLEMENTATION
 #endif
 #include "stb_image.h"
+
+typedef enum CUresult_enum { CUDA_SUCCESS = 0 } CUresult;
+typedef int CUdevice;
+typedef struct CUctx_st* CUcontext;
+typedef CUresult (*tcuInit)(unsigned int);
+typedef CUresult (*tcuDeviceGet)(CUdevice*, int);
+typedef CUresult (*tcuCtxCreate)(CUcontext*, unsigned int, CUdevice);
+typedef CUresult (*tcuCtxDestroy)(CUcontext);
+
+struct CudaFunctions {
+  tcuInit pfn_cuInit = nullptr;
+  tcuDeviceGet pfn_cuDeviceGet = nullptr;
+  tcuCtxCreate pfn_cuCtxCreate = nullptr;
+  tcuCtxDestroy pfn_cuCtxDestroy = nullptr;
+};
+
+CudaFunctions g_cuda_funcs;
+static void* g_cuda_lib_handle = nullptr;
+
+struct NvencEncoderState {
+  NV_ENCODE_API_FUNCTION_LIST nvenc_funcs = {0};
+  void* encoder_session = nullptr;
+  NV_ENC_INITIALIZE_PARAMS init_params = {0};
+  NV_ENC_CONFIG encode_config = {0};
+  std::vector<NV_ENC_INPUT_PTR> input_buffers;
+  std::vector<NV_ENC_OUTPUT_PTR> output_buffers;
+  uint32_t current_input_buffer_idx = 0;
+  uint32_t current_output_buffer_idx = 0;
+  int buffer_pool_size = 4;
+  bool initialized = false;
+  int initialized_width = 0;
+  int initialized_height = 0;
+  int initialized_qp = -1;
+  NV_ENC_BUFFER_FORMAT initialized_buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+  CUcontext cuda_context = nullptr;
+
+  NvencEncoderState() {
+    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+  }
+};
+NvencEncoderState g_nvenc_state;
+std::mutex g_nvenc_mutex;
+std::atomic<bool> g_nvenc_force_next_idr_global{true};
+
+static void* g_nvenc_lib_handle = nullptr;
+typedef NVENCSTATUS(NVENCAPI* PFN_NvEncodeAPICreateInstance)(
+  NV_ENCODE_API_FUNCTION_LIST*);
 
 /**
  * @brief Manages a pool of H.264 encoders and associated picture buffers.
@@ -353,6 +403,535 @@ StripeEncodeResult& StripeEncodeResult::operator=(StripeEncodeResult&& other) no
 }
 
 /**
+ * @brief Dynamically loads the CUDA driver library and resolves required function pointers.
+ *
+ * This function checks if the library is already loaded. If not, it uses `dlopen`
+ * to load `libcuda.so` and `dlsym` to find the addresses of `cuInit`, `cuDeviceGet`,
+ * `cuCtxCreate`, and `cuCtxDestroy`. The function pointers are stored in the
+ * global `g_cuda_funcs` struct. This must be successful before any NVENC
+ * operations that use a CUDA context can be performed.
+ *
+ * @return true if the library was loaded and all required function pointers were
+ *         successfully resolved, false otherwise.
+ */
+bool LoadCudaApi() {
+    if (g_cuda_lib_handle) {
+        return true;
+    }
+
+    g_cuda_lib_handle = dlopen("libcuda.so", RTLD_LAZY);
+    if (!g_cuda_lib_handle) {
+        std::cerr << "CUDA_API_LOAD: dlopen failed for libcuda.so" << std::endl;
+        return false;
+    }
+
+    g_cuda_funcs.pfn_cuInit = (tcuInit)dlsym(g_cuda_lib_handle, "cuInit");
+    g_cuda_funcs.pfn_cuDeviceGet = (tcuDeviceGet)dlsym(g_cuda_lib_handle, "cuDeviceGet");
+    g_cuda_funcs.pfn_cuCtxCreate = (tcuCtxCreate)dlsym(g_cuda_lib_handle, "cuCtxCreate");
+    g_cuda_funcs.pfn_cuCtxDestroy = (tcuCtxDestroy)dlsym(g_cuda_lib_handle, "cuCtxDestroy");
+
+    if (!g_cuda_funcs.pfn_cuInit || !g_cuda_funcs.pfn_cuDeviceGet || !g_cuda_funcs.pfn_cuCtxCreate || !g_cuda_funcs.pfn_cuCtxDestroy) {
+        std::cerr << "CUDA_API_LOAD: dlsym failed for one or more CUDA functions." << std::endl;
+        dlclose(g_cuda_lib_handle);
+        g_cuda_lib_handle = nullptr;
+        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Unloads the CUDA driver library if it was previously loaded.
+ *
+ * This function calls `dlclose` on the CUDA library handle and clears the global
+ * function pointer struct to ensure a clean state. It should be called when
+ * CUDA functionality is no longer needed.
+ */
+void UnloadCudaApi() {
+    if (g_cuda_lib_handle) {
+        dlclose(g_cuda_lib_handle);
+        g_cuda_lib_handle = nullptr;
+        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
+    }
+}
+
+/**
+ * @brief Dynamically loads the NVIDIA Encoder (NVENC) library and initializes the API function list.
+ *
+ * This function checks if the API is already loaded. If not, it attempts to load
+ * `libnvidia-encode.so.1` or `libnvidia-encode.so` using `dlopen`. It then uses
+ * `dlsym` to get the `NvEncodeAPICreateInstance` function and calls it to populate
+ * the global `g_nvenc_state.nvenc_funcs` list, which contains pointers to all
+ * other NVENC API functions.
+ *
+ * @return true if the library was loaded and the function list was successfully
+ *         populated, false otherwise.
+ */
+bool LoadNvencApi() {
+  if (g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx != nullptr) {
+    return true;
+  }
+  if (g_nvenc_lib_handle) {
+    dlclose(g_nvenc_lib_handle);
+    g_nvenc_lib_handle = nullptr;
+  }
+  memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+  g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+
+  const char* lib_names[] = {"libnvidia-encode.so.1", "libnvidia-encode.so"};
+  for (const char* name : lib_names) {
+    g_nvenc_lib_handle = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
+    if (g_nvenc_lib_handle) {
+      break;
+    }
+  }
+
+  if (!g_nvenc_lib_handle) {
+    return false;
+  }
+
+  PFN_NvEncodeAPICreateInstance NvEncodeAPICreateInstance_func_ptr =
+    (PFN_NvEncodeAPICreateInstance)dlsym(g_nvenc_lib_handle, "NvEncodeAPICreateInstance");
+
+  if (!NvEncodeAPICreateInstance_func_ptr) {
+    dlclose(g_nvenc_lib_handle);
+    g_nvenc_lib_handle = nullptr;
+    return false;
+  }
+
+  NVENCSTATUS status = NvEncodeAPICreateInstance_func_ptr(&g_nvenc_state.nvenc_funcs);
+  if (status != NV_ENC_SUCCESS) {
+    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    dlclose(g_nvenc_lib_handle);
+    g_nvenc_lib_handle = nullptr;
+    return false;
+  }
+  if (!g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx) {
+    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    dlclose(g_nvenc_lib_handle);
+    g_nvenc_lib_handle = nullptr;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Resets the global NVENC encoder, releasing all associated resources.
+ *
+ * This function is thread-safe. If the encoder is initialized, it destroys all
+ * allocated input and output buffers, destroys the encoder session, and destroys
+ * the associated CUDA context. It then marks the encoder as uninitialized. This
+ * is called when capture settings change (e.g., resolution) or when stopping.
+ */
+void reset_nvenc_encoder() {
+  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+
+  if (!g_nvenc_state.initialized) {
+    return;
+  }
+
+  if (g_nvenc_state.encoder_session && g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder) {
+    for (NV_ENC_INPUT_PTR& ptr : g_nvenc_state.input_buffers) {
+        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer)
+            g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer(g_nvenc_state.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    g_nvenc_state.input_buffers.clear();
+
+    for (NV_ENC_OUTPUT_PTR& ptr : g_nvenc_state.output_buffers) {
+        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer)
+            g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer(g_nvenc_state.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    g_nvenc_state.output_buffers.clear();
+
+    g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder(g_nvenc_state.encoder_session);
+    g_nvenc_state.encoder_session = nullptr;
+  }
+
+  if (g_nvenc_state.cuda_context && g_cuda_funcs.pfn_cuCtxDestroy) {
+    g_cuda_funcs.pfn_cuCtxDestroy(g_nvenc_state.cuda_context);
+    g_nvenc_state.cuda_context = nullptr;
+  }
+
+  g_nvenc_state.initialized = false;
+}
+
+/**
+ * @brief Completely unloads the NVENC library and resets the encoder state.
+ *
+ * This function is thread-safe. It first calls `reset_nvenc_encoder` to release
+ * any active session resources. Then, it calls `dlclose` on the NVENC library
+ * handle and clears the global NVENC function list struct.
+ */
+void unload_nvenc_library_if_loaded() {
+  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+  if (g_nvenc_state.initialized) {
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
+  }
+
+  if (g_nvenc_lib_handle) {
+    dlclose(g_nvenc_lib_handle);
+    g_nvenc_lib_handle = nullptr;
+    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+  }
+}
+
+/**
+ * @brief Initializes or re-initializes the global NVENC encoder with the specified parameters.
+ *
+ * This function is thread-safe. It checks if an encoder is already initialized
+ * with the exact same parameters. If so, it returns true immediately. Otherwise,
+ * it resets any existing encoder and proceeds to create a new CUDA context and
+ * NVENC session. It configures the encoder for ultra-low-latency H.264 encoding
+ * with the given dimensions, QP, FPS, and colorspace, and allocates a pool of
+ * input/output buffers.
+ *
+ * @param width The width of the video frames to be encoded.
+ * @param height The height of the video frames to be encoded.
+ * @param target_qp The target Quantization Parameter (QP) for constant quality encoding.
+ * @param fps The target frames per second for the encoder.
+ * @param use_yuv444 If true, configures the encoder for YUV 4:4:4 (full color);
+ *                   if false, uses YUV 4:2:0 (NV12).
+ * @return true if the encoder was successfully initialized, false on any failure.
+ */
+bool initialize_nvenc_encoder(int width,
+                              int height,
+                              int target_qp,
+                              double fps,
+                              bool use_yuv444) {
+  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+
+  NV_ENC_BUFFER_FORMAT target_buffer_format =
+    use_yuv444 ? NV_ENC_BUFFER_FORMAT_YUV444 : NV_ENC_BUFFER_FORMAT_NV12;
+
+  if (g_nvenc_state.initialized && g_nvenc_state.initialized_width == width &&
+      g_nvenc_state.initialized_height == height &&
+      g_nvenc_state.initialized_qp == target_qp &&
+      g_nvenc_state.initialized_buffer_format == target_buffer_format) {
+    return true;
+  }
+
+  if (g_nvenc_state.initialized) {
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
+  }
+
+  if (!LoadCudaApi()) {
+    std::cerr << "NVENC_INIT_FATAL: Failed to load CUDA driver API." << std::endl;
+    return false;
+  }
+
+  if (!g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx) {
+    g_nvenc_state.initialized = false;
+    return false;
+  }
+
+  CUresult cu_status = g_cuda_funcs.pfn_cuInit(0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuInit failed with code " << cu_status << std::endl;
+      return false;
+  }
+  CUdevice cu_device;
+  cu_status = g_cuda_funcs.pfn_cuDeviceGet(&cu_device, 0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuDeviceGet failed with code " << cu_status << std::endl;
+      return false;
+  }
+  cu_status = g_cuda_funcs.pfn_cuCtxCreate(&g_nvenc_state.cuda_context, 0, cu_device);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuCtxCreate failed with code " << cu_status << std::endl;
+      return false;
+  }
+
+  NVENCSTATUS status;
+  NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {0};
+  session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+  session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+  session_params.device = g_nvenc_state.cuda_context;
+  session_params.apiVersion = NVENCAPI_VERSION;
+
+  status = g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx(
+    &session_params, &g_nvenc_state.encoder_session);
+
+  if (status != NV_ENC_SUCCESS) {
+    std::string error_str = "NVENC_INIT_ERROR: nvEncOpenEncodeSessionEx (CUDA Path) FAILED: " + std::to_string(status);
+    std::cerr << error_str << std::endl;
+    g_nvenc_state.encoder_session = nullptr;
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
+    return false;
+  }
+  if (!g_nvenc_state.encoder_session) {
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
+    return false;
+  }
+
+  memset(&g_nvenc_state.init_params, 0, sizeof(g_nvenc_state.init_params));
+  g_nvenc_state.init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+  g_nvenc_state.init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+  g_nvenc_state.init_params.presetGUID = NV_ENC_PRESET_P3_GUID;
+  g_nvenc_state.init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+  g_nvenc_state.init_params.encodeWidth = width;
+  g_nvenc_state.init_params.encodeHeight = height;
+  g_nvenc_state.init_params.darWidth = width;
+  g_nvenc_state.init_params.darHeight = height;
+  g_nvenc_state.init_params.frameRateNum = static_cast<uint32_t>(fps < 1.0 ? 30 : fps);
+  g_nvenc_state.init_params.frameRateDen = 1;
+  g_nvenc_state.init_params.enablePTD = 1;
+
+  NV_ENC_PRESET_CONFIG preset_config = {0};
+  preset_config.version = NV_ENC_PRESET_CONFIG_VER;
+  preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
+
+  if (g_nvenc_state.nvenc_funcs.nvEncGetEncodePresetConfigEx) {
+    status = g_nvenc_state.nvenc_funcs.nvEncGetEncodePresetConfigEx(
+      g_nvenc_state.encoder_session,
+      g_nvenc_state.init_params.encodeGUID,
+      g_nvenc_state.init_params.presetGUID,
+      g_nvenc_state.init_params.tuningInfo,
+      &preset_config);
+
+    if (status != NV_ENC_SUCCESS) {
+      std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx FAILED: " << status
+                << ". Falling back to manual config." << std::endl;
+      memset(&g_nvenc_state.encode_config, 0, sizeof(g_nvenc_state.encode_config));
+      g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
+    } else {
+      g_nvenc_state.encode_config = preset_config.presetCfg;
+      g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
+    }
+  } else {
+    std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx not available. Using manual "
+                 "config."
+              << std::endl;
+    memset(&g_nvenc_state.encode_config, 0, sizeof(g_nvenc_state.encode_config));
+    g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
+  }
+
+  g_nvenc_state.encode_config.profileGUID =
+    use_yuv444 ? NV_ENC_H264_PROFILE_HIGH_444_GUID : NV_ENC_H264_PROFILE_HIGH_GUID;
+  g_nvenc_state.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+  g_nvenc_state.encode_config.rcParams.constQP.qpInterP = target_qp;
+  g_nvenc_state.encode_config.rcParams.constQP.qpIntra = target_qp;
+  g_nvenc_state.encode_config.rcParams.constQP.qpInterB = target_qp;
+  g_nvenc_state.encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
+  g_nvenc_state.encode_config.frameIntervalP = 1;
+
+  NV_ENC_CONFIG_H264* h264_cfg = &g_nvenc_state.encode_config.encodeCodecConfig.h264Config;
+  h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
+  h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
+  g_nvenc_state.init_params.encodeConfig = &g_nvenc_state.encode_config;
+
+  status = g_nvenc_state.nvenc_funcs.nvEncInitializeEncoder(g_nvenc_state.encoder_session,
+                                                            &g_nvenc_state.init_params);
+  if (status != NV_ENC_SUCCESS) {
+    std::string error_str =
+      "NVENC_INIT_ERROR: nvEncInitializeEncoder FAILED: " + std::to_string(status);
+    if (g_nvenc_state.nvenc_funcs.nvEncGetLastErrorString) {
+      const char* api_err =
+        g_nvenc_state.nvenc_funcs.nvEncGetLastErrorString(g_nvenc_state.encoder_session);
+      if (api_err)
+        error_str += " - API Error: " + std::string(api_err);
+    }
+    std::cerr << error_str << std::endl;
+
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
+    return false;
+  }
+
+  g_nvenc_state.input_buffers.resize(g_nvenc_state.buffer_pool_size);
+  g_nvenc_state.output_buffers.resize(g_nvenc_state.buffer_pool_size);
+  for (int i = 0; i < g_nvenc_state.buffer_pool_size; ++i) {
+    NV_ENC_CREATE_INPUT_BUFFER icp = {0};
+    icp.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+    icp.width = width;
+    icp.height = height;
+    icp.bufferFmt = target_buffer_format;
+    status = g_nvenc_state.nvenc_funcs.nvEncCreateInputBuffer(g_nvenc_state.encoder_session,
+                                                              &icp);
+    if (status != NV_ENC_SUCCESS) {
+      g_nvenc_mutex.unlock();
+      reset_nvenc_encoder();
+      g_nvenc_mutex.lock();
+      return false;
+    }
+    g_nvenc_state.input_buffers[i] = icp.inputBuffer;
+    NV_ENC_CREATE_BITSTREAM_BUFFER ocp = {0};
+    ocp.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    status = g_nvenc_state.nvenc_funcs.nvEncCreateBitstreamBuffer(
+      g_nvenc_state.encoder_session, &ocp);
+    if (status != NV_ENC_SUCCESS) {
+      g_nvenc_mutex.unlock();
+      reset_nvenc_encoder();
+      g_nvenc_mutex.lock();
+      return false;
+    }
+    g_nvenc_state.output_buffers[i] = ocp.bitstreamBuffer;
+  }
+  g_nvenc_state.initialized_width = width;
+  g_nvenc_state.initialized_height = height;
+  g_nvenc_state.initialized_qp = target_qp;
+  g_nvenc_state.initialized_buffer_format = target_buffer_format;
+  g_nvenc_state.initialized = true;
+  return true;
+}
+
+/**
+ * @brief Encodes a full frame of YUV data using the pre-initialized global NVENC encoder.
+ *
+ * This function is thread-safe. It locks an available input buffer from the pool,
+ * copies the provided Y, U, and V plane data into it (converting to NV12 if the
+ * input is I420), and then submits it to the encoder. After encoding, it locks the
+ * corresponding output bitstream buffer, packages the H.264 data into a
+ * `StripeEncodeResult` with a custom header, and returns it. It manages a circular
+ * pool of input/output buffers to pipeline encoding operations.
+ *
+ * @param width The width of the input frame.
+ * @param height The height of the input frame.
+ * @param y_plane Pointer to the Y (luma) plane data.
+ * @param y_stride Stride of the Y plane in bytes.
+ * @param u_plane Pointer to the U (chroma) plane data.
+ * @param u_stride Stride of the U plane in bytes.
+ * @param v_plane Pointer to the V (chroma) plane data.
+ * @param v_stride Stride of the V plane in bytes.
+ * @param is_i444 True if the input is YUV 4:4:4, false if it is YUV 4:2:0.
+ * @param frame_counter The current frame number, used for timestamping.
+ * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame.
+ * @return A `StripeEncodeResult` containing the encoded H.264 NAL units and a
+ *         custom header. The result's data buffer is dynamically allocated and
+ *         must be freed by the caller.
+ * @throws std::runtime_error if any NVENC API call fails during the encoding process.
+ */
+StripeEncodeResult encode_fullframe_nvenc(int width,
+                                          int height,
+                                          const uint8_t* y_plane, int y_stride,
+                                          const uint8_t* u_plane, int u_stride,
+                                          const uint8_t* v_plane, int v_stride,
+                                          bool is_i444,
+                                          int frame_counter,
+                                          bool force_idr_frame) {
+  StripeEncodeResult result;
+  result.type = StripeDataType::H264;
+  result.stripe_y_start = 0;
+  result.stripe_height = height;
+  result.frame_id = frame_counter;
+
+  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+
+  if (!g_nvenc_state.initialized) {
+    throw std::runtime_error("NVENC_ENCODE_FATAL: Not initialized.");
+  }
+
+  NV_ENC_INPUT_PTR in_ptr =
+    g_nvenc_state.input_buffers[g_nvenc_state.current_input_buffer_idx];
+  NV_ENC_OUTPUT_PTR out_ptr =
+    g_nvenc_state.output_buffers[g_nvenc_state.current_output_buffer_idx];
+
+  NV_ENC_LOCK_INPUT_BUFFER lip = {0};
+  lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+  lip.inputBuffer = in_ptr;
+  NVENCSTATUS status =
+    g_nvenc_state.nvenc_funcs.nvEncLockInputBuffer(g_nvenc_state.encoder_session, &lip);
+  if (status != NV_ENC_SUCCESS)
+    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockInputBuffer FAILED: " +
+                             std::to_string(status));
+
+  unsigned char* locked_buffer = static_cast<unsigned char*>(lip.bufferDataPtr);
+  int locked_pitch = lip.pitch;
+
+  if (is_i444) {
+    uint8_t* y_dst = locked_buffer;
+    uint8_t* u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
+    uint8_t* v_dst = u_dst + static_cast<size_t>(locked_pitch) * height;
+    libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
+    libyuv::CopyPlane(u_plane, u_stride, u_dst, locked_pitch, width, height);
+    libyuv::CopyPlane(v_plane, v_stride, v_dst, locked_pitch, width, height);
+  } else {
+    uint8_t* y_dst = locked_buffer;
+    uint8_t* uv_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
+    libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+                        y_dst, locked_pitch, uv_dst, locked_pitch, width, height);
+  }
+
+  g_nvenc_state.nvenc_funcs.nvEncUnlockInputBuffer(g_nvenc_state.encoder_session, in_ptr);
+
+  NV_ENC_PIC_PARAMS pp = {0};
+  pp.version = NV_ENC_PIC_PARAMS_VER;
+  pp.inputBuffer = in_ptr;
+  pp.outputBitstream = out_ptr;
+  pp.bufferFmt = g_nvenc_state.initialized_buffer_format;
+  pp.inputWidth = width;
+  pp.inputHeight = height;
+  pp.inputPitch = locked_pitch;
+  pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+  pp.inputTimeStamp = frame_counter;
+  pp.frameIdx = frame_counter;
+  if (force_idr_frame) {
+    pp.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+  }
+
+  status =
+    g_nvenc_state.nvenc_funcs.nvEncEncodePicture(g_nvenc_state.encoder_session, &pp);
+  if (status != NV_ENC_SUCCESS) {
+    std::string err_msg = "NVENC_ENCODE_ERROR: nvEncEncodePicture FAILED: " + std::to_string(status);
+    throw std::runtime_error(err_msg);
+  }
+
+  NV_ENC_LOCK_BITSTREAM lbs = {0};
+  lbs.version = NV_ENC_LOCK_BITSTREAM_VER;
+  lbs.outputBitstream = out_ptr;
+  status =
+    g_nvenc_state.nvenc_funcs.nvEncLockBitstream(g_nvenc_state.encoder_session, &lbs);
+  if (status != NV_ENC_SUCCESS) {
+    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockBitstream FAILED: " + std::to_string(status));
+  }
+
+  if (lbs.bitstreamSizeInBytes > 0) {
+    const unsigned char TAG = 0x04;
+    unsigned char type_hdr = 0x00;
+    if (lbs.pictureType == NV_ENC_PIC_TYPE_IDR) type_hdr = 0x01;
+    else if (lbs.pictureType == NV_ENC_PIC_TYPE_I) type_hdr = 0x02;
+
+    int header_sz = 10;
+    result.data = new unsigned char[lbs.bitstreamSizeInBytes + header_sz];
+    result.size = lbs.bitstreamSizeInBytes + header_sz;
+    result.data[0] = TAG;
+    result.data[1] = type_hdr;
+    uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+    std::memcpy(result.data + 2, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+    std::memcpy(result.data + 4, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(width));
+    std::memcpy(result.data + 6, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(height));
+    std::memcpy(result.data + 8, &net_val, 2);
+    std::memcpy(result.data + header_sz, lbs.bitstreamBufferPtr, lbs.bitstreamSizeInBytes);
+  } else {
+    result.size = 0;
+    result.data = nullptr;
+  }
+
+  g_nvenc_state.nvenc_funcs.nvEncUnlockBitstream(g_nvenc_state.encoder_session, out_ptr);
+
+  g_nvenc_state.current_input_buffer_idx = (g_nvenc_state.current_input_buffer_idx + 1) % g_nvenc_state.buffer_pool_size;
+  g_nvenc_state.current_output_buffer_idx = (g_nvenc_state.current_output_buffer_idx + 1) % g_nvenc_state.buffer_pool_size;
+
+  return result;
+}
+
+/**
  * @brief Callback function type for processing encoded stripes.
  * @param result Pointer to the StripeEncodeResult containing the encoded data.
  * @param user_data User-defined data passed to the callback.
@@ -514,6 +1093,8 @@ public:
   int encoded_frame_count = 0;
   int total_stripes_encoded_this_interval = 0;
   mutable std::mutex settings_mutex;
+  bool is_nvidia_system_detected = false;
+  bool nvenc_operational = false;
 
 private:
     std::vector<uint8_t> full_frame_y_plane_;
@@ -571,7 +1152,21 @@ public:
     if (capture_thread.joinable()) {
       stop_capture();
     }
+
+    {
+        std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+        if (LoadNvencApi()) {
+            is_nvidia_system_detected = true;
+        } else {
+            is_nvidia_system_detected = false;
+        }
+    }
+
     g_h264_minimal_store.reset();
+
+    nvenc_operational = false;
+    g_nvenc_force_next_idr_global = true;
+
     stop_requested = false;
     frame_counter = 0;
     encoded_frame_count = 0;
@@ -592,6 +1187,11 @@ public:
     if (capture_thread.joinable()) {
       capture_thread.join();
     }
+    if (g_nvenc_state.initialized) {
+      reset_nvenc_encoder();
+    }
+    unload_nvenc_library_if_loaded();
+    UnloadCudaApi();
   }
 
   /**
@@ -918,6 +1518,25 @@ private:
     }
     std::cout << "XShm setup complete for " << local_capture_width_actual
               << "x" << local_capture_height_actual << "." << std::endl;
+
+    this->nvenc_operational = false;
+    if (this->is_nvidia_system_detected &&
+        local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
+      if (initialize_nvenc_encoder(local_capture_width_actual,
+                                   local_capture_height_actual,
+                                   local_current_h264_crf,
+                                   local_current_target_fps,
+                                   local_current_h264_fullcolor)) {
+        this->nvenc_operational = true;
+        g_nvenc_force_next_idr_global = true;
+        std::cout << "NVENC Encoder Initialized successfully." << std::endl;
+      } else {
+        std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
+      }
+    }
+    if (!this->nvenc_operational && g_nvenc_state.initialized) {
+      reset_nvenc_encoder();
+    }
 
     int num_cores = std::max(1, (int)std::thread::hardware_concurrency());
     std::cout << "CPU cores available: " << num_cores << std::endl;
@@ -1559,53 +2178,82 @@ private:
                 quality_to_use,
                 this->frame_counter));
             } else {
-              int crf_for_encode = local_current_h264_crf;
-              if (is_h264_idr_paintover_this_stripe && local_current_h264_crf > 10) {
-                crf_for_encode = 10;
-              }
-              if (is_h264_idr_paintover_this_stripe) {
-                std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-                g_h264_minimal_store.ensure_size(i);
-                if (i < static_cast<int>(g_h264_minimal_store.force_idr_flags.size())) {
-                    g_h264_minimal_store.force_idr_flags[i] = true;
+              if (this->nvenc_operational) {
+                std::packaged_task<StripeEncodeResult()> task([=]() {
+                    bool force_idr = g_nvenc_force_next_idr_global.exchange(false);
+                    return encode_fullframe_nvenc(
+                        local_capture_width_actual, local_capture_height_actual,
+                        full_frame_y_plane_.data(), full_frame_y_stride_,
+                        full_frame_u_plane_.data(), full_frame_u_stride_,
+                        full_frame_v_plane_.data(), full_frame_v_stride_,
+                        this->yuv_planes_are_i444_, this->frame_counter, force_idr
+                    );
+                });
+                futures.push_back(task.get_future());
+                threads.push_back(std::thread(std::move(task)));
+              } else {
+                int crf_for_encode = local_current_h264_crf;
+                if (is_h264_idr_paintover_this_stripe && local_current_h264_crf > 10) {
+                  crf_for_encode = 10;
                 }
+                if (is_h264_idr_paintover_this_stripe) {
+                  std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
+                  g_h264_minimal_store.ensure_size(i);
+                  if (i < static_cast<int>(g_h264_minimal_store.force_idr_flags.size())) {
+                      g_h264_minimal_store.force_idr_flags[i] = true;
+                  }
+                }
+
+                const uint8_t* y_plane_for_thread = full_frame_y_plane_.data() +
+                    static_cast<size_t>(start_y) * full_frame_y_stride_;
+                const uint8_t* u_plane_for_thread = full_frame_u_plane_.data() +
+                    (static_cast<size_t>(this->yuv_planes_are_i444_ ?
+                     start_y : (start_y / 2)) * full_frame_u_stride_);
+                const uint8_t* v_plane_for_thread = full_frame_v_plane_.data() +
+                    (static_cast<size_t>(this->yuv_planes_are_i444_ ?
+                     start_y : (start_y / 2)) * full_frame_v_stride_);
+
+                std::packaged_task<StripeEncodeResult(
+                  int, int, int, int,
+                  const uint8_t*, int, const uint8_t*, int, const uint8_t*, int,
+                  bool, int, int, int, bool)>
+                  task(encode_stripe_h264);
+                futures.push_back(task.get_future());
+                threads.push_back(std::thread(
+                  std::move(task), i, start_y, current_stripe_height,
+                  local_capture_width_actual,
+                  y_plane_for_thread, full_frame_y_stride_,
+                  u_plane_for_thread, full_frame_u_stride_,
+                  v_plane_for_thread, full_frame_v_stride_,
+                  this->yuv_planes_are_i444_,
+                  this->frame_counter,
+                  crf_for_encode,
+                  derived_h264_colorspace_setting,
+                  derived_h264_use_full_range
+                  ));
               }
-
-              const uint8_t* y_plane_for_thread = full_frame_y_plane_.data() +
-                  static_cast<size_t>(start_y) * full_frame_y_stride_;
-              const uint8_t* u_plane_for_thread = full_frame_u_plane_.data() +
-                  (static_cast<size_t>(this->yuv_planes_are_i444_ ?
-                   start_y : (start_y / 2)) * full_frame_u_stride_);
-              const uint8_t* v_plane_for_thread = full_frame_v_plane_.data() +
-                  (static_cast<size_t>(this->yuv_planes_are_i444_ ?
-                   start_y : (start_y / 2)) * full_frame_v_stride_);
-
-              std::packaged_task<StripeEncodeResult(
-                int, int, int, int,
-                const uint8_t*, int, const uint8_t*, int, const uint8_t*, int,
-                bool, int, int, int, bool)>
-                task(encode_stripe_h264);
-              futures.push_back(task.get_future());
-              threads.push_back(std::thread(
-                std::move(task), i, start_y, current_stripe_height,
-                local_capture_width_actual,
-                y_plane_for_thread, full_frame_y_stride_,
-                u_plane_for_thread, full_frame_u_stride_,
-                v_plane_for_thread, full_frame_v_stride_,
-                this->yuv_planes_are_i444_,
-                this->frame_counter,
-                crf_for_encode,
-                derived_h264_colorspace_setting,
-                derived_h264_use_full_range
-                ));
             }
           }
         }
 
+
         std::vector<StripeEncodeResult> stripe_results;
         stripe_results.reserve(futures.size());
         for (auto& future : futures) {
-          stripe_results.push_back(future.get());
+          try {
+            stripe_results.push_back(future.get());
+          } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("NVENC_") != std::string::npos) {
+                std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
+                std::cerr << "Disabling NVENC for this session due to runtime error." << std::endl;
+                this->nvenc_operational = false;
+                reset_nvenc_encoder();
+                g_nvenc_force_next_idr_global = true;
+            } else {
+                std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
+            }
+            stripe_results.push_back({});
+          }
         }
         futures.clear();
 
@@ -1662,7 +2310,7 @@ private:
           std::cout << "Res: " << local_capture_width_actual << "x"
                     << local_capture_height_actual
                     << " Mode: "
-                    << (local_current_output_mode == OutputMode::JPEG ? "JPEG" : "H264")
+                    << (local_current_output_mode == OutputMode::JPEG ? "JPEG" : (this->nvenc_operational ? "H264 (NVENC)" : "H264 (CPU)"))
                     << (local_current_output_mode == OutputMode::H264
                         ? (std::string(local_current_h264_fullcolor ?
                                        " CS_IN:I444" : " CS_IN:I420") +

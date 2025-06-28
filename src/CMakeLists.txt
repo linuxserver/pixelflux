@@ -37,40 +37,57 @@ set(STB_IMAGE_HEADER_URL "https://raw.githubusercontent.com/nothings/stb/master/
 set(STB_IMAGE_HEADER_PARENT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/stb_image_downloaded/include")
 set(STB_IMAGE_HEADER_DOWNLOAD_DIR "${STB_IMAGE_HEADER_PARENT_INCLUDE_DIR}/")
 set(STB_IMAGE_HEADER_FILE "${STB_IMAGE_HEADER_DOWNLOAD_DIR}/stb_image.h")
-
 file(MAKE_DIRECTORY "${STB_IMAGE_HEADER_DOWNLOAD_DIR}")
-
 if(NOT EXISTS "${STB_IMAGE_HEADER_FILE}")
     message(STATUS "Downloading stb_image.h from ${STB_IMAGE_HEADER_URL}")
-    file(DOWNLOAD "${STB_IMAGE_HEADER_URL}" "${STB_IMAGE_HEADER_FILE}"
-         SHOW_PROGRESS
-         STATUS download_status_stb
-         LOG download_log_stb
-         TIMEOUT 60
-    )
-    list(GET download_status_stb 0 download_error_code_stb)
-    list(GET download_status_stb 1 download_error_string_stb)
-
-    if(NOT download_error_code_stb EQUAL 0)
-        message(FATAL_ERROR "Failed to download ${STB_IMAGE_HEADER_URL}: [${download_error_code_stb}] ${download_error_string_stb}\nFull Log:\n${download_log_stb}")
-    elseif(NOT EXISTS "${STB_IMAGE_HEADER_FILE}")
-        message(FATAL_ERROR "Download reported success, but file ${STB_IMAGE_HEADER_FILE} does not exist.\nFull Log:\n${download_log_stb}")
-    else()
-        message(STATUS "stb_image.h downloaded successfully to ${STB_IMAGE_HEADER_FILE}")
+    file(DOWNLOAD "${STB_IMAGE_HEADER_URL}" "${STB_IMAGE_HEADER_FILE}" SHOW_PROGRESS STATUS download_status LOG download_log TIMEOUT 60)
+    list(GET download_status 0 download_error_code)
+    list(GET download_status 1 download_error_string)
+    if(NOT download_error_code EQUAL 0)
+        message(FATAL_ERROR "Failed to download ${STB_IMAGE_HEADER_URL}: [${download_error_code}] ${download_error_string}\nFull Log:\n${download_log}")
     endif()
-else()
-    message(STATUS "stb_image.h already exists at ${STB_IMAGE_HEADER_FILE}. Skipping download.")
 endif()
-
 if(NOT TARGET stb_image_header)
     add_library(stb_image_header INTERFACE)
-    target_include_directories(stb_image_header INTERFACE
-        "${STB_IMAGE_HEADER_PARENT_INCLUDE_DIR}"
-    )
+    target_include_directories(stb_image_header INTERFACE "${STB_IMAGE_HEADER_PARENT_INCLUDE_DIR}")
 endif()
 
-if(NOT EXISTS "${STB_IMAGE_HEADER_FILE}")
-    message(FATAL_ERROR "Critical error: stb_image.h is missing at ${STB_IMAGE_HEADER_FILE}. Cannot build.")
+set(CUDA_STUB_HEADER_URL "https://raw.githubusercontent.com/GStreamer/gstreamer/188a9fa7a282df8b142f992194ceadc724744397/subprojects/gst-plugins-bad/sys/hip/stub/cuda.h")
+set(CUDA_STUB_HEADER_PARENT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cuda_stub_downloaded/include")
+set(CUDA_STUB_HEADER_DOWNLOAD_DIR "${CUDA_STUB_HEADER_PARENT_INCLUDE_DIR}/")
+set(CUDA_STUB_HEADER_FILE "${CUDA_STUB_HEADER_DOWNLOAD_DIR}/cuda.h")
+file(MAKE_DIRECTORY "${CUDA_STUB_HEADER_DOWNLOAD_DIR}")
+if(NOT EXISTS "${CUDA_STUB_HEADER_FILE}")
+    message(STATUS "Downloading cuda.h stub from ${CUDA_STUB_HEADER_URL}")
+    file(DOWNLOAD "${CUDA_STUB_HEADER_URL}" "${CUDA_STUB_HEADER_FILE}" SHOW_PROGRESS STATUS download_status LOG download_log TIMEOUT 60)
+    list(GET download_status 0 download_error_code)
+    list(GET download_status 1 download_error_string)
+    if(NOT download_error_code EQUAL 0)
+        message(FATAL_ERROR "Failed to download ${CUDA_STUB_HEADER_URL}: [${download_error_code}] ${download_error_string}\nFull Log:\n${download_log}")
+    endif()
+endif()
+if(NOT TARGET cuda_stub_header)
+    add_library(cuda_stub_header INTERFACE)
+    target_include_directories(cuda_stub_header INTERFACE "${CUDA_STUB_HEADER_PARENT_INCLUDE_DIR}")
+endif()
+
+set(NVENC_HEADER_URL "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/refs/tags/n12.1.14.0/include/ffnvcodec/nvEncodeAPI.h")
+set(NVENC_HEADER_PARENT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/nvenc_header_downloaded/include")
+set(NVENC_HEADER_DOWNLOAD_DIR "${NVENC_HEADER_PARENT_INCLUDE_DIR}/")
+set(NVENC_HEADER_FILE "${NVENC_HEADER_DOWNLOAD_DIR}/nvEncodeAPI.h")
+file(MAKE_DIRECTORY "${NVENC_HEADER_DOWNLOAD_DIR}")
+if(NOT EXISTS "${NVENC_HEADER_FILE}")
+    message(STATUS "Downloading nvEncodeAPI.h from ${NVENC_HEADER_URL}")
+    file(DOWNLOAD "${NVENC_HEADER_URL}" "${NVENC_HEADER_FILE}" SHOW_PROGRESS STATUS download_status LOG download_log TIMEOUT 60)
+    list(GET download_status 0 download_error_code)
+    list(GET download_status 1 download_error_string)
+    if(NOT download_error_code EQUAL 0)
+        message(FATAL_ERROR "Failed to download ${NVENC_HEADER_URL}: [${download_error_code}] ${download_error_string}\nFull Log:\n${download_log}")
+    endif()
+endif()
+if(NOT TARGET nvenc_header)
+    add_library(nvenc_header INTERFACE)
+    target_include_directories(nvenc_header INTERFACE "${NVENC_HEADER_PARENT_INCLUDE_DIR}")
 endif()
 
 find_package(PkgConfig REQUIRED)
@@ -99,9 +116,12 @@ target_link_libraries(screen_capture_module PRIVATE
     yuv
     xxhash
     stb_image_header
+    cuda_stub_header
+    nvenc_header
     ${X264_LIBRARIES}
     ${JPEG_LIBRARIES}
     ${XFIXES_LIB}
+    dl
 )
 
 set_target_properties(screen_capture_module PROPERTIES
