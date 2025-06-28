@@ -14,7 +14,8 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
-#include <GL/glx.h>
+// #include <GL/glx.h> // REMOVED
+// #include <cuda.h> // REMOVED - We will define types manually
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -45,6 +46,30 @@
 #include <x264.h>
 #include <xxhash.h>
 #include "nvEncodeAPI.h"
+
+// =====================================================================================
+// NEW: Minimal CUDA Driver API definitions to avoid build-time dependency
+// These are ABI-stable and can be defined directly.
+// =====================================================================================
+typedef enum CUresult_enum { CUDA_SUCCESS = 0 } CUresult;
+typedef int CUdevice;
+typedef struct CUctx_st* CUcontext;
+typedef CUresult (*tcuInit)(unsigned int);
+typedef CUresult (*tcuDeviceGet)(CUdevice*, int);
+typedef CUresult (*tcuCtxCreate)(CUcontext*, unsigned int, CUdevice);
+typedef CUresult (*tcuCtxDestroy)(CUcontext);
+
+struct CudaFunctions {
+  tcuInit pfn_cuInit = nullptr;
+  tcuDeviceGet pfn_cuDeviceGet = nullptr;
+  tcuCtxCreate pfn_cuCtxCreate = nullptr;
+  tcuCtxDestroy pfn_cuCtxDestroy = nullptr;
+};
+
+CudaFunctions g_cuda_funcs;
+static void* g_cuda_lib_handle = nullptr;
+// =====================================================================================
+
 
 // Manages a pool of x264 encoders and their associated picture structures
 // for multi-threaded H.264 encoding.
@@ -134,6 +159,7 @@ struct NvencEncoderState {
   int initialized_height = 0;
   int initialized_qp = -1;
   NV_ENC_BUFFER_FORMAT initialized_buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+  CUcontext cuda_context = nullptr;
 
   // Constructor for NvencEncoderState, initializes version fields for NVENC structures.
   // Input: None.
@@ -311,6 +337,44 @@ extern "C" {
 void free_stripe_encode_result_data(StripeEncodeResult* result);
 }
 
+// =====================================================================================
+// Functions to dynamically load CUDA Driver API
+// =====================================================================================
+bool LoadCudaApi() {
+    if (g_cuda_lib_handle) {
+        return true;
+    }
+
+    g_cuda_lib_handle = dlopen("libcuda.so", RTLD_LAZY);
+    if (!g_cuda_lib_handle) {
+        std::cerr << "CUDA_API_LOAD: dlopen failed for libcuda.so" << std::endl;
+        return false;
+    }
+
+    g_cuda_funcs.pfn_cuInit = (tcuInit)dlsym(g_cuda_lib_handle, "cuInit");
+    g_cuda_funcs.pfn_cuDeviceGet = (tcuDeviceGet)dlsym(g_cuda_lib_handle, "cuDeviceGet");
+    g_cuda_funcs.pfn_cuCtxCreate = (tcuCtxCreate)dlsym(g_cuda_lib_handle, "cuCtxCreate");
+    g_cuda_funcs.pfn_cuCtxDestroy = (tcuCtxDestroy)dlsym(g_cuda_lib_handle, "cuCtxDestroy");
+
+    if (!g_cuda_funcs.pfn_cuInit || !g_cuda_funcs.pfn_cuDeviceGet || !g_cuda_funcs.pfn_cuCtxCreate || !g_cuda_funcs.pfn_cuCtxDestroy) {
+        std::cerr << "CUDA_API_LOAD: dlsym failed for one or more CUDA functions." << std::endl;
+        dlclose(g_cuda_lib_handle);
+        g_cuda_lib_handle = nullptr;
+        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
+        return false;
+    }
+    return true;
+}
+
+void UnloadCudaApi() {
+    if (g_cuda_lib_handle) {
+        dlclose(g_cuda_lib_handle);
+        g_cuda_lib_handle = nullptr;
+        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
+    }
+}
+// =====================================================================================
+
 // Loads the NVIDIA NVENC library and initializes its API function pointers.
 // Input: None.
 // Output: True if the API was loaded successfully, false otherwise.
@@ -370,40 +434,34 @@ bool LoadNvencApi() {
 void reset_nvenc_encoder() {
   std::lock_guard<std::mutex> lock(g_nvenc_mutex);
 
-  if (!g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder ||
-      !g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer ||
-      !g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer) {
+  if (!g_nvenc_state.initialized) {
+    return;
+  }
+
+  if (g_nvenc_state.encoder_session && g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder) {
+    for (NV_ENC_INPUT_PTR& ptr : g_nvenc_state.input_buffers) {
+        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer)
+            g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer(g_nvenc_state.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    g_nvenc_state.input_buffers.clear();
+
+    for (NV_ENC_OUTPUT_PTR& ptr : g_nvenc_state.output_buffers) {
+        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer)
+            g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer(g_nvenc_state.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    g_nvenc_state.output_buffers.clear();
+
+    g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder(g_nvenc_state.encoder_session);
     g_nvenc_state.encoder_session = nullptr;
-    g_nvenc_state.input_buffers.clear();
-    g_nvenc_state.output_buffers.clear();
-    g_nvenc_state.initialized = false;
-    return;
   }
 
-  if (!g_nvenc_state.encoder_session) {
-    g_nvenc_state.input_buffers.clear();
-    g_nvenc_state.output_buffers.clear();
-    g_nvenc_state.initialized = false;
-    return;
+  if (g_nvenc_state.cuda_context && g_cuda_funcs.pfn_cuCtxDestroy) {
+    g_cuda_funcs.pfn_cuCtxDestroy(g_nvenc_state.cuda_context);
+    g_nvenc_state.cuda_context = nullptr;
   }
 
-  for (NV_ENC_INPUT_PTR& ptr : g_nvenc_state.input_buffers) {
-    if (ptr)
-      g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer(g_nvenc_state.encoder_session, ptr);
-    ptr = nullptr;
-  }
-  g_nvenc_state.input_buffers.clear();
-
-  for (NV_ENC_OUTPUT_PTR& ptr : g_nvenc_state.output_buffers) {
-    if (ptr)
-      g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer(g_nvenc_state.encoder_session,
-                                                            ptr);
-    ptr = nullptr;
-  }
-  g_nvenc_state.output_buffers.clear();
-
-  g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder(g_nvenc_state.encoder_session);
-  g_nvenc_state.encoder_session = nullptr;
   g_nvenc_state.initialized = false;
 }
 
@@ -414,25 +472,9 @@ void reset_nvenc_encoder() {
 void unload_nvenc_library_if_loaded() {
   std::lock_guard<std::mutex> lock(g_nvenc_mutex);
   if (g_nvenc_state.initialized) {
-    if (g_nvenc_state.encoder_session && g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder) {
-      for (NV_ENC_INPUT_PTR& ptr : g_nvenc_state.input_buffers) {
-        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer)
-          g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer(g_nvenc_state.encoder_session,
-                                                            ptr);
-        ptr = nullptr;
-      }
-      g_nvenc_state.input_buffers.clear();
-      for (NV_ENC_OUTPUT_PTR& ptr : g_nvenc_state.output_buffers) {
-        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer)
-          g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer(
-            g_nvenc_state.encoder_session, ptr);
-        ptr = nullptr;
-      }
-      g_nvenc_state.output_buffers.clear();
-      g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder(g_nvenc_state.encoder_session);
-      g_nvenc_state.encoder_session = nullptr;
-    }
-    g_nvenc_state.initialized = false;
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
   }
 
   if (g_nvenc_lib_handle) {
@@ -441,21 +483,18 @@ void unload_nvenc_library_if_loaded() {
     memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
     g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
   }
-  g_nvenc_state.initialized = false;
 }
 
 // Initializes the NVENC encoder with specified parameters.
 // If already initialized with the same parameters, it returns true.
 // Otherwise, it resets any existing encoder and initializes a new one.
-// Input: p_display - X11 Display pointer for OpenGL context.
-//        width - Encoding width.
+// Input: width - Encoding width.
 //        height - Encoding height.
 //        target_qp - Target quantization parameter for constant QP mode.
 //        fps - Target frames per second.
 //        use_yuv444 - True to use YUV444 color format, false for NV12 (YUV420).
 // Output: True if initialization was successful, false otherwise.
-bool initialize_nvenc_encoder(Display* p_display,
-                              int width,
+bool initialize_nvenc_encoder(int width,
                               int height,
                               int target_qp,
                               double fps,
@@ -478,28 +517,56 @@ bool initialize_nvenc_encoder(Display* p_display,
     g_nvenc_mutex.lock();
   }
 
+  if (!LoadCudaApi()) {
+    std::cerr << "NVENC_INIT_FATAL: Failed to load CUDA driver API." << std::endl;
+    return false;
+  }
+
   if (!g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx) {
     g_nvenc_state.initialized = false;
     return false;
+  }
+  
+  CUresult cu_status = g_cuda_funcs.pfn_cuInit(0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuInit failed with code " << cu_status << std::endl;
+      return false;
+  }
+  CUdevice cu_device;
+  cu_status = g_cuda_funcs.pfn_cuDeviceGet(&cu_device, 0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuDeviceGet failed with code " << cu_status << std::endl;
+      return false;
+  }
+  cu_status = g_cuda_funcs.pfn_cuCtxCreate(&g_nvenc_state.cuda_context, 0, cu_device);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuCtxCreate failed with code " << cu_status << std::endl;
+      return false;
   }
 
   NVENCSTATUS status;
   NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {0};
   session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
-  session_params.deviceType = NV_ENC_DEVICE_TYPE_OPENGL;
-  session_params.device = p_display;
+  session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+  session_params.device = g_nvenc_state.cuda_context;
   session_params.apiVersion = NVENCAPI_VERSION;
 
   status = g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx(
     &session_params, &g_nvenc_state.encoder_session);
 
   if (status != NV_ENC_SUCCESS) {
+    std::string error_str = "NVENC_INIT_ERROR: nvEncOpenEncodeSessionEx (CUDA Path) FAILED: " + std::to_string(status);
+    std::cerr << error_str << std::endl;
     g_nvenc_state.encoder_session = nullptr;
-    g_nvenc_state.initialized = false;
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
     return false;
   }
   if (!g_nvenc_state.encoder_session) {
-    g_nvenc_state.initialized = false;
+    g_nvenc_mutex.unlock();
+    reset_nvenc_encoder();
+    g_nvenc_mutex.lock();
     return false;
   }
 
@@ -875,15 +942,9 @@ public:
 
   bool is_nvidia_system_detected = false;
   bool nvenc_operational = false;
-  Display* glx_display_for_nvenc = nullptr;
-  Window glx_window_for_nvenc = 0;
-  GLXContext glx_context_for_nvenc = nullptr;
-  GLXFBConfig* glx_fbconfigs_for_nvenc = nullptr;
-  XVisualInfo* glx_visual_info_for_nvenc = nullptr;
-  Colormap glx_colormap_for_nvenc = 0;
 
 public:
-  // Constructor for ScreenCaptureModule. Attempts to load NVENC API.
+  // Constructor for ScreenCaptureModule.
   // Input: None.
   // Output: None.
   ScreenCaptureModule() : stop_requested(false) {
@@ -904,12 +965,7 @@ void start_capture() {
         stop_capture();
     }
 
-    // =======================================================================
-    // FIX: Reload the NVENC API here, at the start of every capture session.
-    // This ensures that if it was unloaded by stop_capture(), it's re-loaded
-    // for the new session.
     {
-        // Use a local lock, as LoadNvencApi uses the global g_nvenc_mutex
         std::lock_guard<std::mutex> lock(g_nvenc_mutex);
         if (LoadNvencApi()) {
             is_nvidia_system_detected = true;
@@ -917,7 +973,6 @@ void start_capture() {
             is_nvidia_system_detected = false;
         }
     }
-    // =======================================================================
 
     g_h264_minimal_store.reset();
 
@@ -945,6 +1000,7 @@ void start_capture() {
       reset_nvenc_encoder();
     }
     unload_nvenc_library_if_loaded();
+    UnloadCudaApi();
   }
 
   // Retrieves the current capture settings.
@@ -1043,103 +1099,11 @@ private:
         throw std::runtime_error("CAPTURE_FATAL: Failed to open X display " +
                                  std::string(display_name));
       }
-      this->glx_display_for_nvenc = display;
       root_window = DefaultRootWindow(display);
       screen_num = DefaultScreen(display);
 
       if (!XShmQueryExtension(display)) {
         throw std::runtime_error("CAPTURE_FATAL: X Shared Memory Extension not available!");
-      }
-
-      if (this->is_nvidia_system_detected) {
-        int glx_major, glx_minor;
-        if (!glXQueryVersion(display, &glx_major, &glx_minor)) {
-          throw std::runtime_error("GLX_FATAL: glXQueryVersion failed.");
-        }
-        static int fb_attributes[] = {GLX_X_RENDERABLE,
-                                      True,
-                                      GLX_DRAWABLE_TYPE,
-                                      GLX_WINDOW_BIT,
-                                      GLX_RENDER_TYPE,
-                                      GLX_RGBA_BIT,
-                                      GLX_X_VISUAL_TYPE,
-                                      GLX_TRUE_COLOR,
-                                      GLX_RED_SIZE,
-                                      8,
-                                      GLX_GREEN_SIZE,
-                                      8,
-                                      GLX_BLUE_SIZE,
-                                      8,
-                                      GLX_ALPHA_SIZE,
-                                      8,
-                                      GLX_DEPTH_SIZE,
-                                      24,
-                                      GLX_STENCIL_SIZE,
-                                      8,
-                                      GLX_DOUBLEBUFFER,
-                                      True,
-                                      None};
-        int fbcount;
-        this->glx_fbconfigs_for_nvenc =
-          glXChooseFBConfig(display, screen_num, fb_attributes, &fbcount);
-        if (!this->glx_fbconfigs_for_nvenc || fbcount == 0) {
-          if (this->glx_fbconfigs_for_nvenc)
-            XFree(this->glx_fbconfigs_for_nvenc);
-          this->glx_fbconfigs_for_nvenc = nullptr;
-          throw std::runtime_error("GLX_FATAL: glXChooseFBConfig failed.");
-        }
-        this->glx_visual_info_for_nvenc =
-          glXGetVisualFromFBConfig(display, this->glx_fbconfigs_for_nvenc[0]);
-        if (!this->glx_visual_info_for_nvenc) {
-          throw std::runtime_error("GLX_FATAL: glXGetVisualFromFBConfig failed.");
-        }
-        XSetWindowAttributes swa;
-        this->glx_colormap_for_nvenc =
-          XCreateColormap(display,
-                          root_window,
-                          this->glx_visual_info_for_nvenc->visual,
-                          AllocNone);
-        swa.colormap = this->glx_colormap_for_nvenc;
-        swa.background_pixmap = None;
-        swa.border_pixel = 0;
-        swa.event_mask = StructureNotifyMask;
-        this->glx_window_for_nvenc =
-          XCreateWindow(display,
-                        root_window,
-                        0,
-                        0,
-                        1,
-                        1,
-                        0,
-                        this->glx_visual_info_for_nvenc->depth,
-                        InputOutput,
-                        this->glx_visual_info_for_nvenc->visual,
-                        CWBorderPixel | CWColormap | CWEventMask,
-                        &swa);
-        if (!this->glx_window_for_nvenc) {
-          if (this->glx_colormap_for_nvenc)
-            XFreeColormap(display, this->glx_colormap_for_nvenc);
-          throw std::runtime_error("GLX_FATAL: XCreateWindow failed for GLX window.");
-        }
-        this->glx_context_for_nvenc =
-          glXCreateContext(display, this->glx_visual_info_for_nvenc, NULL, GL_TRUE);
-        if (!this->glx_context_for_nvenc) {
-          if (this->glx_window_for_nvenc)
-            XDestroyWindow(display, this->glx_window_for_nvenc);
-          if (this->glx_colormap_for_nvenc)
-            XFreeColormap(display, this->glx_colormap_for_nvenc);
-          throw std::runtime_error("GLX_FATAL: glXCreateContext failed.");
-        }
-        if (!glXMakeCurrent(
-              display, this->glx_window_for_nvenc, this->glx_context_for_nvenc)) {
-          if (this->glx_context_for_nvenc)
-            glXDestroyContext(display, this->glx_context_for_nvenc);
-          if (this->glx_window_for_nvenc)
-            XDestroyWindow(display, this->glx_window_for_nvenc);
-          if (this->glx_colormap_for_nvenc)
-            XFreeColormap(display, this->glx_colormap_for_nvenc);
-          throw std::runtime_error("GLX_FATAL: glXMakeCurrent failed.");
-        }
       }
 
       shm_image = XShmCreateImage(display,
@@ -1185,16 +1149,13 @@ private:
       this->nvenc_operational = false;
       if (this->is_nvidia_system_detected &&
           local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (this->glx_display_for_nvenc && this->glx_context_for_nvenc) {
-          if (initialize_nvenc_encoder(this->glx_display_for_nvenc,
-                                       local_capture_width_actual,
-                                       local_capture_height_actual,
-                                       local_current_h264_crf,
-                                       local_current_target_fps,
-                                       local_current_h264_fullcolor)) {
-            this->nvenc_operational = true;
-            g_nvenc_force_next_idr_global = true;
-          }
+        if (initialize_nvenc_encoder(local_capture_width_actual,
+                                     local_capture_height_actual,
+                                     local_current_h264_crf,
+                                     local_current_target_fps,
+                                     local_current_h264_fullcolor)) {
+          this->nvenc_operational = true;
+          g_nvenc_force_next_idr_global = true;
         }
       }
       if (!this->nvenc_operational && g_nvenc_state.initialized) {
@@ -1286,289 +1247,263 @@ private:
             full_bgr_data[base_idx + 2] = pixel_ptr[0];
           }
         }
-
-        std::vector<std::future<StripeEncodeResult>> futures;
-        std::vector<std::thread> threads;
-
-        int h264_base_even_height = 0;
-        int h264_num_stripes_with_extra_pair = 0;
-        int current_y_start_for_stripe = 0;
-        if (local_current_output_mode == OutputMode::H264 && N_processing_stripes > 0 &&
-            local_capture_height_actual > 0 && !local_current_h264_fullframe) {
-          int H = local_capture_height_actual, N = N_processing_stripes, base_h = H / N;
-          h264_base_even_height = (base_h > 0) ? (base_h - (base_h % 2)) : 0;
-          if (h264_base_even_height == 0 && H >= 2)
-            h264_base_even_height = 2;
-          if (h264_base_even_height > 0) {
-            int H_base_covered = h264_base_even_height * N, H_remaining = H - H_base_covered;
-            if (H_remaining < 0)
-              H_remaining = 0;
-            h264_num_stripes_with_extra_pair = std::min(H_remaining / 2, N);
-          }
-        }
+        
         bool any_content_encoded_this_frame = false;
-        int derived_h264_colorspace_setting;
-        bool derived_h264_use_full_range;
-        if (local_current_h264_fullcolor) {
-          derived_h264_colorspace_setting = 444;
-          derived_h264_use_full_range = true;
-        } else {
-          derived_h264_colorspace_setting = 420;
-          derived_h264_use_full_range = false;
-        }
 
-        bool use_advanced_damage_blocking_this_frame = (N_processing_stripes == 1);
-
-        for (int i = 0; i < N_processing_stripes; ++i) {
-          int start_y = 0;
-          int current_stripe_height = 0;
-
-          if (local_current_output_mode == OutputMode::H264) {
-            if (local_current_h264_fullframe) {
-              start_y = 0;
-              current_stripe_height = local_capture_height_actual;
-            } else {
-              start_y = current_y_start_for_stripe;
-              if (h264_base_even_height > 0) {
-                current_stripe_height = h264_base_even_height;
-                if (i < h264_num_stripes_with_extra_pair)
-                  current_stripe_height += 2;
-              } else if (N_processing_stripes == 1) {
-                current_stripe_height = local_capture_height_actual;
-              } else {
-                current_stripe_height = 0;
-              }
-            }
-          } else {
-            if (N_processing_stripes > 0) {
-              int base_stripe_height_jpeg =
-                local_capture_height_actual / N_processing_stripes;
-              int remainder_height_jpeg =
-                local_capture_height_actual % N_processing_stripes;
-              start_y =
-                i * base_stripe_height_jpeg + std::min(i, remainder_height_jpeg);
-              current_stripe_height =
-                base_stripe_height_jpeg + (i < remainder_height_jpeg ? 1 : 0);
-            } else {
-              current_stripe_height = 0;
-            }
-          }
-
-          if (current_stripe_height <= 0)
-            continue;
-          if (start_y + current_stripe_height > local_capture_height_actual) {
-            current_stripe_height = local_capture_height_actual - start_y;
-            if (current_stripe_height <= 0)
-              continue;
-            if (local_current_output_mode == OutputMode::H264 &&
-                !local_current_h264_fullframe && current_stripe_height % 2 != 0 &&
-                current_stripe_height > 0) {
-              current_stripe_height--;
-            }
-            if (current_stripe_height <= 0)
-              continue;
-          }
-
-          if (local_current_output_mode == OutputMode::H264 &&
-              !local_current_h264_fullframe) {
-            current_y_start_for_stripe += current_stripe_height;
-          }
-
-          bool send_this_stripe_final = false;
-          bool is_h264_idr_paintover_this_stripe = false;
-          const unsigned char* data_for_processing_ptr = nullptr;
-          std::vector<unsigned char> stripe_bgr_data_storage_iter;
-          bool data_was_extracted_this_iteration = false;
-
-          if (use_advanced_damage_blocking_this_frame) {
-            StripeOperationalMode current_op_mode = stripe_op_modes[i];
-            bool should_calculate_hash_adv = false;
-            bool should_send_stripe_preliminary_adv = false;
-            uint64_t current_hash_adv = stripe_previous_hashes[i];
-
-            if (current_op_mode == StripeOperationalMode::STALE_BLOCKED) {
-              stripe_block_timers[i]--;
-              stripe_consecutive_same_hashes[i]++;
-              if ((local_current_use_paint_over_quality &&
-                   local_current_output_mode == OutputMode::JPEG) ||
-                  local_current_output_mode == OutputMode::H264) {
-                if (stripe_consecutive_same_hashes[i] >=
-                      local_current_paint_over_trigger_frames &&
-                    !stripe_paint_over_sent[i]) {
-                  should_send_stripe_preliminary_adv = true;
-                }
-              }
-              if (stripe_block_timers[i] <= 0)
-                should_calculate_hash_adv = true;
-            } else if (current_op_mode == StripeOperationalMode::ACTIVE_BLOCKED) {
-              should_send_stripe_preliminary_adv = true;
-              stripe_paint_over_sent[i] = false;
-              stripe_consecutive_same_hashes[i] = 0;
-              stripe_block_timers[i]--;
-              if (stripe_block_timers[i] <= 0)
-                should_calculate_hash_adv = true;
-            } else {
-              should_calculate_hash_adv = true;
-            }
-
-            if (should_calculate_hash_adv || should_send_stripe_preliminary_adv) {
-              data_for_processing_ptr = full_bgr_data.data();
-              data_was_extracted_this_iteration = true;
-              if (should_calculate_hash_adv) {
-                current_hash_adv = calculate_stripe_hash(full_bgr_data);
-              }
-            }
-
-            if (current_op_mode == StripeOperationalMode::STALE_BLOCKED) {
-              if (should_calculate_hash_adv) {
-                if (current_hash_adv == stripe_previous_hashes[i]) {
-                  stripe_op_modes[i] = StripeOperationalMode::STALE_BLOCKED;
-                  stripe_block_timers[i] = local_current_damage_block_duration;
-                  if (should_send_stripe_preliminary_adv) {
-                    send_this_stripe_final = true;
-                    stripe_paint_over_sent[i] = true;
-                    if (local_current_output_mode == OutputMode::H264)
-                      is_h264_idr_paintover_this_stripe = true;
-                  }
-                } else {
-                  stripe_previous_hashes[i] = current_hash_adv;
-                  stripe_consecutive_same_hashes[i] = 0;
-                  stripe_consecutive_diff_hashes[i] = 1;
-                  stripe_op_modes[i] = StripeOperationalMode::CHECKING;
-                  send_this_stripe_final = true;
-                  stripe_paint_over_sent[i] = false;
-                }
-              } else {
-                if (should_send_stripe_preliminary_adv) {
-                  send_this_stripe_final = true;
-                  stripe_paint_over_sent[i] = true;
-                  if (local_current_output_mode == OutputMode::H264)
-                    is_h264_idr_paintover_this_stripe = true;
-                }
-              }
-            } else if (current_op_mode == StripeOperationalMode::ACTIVE_BLOCKED) {
-              send_this_stripe_final = true;
-              if (should_calculate_hash_adv) {
-                if (current_hash_adv == stripe_hash_at_active_block_start[i] ||
-                    current_hash_adv == stripe_previous_hashes[i]) {
-                  stripe_previous_hashes[i] = current_hash_adv;
-                  stripe_consecutive_same_hashes[i] = 1;
-                  stripe_consecutive_diff_hashes[i] = 0;
-                  stripe_op_modes[i] = StripeOperationalMode::CHECKING;
-                  current_jpeg_qualities[i] = local_current_use_paint_over_quality
-                                                ? local_current_paint_over_jpeg_quality
-                                                : local_current_jpeg_quality;
-                } else {
-                  stripe_previous_hashes[i] = current_hash_adv;
-                  stripe_consecutive_same_hashes[i] = 0;
-                  stripe_consecutive_diff_hashes[i] = 1;
-                  stripe_op_modes[i] = StripeOperationalMode::ACTIVE_BLOCKED;
-                  stripe_block_timers[i] = local_current_damage_block_duration;
-                  stripe_hash_at_active_block_start[i] = current_hash_adv;
-                }
-              }
-              if (should_calculate_hash_adv)
-                stripe_previous_hashes[i] = current_hash_adv;
-
-            } else {
-              if (current_hash_adv == stripe_previous_hashes[i]) {
-                stripe_consecutive_same_hashes[i]++;
-                stripe_consecutive_diff_hashes[i] = 0;
-                bool paint_over_cond =
-                  (local_current_output_mode == OutputMode::JPEG &&
-                   local_current_use_paint_over_quality) ||
-                  local_current_output_mode == OutputMode::H264;
-                if (paint_over_cond &&
-                    stripe_consecutive_same_hashes[i] >=
-                      local_current_paint_over_trigger_frames &&
-                    !stripe_paint_over_sent[i]) {
-                  send_this_stripe_final = true;
-                  stripe_paint_over_sent[i] = true;
-                  if (local_current_output_mode == OutputMode::H264)
-                    is_h264_idr_paintover_this_stripe = true;
-                }
-                if (stripe_consecutive_same_hashes[i] >= local_current_damage_block_threshold) {
-                  stripe_op_modes[i] = StripeOperationalMode::STALE_BLOCKED;
-                  stripe_block_timers[i] = local_current_damage_block_duration;
-                }
-              } else {
-                stripe_previous_hashes[i] = current_hash_adv;
-                stripe_consecutive_same_hashes[i] = 0;
-                stripe_consecutive_diff_hashes[i]++;
-                send_this_stripe_final = true;
-                stripe_paint_over_sent[i] = false;
-                if (local_current_output_mode == OutputMode::JPEG)
-                  current_jpeg_qualities[i] =
-                    std::max(current_jpeg_qualities[i] - 1, local_current_jpeg_quality);
-                if (stripe_consecutive_diff_hashes[i] >=
-                    local_current_damage_block_threshold) {
-                  stripe_op_modes[i] = StripeOperationalMode::ACTIVE_BLOCKED;
-                  stripe_block_timers[i] = local_current_damage_block_duration;
-                  stripe_hash_at_active_block_start[i] = current_hash_adv;
-                }
-              }
-            }
-          } else {
-            stripe_bgr_data_storage_iter.resize(
-              static_cast<size_t>(local_capture_width_actual) * current_stripe_height * 3);
-            int row_stride_bgr = local_capture_width_actual * 3;
-            for (int y_offset = 0; y_offset < current_stripe_height; ++y_offset) {
-              int global_y = start_y + y_offset;
-              size_t dest_offset = static_cast<size_t>(y_offset) * row_stride_bgr;
-              size_t src_offset = static_cast<size_t>(global_y) * row_stride_bgr;
-              if (global_y < local_capture_height_actual &&
-                  (src_offset + row_stride_bgr) <= full_bgr_data.size())
-                std::memcpy(stripe_bgr_data_storage_iter.data() + dest_offset,
-                            &full_bgr_data[src_offset],
-                            row_stride_bgr);
-              else
-                std::memset(
-                  stripe_bgr_data_storage_iter.data() + dest_offset, 0, row_stride_bgr);
-            }
-            data_for_processing_ptr = stripe_bgr_data_storage_iter.data();
-            data_was_extracted_this_iteration = true;
-
-            uint64_t current_hash_simple =
-              calculate_stripe_hash(stripe_bgr_data_storage_iter);
-
-            if (current_hash_simple == stripe_previous_hashes[i]) {
-              stripe_consecutive_same_hashes[i]++;
-              stripe_consecutive_diff_hashes[i] = 0;
-              bool paint_over_cond =
-                (local_current_output_mode == OutputMode::JPEG &&
-                 local_current_use_paint_over_quality) ||
-                local_current_output_mode == OutputMode::H264;
-              if (paint_over_cond &&
-                  stripe_consecutive_same_hashes[i] >=
-                    local_current_paint_over_trigger_frames &&
-                  !stripe_paint_over_sent[i]) {
-                send_this_stripe_final = true;
-                stripe_paint_over_sent[i] = true;
-                if (local_current_output_mode == OutputMode::H264)
-                  is_h264_idr_paintover_this_stripe = true;
-              }
-            } else {
-              stripe_previous_hashes[i] = current_hash_simple;
-              stripe_consecutive_same_hashes[i] = 0;
-              stripe_consecutive_diff_hashes[i]++;
-              send_this_stripe_final = true;
-              stripe_paint_over_sent[i] = false;
-              if (local_current_output_mode == OutputMode::JPEG) {
-                current_jpeg_qualities[i] =
-                  std::max(current_jpeg_qualities[i] - 1, local_current_jpeg_quality);
-              }
-            }
-          }
-
-          if (send_this_stripe_final) {
+        // =====================================================================================
+        // NEW: Top-level branch to bypass damage checking for NVENC
+        // =====================================================================================
+        if (this->nvenc_operational) {
             any_content_encoded_this_frame = true;
-            if (!data_was_extracted_this_iteration) {
-              if (N_processing_stripes == 1) {
-                data_for_processing_ptr = full_bgr_data.data();
+            total_nvenc_frames_encoded_this_interval++;
+            
+            bool force_idr_for_nvenc = g_nvenc_force_next_idr_global.exchange(false);
+            StripeEncodeResult nvenc_res;
+            try {
+                nvenc_res = encode_fullframe_nvenc(local_capture_width_actual,
+                                                   local_capture_height_actual,
+                                                   full_bgr_data.data(),
+                                                   this->frame_counter,
+                                                   force_idr_for_nvenc);
+                if (stripe_callback && nvenc_res.data && nvenc_res.size > 0) {
+                    stripe_callback(&nvenc_res, user_data);
+                } else if (nvenc_res.data) {
+                    free_stripe_encode_result_data(&nvenc_res);
+                }
+            } catch (const std::runtime_error& enc_err) {
+                std::cerr << "NVENC_ENCODE_RUNTIME_ERROR: " << enc_err.what()
+                          << ". Disabling NVENC for this session." << std::endl;
+                this->nvenc_operational = false;
+                reset_nvenc_encoder();
+                if (force_idr_for_nvenc) {
+                    g_nvenc_force_next_idr_global = true;
+                }
+            }
+        } else {
+            // This is the original path for JPEG and x264 with damage checking
+            std::vector<std::future<StripeEncodeResult>> futures;
+            std::vector<std::thread> threads;
+
+            int h264_base_even_height = 0;
+            int h264_num_stripes_with_extra_pair = 0;
+            int current_y_start_for_stripe = 0;
+            if (local_current_output_mode == OutputMode::H264 && N_processing_stripes > 0 &&
+                local_capture_height_actual > 0 && !local_current_h264_fullframe) {
+              int H = local_capture_height_actual, N = N_processing_stripes, base_h = H / N;
+              h264_base_even_height = (base_h > 0) ? (base_h - (base_h % 2)) : 0;
+              if (h264_base_even_height == 0 && H >= 2)
+                h264_base_even_height = 2;
+              if (h264_base_even_height > 0) {
+                int H_base_covered = h264_base_even_height * N, H_remaining = H - H_base_covered;
+                if (H_remaining < 0)
+                  H_remaining = 0;
+                h264_num_stripes_with_extra_pair = std::min(H_remaining / 2, N);
+              }
+            }
+            int derived_h264_colorspace_setting;
+            bool derived_h264_use_full_range;
+            if (local_current_h264_fullcolor) {
+              derived_h264_colorspace_setting = 444;
+              derived_h264_use_full_range = true;
+            } else {
+              derived_h264_colorspace_setting = 420;
+              derived_h264_use_full_range = false;
+            }
+
+            bool use_advanced_damage_blocking_this_frame = (N_processing_stripes == 1);
+
+            for (int i = 0; i < N_processing_stripes; ++i) {
+              int start_y = 0;
+              int current_stripe_height = 0;
+
+              if (local_current_output_mode == OutputMode::H264) {
+                if (local_current_h264_fullframe) {
+                  start_y = 0;
+                  current_stripe_height = local_capture_height_actual;
+                } else {
+                  start_y = current_y_start_for_stripe;
+                  if (h264_base_even_height > 0) {
+                    current_stripe_height = h264_base_even_height;
+                    if (i < h264_num_stripes_with_extra_pair)
+                      current_stripe_height += 2;
+                  } else if (N_processing_stripes == 1) {
+                    current_stripe_height = local_capture_height_actual;
+                  } else {
+                    current_stripe_height = 0;
+                  }
+                }
+              } else {
+                if (N_processing_stripes > 0) {
+                  int base_stripe_height_jpeg =
+                    local_capture_height_actual / N_processing_stripes;
+                  int remainder_height_jpeg =
+                    local_capture_height_actual % N_processing_stripes;
+                  start_y =
+                    i * base_stripe_height_jpeg + std::min(i, remainder_height_jpeg);
+                  current_stripe_height =
+                    base_stripe_height_jpeg + (i < remainder_height_jpeg ? 1 : 0);
+                } else {
+                  current_stripe_height = 0;
+                }
+              }
+
+              if (current_stripe_height <= 0)
+                continue;
+              if (start_y + current_stripe_height > local_capture_height_actual) {
+                current_stripe_height = local_capture_height_actual - start_y;
+                if (current_stripe_height <= 0)
+                  continue;
+                if (local_current_output_mode == OutputMode::H264 &&
+                    !local_current_h264_fullframe && current_stripe_height % 2 != 0 &&
+                    current_stripe_height > 0) {
+                  current_stripe_height--;
+                }
+                if (current_stripe_height <= 0)
+                  continue;
+              }
+
+              if (local_current_output_mode == OutputMode::H264 &&
+                  !local_current_h264_fullframe) {
+                current_y_start_for_stripe += current_stripe_height;
+              }
+
+              bool send_this_stripe_final = false;
+              bool is_h264_idr_paintover_this_stripe = false;
+              const unsigned char* data_for_processing_ptr = nullptr;
+              std::vector<unsigned char> stripe_bgr_data_storage_iter;
+              bool data_was_extracted_this_iteration = false;
+
+              if (use_advanced_damage_blocking_this_frame) {
+                StripeOperationalMode current_op_mode = stripe_op_modes[i];
+                bool should_calculate_hash_adv = false;
+                bool should_send_stripe_preliminary_adv = false;
+                uint64_t current_hash_adv = stripe_previous_hashes[i];
+
+                if (current_op_mode == StripeOperationalMode::STALE_BLOCKED) {
+                  stripe_block_timers[i]--;
+                  stripe_consecutive_same_hashes[i]++;
+                  if ((local_current_use_paint_over_quality &&
+                       local_current_output_mode == OutputMode::JPEG) ||
+                      local_current_output_mode == OutputMode::H264) {
+                    if (stripe_consecutive_same_hashes[i] >=
+                          local_current_paint_over_trigger_frames &&
+                        !stripe_paint_over_sent[i]) {
+                      should_send_stripe_preliminary_adv = true;
+                    }
+                  }
+                  if (stripe_block_timers[i] <= 0)
+                    should_calculate_hash_adv = true;
+                } else if (current_op_mode == StripeOperationalMode::ACTIVE_BLOCKED) {
+                  should_send_stripe_preliminary_adv = true;
+                  stripe_paint_over_sent[i] = false;
+                  stripe_consecutive_same_hashes[i] = 0;
+                  stripe_block_timers[i]--;
+                  if (stripe_block_timers[i] <= 0)
+                    should_calculate_hash_adv = true;
+                } else {
+                  should_calculate_hash_adv = true;
+                }
+
+                if (should_calculate_hash_adv || should_send_stripe_preliminary_adv) {
+                  data_for_processing_ptr = full_bgr_data.data();
+                  data_was_extracted_this_iteration = true;
+                  if (should_calculate_hash_adv) {
+                    current_hash_adv = calculate_stripe_hash(full_bgr_data);
+                  }
+                }
+
+                if (current_op_mode == StripeOperationalMode::STALE_BLOCKED) {
+                  if (should_calculate_hash_adv) {
+                    if (current_hash_adv == stripe_previous_hashes[i]) {
+                      stripe_op_modes[i] = StripeOperationalMode::STALE_BLOCKED;
+                      stripe_block_timers[i] = local_current_damage_block_duration;
+                      if (should_send_stripe_preliminary_adv) {
+                        send_this_stripe_final = true;
+                        stripe_paint_over_sent[i] = true;
+                        if (local_current_output_mode == OutputMode::H264)
+                          is_h264_idr_paintover_this_stripe = true;
+                      }
+                    } else {
+                      stripe_previous_hashes[i] = current_hash_adv;
+                      stripe_consecutive_same_hashes[i] = 0;
+                      stripe_consecutive_diff_hashes[i] = 1;
+                      stripe_op_modes[i] = StripeOperationalMode::CHECKING;
+                      send_this_stripe_final = true;
+                      stripe_paint_over_sent[i] = false;
+                    }
+                  } else {
+                    if (should_send_stripe_preliminary_adv) {
+                      send_this_stripe_final = true;
+                      stripe_paint_over_sent[i] = true;
+                      if (local_current_output_mode == OutputMode::H264)
+                        is_h264_idr_paintover_this_stripe = true;
+                    }
+                  }
+                } else if (current_op_mode == StripeOperationalMode::ACTIVE_BLOCKED) {
+                  send_this_stripe_final = true;
+                  if (should_calculate_hash_adv) {
+                    if (current_hash_adv == stripe_hash_at_active_block_start[i] ||
+                        current_hash_adv == stripe_previous_hashes[i]) {
+                      stripe_previous_hashes[i] = current_hash_adv;
+                      stripe_consecutive_same_hashes[i] = 1;
+                      stripe_consecutive_diff_hashes[i] = 0;
+                      stripe_op_modes[i] = StripeOperationalMode::CHECKING;
+                      current_jpeg_qualities[i] = local_current_use_paint_over_quality
+                                                    ? local_current_paint_over_jpeg_quality
+                                                    : local_current_jpeg_quality;
+                    } else {
+                      stripe_previous_hashes[i] = current_hash_adv;
+                      stripe_consecutive_same_hashes[i] = 0;
+                      stripe_consecutive_diff_hashes[i] = 1;
+                      stripe_op_modes[i] = StripeOperationalMode::ACTIVE_BLOCKED;
+                      stripe_block_timers[i] = local_current_damage_block_duration;
+                      stripe_hash_at_active_block_start[i] = current_hash_adv;
+                    }
+                  }
+                  if (should_calculate_hash_adv)
+                    stripe_previous_hashes[i] = current_hash_adv;
+
+                } else {
+                  if (current_hash_adv == stripe_previous_hashes[i]) {
+                    stripe_consecutive_same_hashes[i]++;
+                    stripe_consecutive_diff_hashes[i] = 0;
+                    bool paint_over_cond =
+                      (local_current_output_mode == OutputMode::JPEG &&
+                       local_current_use_paint_over_quality) ||
+                      local_current_output_mode == OutputMode::H264;
+                    if (paint_over_cond &&
+                        stripe_consecutive_same_hashes[i] >=
+                          local_current_paint_over_trigger_frames &&
+                        !stripe_paint_over_sent[i]) {
+                      send_this_stripe_final = true;
+                      stripe_paint_over_sent[i] = true;
+                      if (local_current_output_mode == OutputMode::H264)
+                        is_h264_idr_paintover_this_stripe = true;
+                    }
+                    if (stripe_consecutive_same_hashes[i] >= local_current_damage_block_threshold) {
+                      stripe_op_modes[i] = StripeOperationalMode::STALE_BLOCKED;
+                      stripe_block_timers[i] = local_current_damage_block_duration;
+                    }
+                  } else {
+                    stripe_previous_hashes[i] = current_hash_adv;
+                    stripe_consecutive_same_hashes[i] = 0;
+                    stripe_consecutive_diff_hashes[i]++;
+                    send_this_stripe_final = true;
+                    stripe_paint_over_sent[i] = false;
+                    if (local_current_output_mode == OutputMode::JPEG)
+                      current_jpeg_qualities[i] =
+                        std::max(current_jpeg_qualities[i] - 1, local_current_jpeg_quality);
+                    if (stripe_consecutive_diff_hashes[i] >=
+                        local_current_damage_block_threshold) {
+                      stripe_op_modes[i] = StripeOperationalMode::ACTIVE_BLOCKED;
+                      stripe_block_timers[i] = local_current_damage_block_duration;
+                      stripe_hash_at_active_block_start[i] = current_hash_adv;
+                    }
+                  }
+                }
               } else {
                 stripe_bgr_data_storage_iter.resize(
-                  static_cast<size_t>(local_capture_width_actual) * current_stripe_height *
-                  3);
+                  static_cast<size_t>(local_capture_width_actual) * current_stripe_height * 3);
                 int row_stride_bgr = local_capture_width_actual * 3;
                 for (int y_offset = 0; y_offset < current_stripe_height; ++y_offset) {
                   int global_y = start_y + y_offset;
@@ -1580,132 +1515,168 @@ private:
                                 &full_bgr_data[src_offset],
                                 row_stride_bgr);
                   else
-                    std::memset(stripe_bgr_data_storage_iter.data() + dest_offset,
-                                0,
-                                row_stride_bgr);
+                    std::memset(
+                      stripe_bgr_data_storage_iter.data() + dest_offset, 0, row_stride_bgr);
                 }
                 data_for_processing_ptr = stripe_bgr_data_storage_iter.data();
-              }
-            }
-            if (!data_for_processing_ptr) {
-              std::cerr << "CRITICAL_WARN: Stripe " << i
-                        << " trying to send with NULL data_for_processing_ptr." << std::endl;
-              continue;
-            }
+                data_was_extracted_this_iteration = true;
 
-            if (local_current_output_mode == OutputMode::H264 &&
-                local_current_h264_fullframe && this->is_nvidia_system_detected &&
-                this->nvenc_operational) {
-              total_nvenc_frames_encoded_this_interval++;
-              bool force_idr_for_nvenc =
-                g_nvenc_force_next_idr_global.exchange(false) ||
-                is_h264_idr_paintover_this_stripe;
-              StripeEncodeResult nvenc_res;
-              try {
-                nvenc_res = encode_fullframe_nvenc(local_capture_width_actual,
-                                                   local_capture_height_actual,
-                                                   data_for_processing_ptr,
-                                                   this->frame_counter,
-                                                   force_idr_for_nvenc);
-                if (stripe_callback && nvenc_res.data && nvenc_res.size > 0)
-                  stripe_callback(&nvenc_res, user_data);
-                else if (nvenc_res.data)
-                  free_stripe_encode_result_data(&nvenc_res);
-              } catch (const std::runtime_error& enc_err) {
-                std::cerr << "NVENC_ENCODE_RUNTIME_ERROR: " << enc_err.what()
-                          << ". Disabling NVENC for this session." << std::endl;
-                this->nvenc_operational = false;
-                reset_nvenc_encoder();
-                if (force_idr_for_nvenc)
-                  g_nvenc_force_next_idr_global = true;
-              }
-            } else if (local_current_output_mode == OutputMode::JPEG) {
-              total_stripes_encoded_this_interval++;
-              int quality_to_use_jpeg;
-              if (stripe_paint_over_sent[i] && local_current_use_paint_over_quality)
-                quality_to_use_jpeg = local_current_paint_over_jpeg_quality;
-              else if (use_advanced_damage_blocking_this_frame &&
-                       stripe_op_modes[i] == StripeOperationalMode::ACTIVE_BLOCKED)
-                quality_to_use_jpeg = local_current_jpeg_quality;
-              else
-                quality_to_use_jpeg = current_jpeg_qualities[i];
+                uint64_t current_hash_simple =
+                  calculate_stripe_hash(stripe_bgr_data_storage_iter);
 
-              std::packaged_task<StripeEncodeResult(
-                int, int, int, int, int, int, const unsigned char*, int, int, int)>
-                task(encode_stripe_jpeg);
-              futures.push_back(task.get_future());
-              threads.push_back(std::thread(std::move(task),
-                                            i,
-                                            start_y,
-                                            current_stripe_height,
-                                            DisplayWidth(display, screen_num),
-                                            local_capture_height_actual,
-                                            local_capture_width_actual,
-                                            full_bgr_data.data(),
-                                            static_cast<int>(full_bgr_data.size()),
-                                            quality_to_use_jpeg,
-                                            this->frame_counter));
-
-            } else {
-              total_stripes_encoded_this_interval++;
-              int crf_for_encode = local_current_h264_crf;
-              if (is_h264_idr_paintover_this_stripe && local_current_h264_crf > 10) {
-                crf_for_encode = 10;
-                std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-                g_h264_minimal_store.ensure_size(i);
-                g_h264_minimal_store.force_idr_flags[i] = true;
+                if (current_hash_simple == stripe_previous_hashes[i]) {
+                  stripe_consecutive_same_hashes[i]++;
+                  stripe_consecutive_diff_hashes[i] = 0;
+                  bool paint_over_cond =
+                    (local_current_output_mode == OutputMode::JPEG &&
+                     local_current_use_paint_over_quality) ||
+                    local_current_output_mode == OutputMode::H264;
+                  if (paint_over_cond &&
+                      stripe_consecutive_same_hashes[i] >=
+                        local_current_paint_over_trigger_frames &&
+                      !stripe_paint_over_sent[i]) {
+                    send_this_stripe_final = true;
+                    stripe_paint_over_sent[i] = true;
+                    if (local_current_output_mode == OutputMode::H264)
+                      is_h264_idr_paintover_this_stripe = true;
+                  }
+                } else {
+                  stripe_previous_hashes[i] = current_hash_simple;
+                  stripe_consecutive_same_hashes[i] = 0;
+                  stripe_consecutive_diff_hashes[i]++;
+                  send_this_stripe_final = true;
+                  stripe_paint_over_sent[i] = false;
+                  if (local_current_output_mode == OutputMode::JPEG) {
+                    current_jpeg_qualities[i] =
+                      std::max(current_jpeg_qualities[i] - 1, local_current_jpeg_quality);
+                  }
+                }
               }
 
-              std::packaged_task<StripeEncodeResult(
-                int, int, int, int, const unsigned char*, int, int, int, bool)>
-                task(encode_stripe_h264);
-              futures.push_back(task.get_future());
-              std::vector<unsigned char> data_copy_for_thread(
-                data_for_processing_ptr,
-                data_for_processing_ptr +
-                  (static_cast<size_t>(local_capture_width_actual) *
-                   current_stripe_height * 3));
-              threads.push_back(std::thread(
-                [task_moved = std::move(task),
-                 i,
-                 start_y_thr = start_y,
-                 stripe_h_thr = current_stripe_height,
-                 cap_w_thr = local_capture_width_actual,
-                 data_c = std::move(data_copy_for_thread),
-                 fc_thr = this->frame_counter,
-                 crf_val_thr = crf_for_encode,
-                 cs_thr = derived_h264_colorspace_setting,
-                 fr_thr = derived_h264_use_full_range]() mutable {
-                  task_moved(i,
-                             start_y_thr,
-                             stripe_h_thr,
-                             cap_w_thr,
-                             data_c.data(),
-                             fc_thr,
-                             crf_val_thr,
-                             cs_thr,
-                             fr_thr);
-                }));
+              if (send_this_stripe_final) {
+                any_content_encoded_this_frame = true;
+                if (!data_was_extracted_this_iteration) {
+                  if (N_processing_stripes == 1) {
+                    data_for_processing_ptr = full_bgr_data.data();
+                  } else {
+                    stripe_bgr_data_storage_iter.resize(
+                      static_cast<size_t>(local_capture_width_actual) * current_stripe_height *
+                      3);
+                    int row_stride_bgr = local_capture_width_actual * 3;
+                    for (int y_offset = 0; y_offset < current_stripe_height; ++y_offset) {
+                      int global_y = start_y + y_offset;
+                      size_t dest_offset = static_cast<size_t>(y_offset) * row_stride_bgr;
+                      size_t src_offset = static_cast<size_t>(global_y) * row_stride_bgr;
+                      if (global_y < local_capture_height_actual &&
+                          (src_offset + row_stride_bgr) <= full_bgr_data.size())
+                        std::memcpy(stripe_bgr_data_storage_iter.data() + dest_offset,
+                                    &full_bgr_data[src_offset],
+                                    row_stride_bgr);
+                      else
+                        std::memset(stripe_bgr_data_storage_iter.data() + dest_offset,
+                                    0,
+                                    row_stride_bgr);
+                    }
+                    data_for_processing_ptr = stripe_bgr_data_storage_iter.data();
+                  }
+                }
+                if (!data_for_processing_ptr) {
+                  std::cerr << "CRITICAL_WARN: Stripe " << i
+                            << " trying to send with NULL data_for_processing_ptr." << std::endl;
+                  continue;
+                }
+
+                if (local_current_output_mode == OutputMode::JPEG) {
+                  total_stripes_encoded_this_interval++;
+                  int quality_to_use_jpeg;
+                  if (stripe_paint_over_sent[i] && local_current_use_paint_over_quality)
+                    quality_to_use_jpeg = local_current_paint_over_jpeg_quality;
+                  else if (use_advanced_damage_blocking_this_frame &&
+                           stripe_op_modes[i] == StripeOperationalMode::ACTIVE_BLOCKED)
+                    quality_to_use_jpeg = local_current_jpeg_quality;
+                  else
+                    quality_to_use_jpeg = current_jpeg_qualities[i];
+
+                  std::packaged_task<StripeEncodeResult(
+                    int, int, int, int, int, int, const unsigned char*, int, int, int)>
+                    task(encode_stripe_jpeg);
+                  futures.push_back(task.get_future());
+                  threads.push_back(std::thread(std::move(task),
+                                                i,
+                                                start_y,
+                                                current_stripe_height,
+                                                DisplayWidth(display, screen_num),
+                                                local_capture_height_actual,
+                                                local_capture_width_actual,
+                                                full_bgr_data.data(),
+                                                static_cast<int>(full_bgr_data.size()),
+                                                quality_to_use_jpeg,
+                                                this->frame_counter));
+
+                } else { // H264 x264
+                  total_stripes_encoded_this_interval++;
+                  int crf_for_encode = local_current_h264_crf;
+                  if (is_h264_idr_paintover_this_stripe && local_current_h264_crf > 10) {
+                    crf_for_encode = 10;
+                    std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
+                    g_h264_minimal_store.ensure_size(i);
+                    g_h264_minimal_store.force_idr_flags[i] = true;
+                  }
+
+                  std::packaged_task<StripeEncodeResult(
+                    int, int, int, int, const unsigned char*, int, int, int, bool)>
+                    task(encode_stripe_h264);
+                  futures.push_back(task.get_future());
+                  std::vector<unsigned char> data_copy_for_thread(
+                    data_for_processing_ptr,
+                    data_for_processing_ptr +
+                      (static_cast<size_t>(local_capture_width_actual) *
+                       current_stripe_height * 3));
+                  threads.push_back(std::thread(
+                    [task_moved = std::move(task),
+                     i,
+                     start_y_thr = start_y,
+                     stripe_h_thr = current_stripe_height,
+                     cap_w_thr = local_capture_width_actual,
+                     data_c = std::move(data_copy_for_thread),
+                     fc_thr = this->frame_counter,
+                     crf_val_thr = crf_for_encode,
+                     cs_thr = derived_h264_colorspace_setting,
+                     fr_thr = derived_h264_use_full_range]() mutable {
+                      task_moved(i,
+                                 start_y_thr,
+                                 stripe_h_thr,
+                                 cap_w_thr,
+                                 data_c.data(),
+                                 fc_thr,
+                                 crf_val_thr,
+                                 cs_thr,
+                                 fr_thr);
+                    }));
+                }
+              }
             }
-          }
+
+            std::vector<StripeEncodeResult> stripe_results;
+            stripe_results.reserve(futures.size());
+            for (auto& future : futures)
+              stripe_results.push_back(future.get());
+            futures.clear();
+            for (StripeEncodeResult& result : stripe_results) {
+              if (stripe_callback && result.data && result.size > 0)
+                stripe_callback(&result, user_data);
+              else if (result.data)
+                free_stripe_encode_result_data(&result);
+            }
+            stripe_results.clear();
+            for (auto& thread : threads)
+              if (thread.joinable())
+                thread.join();
+            threads.clear();
         }
-
-        std::vector<StripeEncodeResult> stripe_results;
-        stripe_results.reserve(futures.size());
-        for (auto& future : futures)
-          stripe_results.push_back(future.get());
-        futures.clear();
-        for (StripeEncodeResult& result : stripe_results) {
-          if (stripe_callback && result.data && result.size > 0)
-            stripe_callback(&result, user_data);
-          else if (result.data)
-            free_stripe_encode_result_data(&result);
-        }
-        stripe_results.clear();
-        for (auto& thread : threads)
-          if (thread.joinable())
-            thread.join();
-        threads.clear();
+        // =====================================================================================
+        // END of the new top-level branch
+        // =====================================================================================
 
         this->frame_counter++;
         if (any_content_encoded_this_frame)
@@ -1783,32 +1754,6 @@ private:
     }
 
     if (display) {
-      if (this->is_nvidia_system_detected) {
-        if (this->glx_context_for_nvenc) {
-          if (glXGetCurrentDisplay() == display &&
-              glXGetCurrentContext() == this->glx_context_for_nvenc) {
-            glXMakeCurrent(display, None, NULL);
-          }
-          glXDestroyContext(display, this->glx_context_for_nvenc);
-          this->glx_context_for_nvenc = nullptr;
-        }
-        if (this->glx_window_for_nvenc) {
-          XDestroyWindow(display, this->glx_window_for_nvenc);
-          this->glx_window_for_nvenc = 0;
-        }
-        if (this->glx_colormap_for_nvenc) {
-          XFreeColormap(display, this->glx_colormap_for_nvenc);
-          this->glx_colormap_for_nvenc = 0;
-        }
-        if (this->glx_visual_info_for_nvenc) {
-          XFree(this->glx_visual_info_for_nvenc);
-          this->glx_visual_info_for_nvenc = nullptr;
-        }
-        if (this->glx_fbconfigs_for_nvenc) {
-          XFree(this->glx_fbconfigs_for_nvenc);
-          this->glx_fbconfigs_for_nvenc = nullptr;
-        }
-      }
       if (shm_image) {
         XShmDetach(display, &shminfo_loop);
         if (shminfo_loop.shmaddr && shminfo_loop.shmaddr != (char*)-1)
@@ -1820,7 +1765,6 @@ private:
       }
       XCloseDisplay(display);
       display = nullptr;
-      this->glx_display_for_nvenc = nullptr;
     }
     if (g_nvenc_state.initialized)
       reset_nvenc_encoder();
