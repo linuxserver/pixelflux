@@ -17,7 +17,6 @@ This module relies on a native C++ component.
 ```bash
 sudo apt-get update && \
 sudo apt-get install -y \
-  cmake \
   g++ \
   gcc \
   libjpeg-turbo8-dev \
@@ -25,7 +24,6 @@ sudo apt-get install -y \
   libxfixes-dev \
   libxext-dev \
   libx264-dev \
-  make \
   python3-dev \
   python3-pip \
   python3-websockets

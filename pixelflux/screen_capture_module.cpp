@@ -39,7 +39,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #define XXH_STATIC_LINKING_ONLY
-#include <xxhash.h>
+#include "xxhash.h"
 #include <libyuv/convert.h>
 #include <libyuv/convert_from.h>
 #include <libyuv/convert_from_argb.h>
