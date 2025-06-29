@@ -20,7 +20,7 @@ setup(
             "pixelflux.screen_capture_module",
             sources=["pixelflux/screen_capture_module.cpp", "pixelflux/include/xxhash.c"],
             include_dirs=["pixelflux/include"],
-            libraries=["X11", "Xext", "Xfixes", "jpeg", "x264", "yuv", "dl"],
+            libraries=["X11", "Xext", "Xfixes", "jpeg", "x264", "yuv", "dl", "pthread"],
             language="c++",
             extra_compile_args=["-std=c++17"],
         )
