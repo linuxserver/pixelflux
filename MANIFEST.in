@@ -1,2 +1,0 @@
-include src/CMakeLists.txt
-include src/screen_capture_module.cpp
