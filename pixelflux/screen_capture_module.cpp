@@ -30,6 +30,8 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <Python.h>
+#include <structmember.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xfixes.h>
@@ -3128,3 +3130,521 @@ uint64_t calculate_rgb_stripe_hash(const std::vector<unsigned char>& rgb_data) {
   if (rgb_data.empty()) return 0;
   return XXH3_64bits(rgb_data.data(), rgb_data.size());
 }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+///////////////////////
+// Python Type: CaptureSettings
+///////////////////////
+typedef struct {
+    PyObject_HEAD
+    CaptureSettings settings;
+} PyCaptureSettings;
+
+// PyMemberDef for CaptureSettings
+static PyMemberDef PyCaptureSettings_members[] = {
+    {"capture_width", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, capture_width), 0, "capture width"},
+    {"capture_height", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, capture_height), 0, "capture height"},
+    {"capture_x", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, capture_x), 0, "capture x"},
+    {"capture_y", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, capture_y), 0, "capture y"},
+    {"target_fps", T_DOUBLE, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, target_fps), 0, "target fps"},
+    {"jpeg_quality", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, jpeg_quality), 0, "jpeg quality"},
+    {"paint_over_jpeg_quality", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, paint_over_jpeg_quality), 0, "paint over jpeg quality"},
+    {"use_paint_over_quality", T_BOOL, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, use_paint_over_quality), 0, "use paint over quality"},
+    {"paint_over_trigger_frames", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, paint_over_trigger_frames), 0, "paint over trigger frames"},
+    {"damage_block_threshold", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, damage_block_threshold), 0, "damage block threshold"},
+    {"damage_block_duration", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, damage_block_duration), 0, "damage block duration"},
+    {"output_mode", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, output_mode), 0, "output mode"},
+    {"h264_crf", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, h264_crf), 0, "h264 crf"},
+    {"h264_fullcolor", T_BOOL, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, h264_fullcolor), 0, "h264 fullcolor"},
+    {"h264_fullframe", T_BOOL, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, h264_fullframe), 0, "h264 fullframe"},
+    {"capture_cursor", T_BOOL, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, capture_cursor), 0, "capture cursor"},
+    {"watermark_path", T_STRING, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, watermark_path), 0, "watermark path"},
+    {"watermark_location_enum", T_INT, offsetof(PyCaptureSettings, settings) + offsetof(CaptureSettings, watermark_location_enum), 0, "watermark location enum"},
+    {NULL}
+};
+
+static void PyCaptureSettings_dealloc(PyCaptureSettings* self) {
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* PyCaptureSettings_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+    PyCaptureSettings* self = (PyCaptureSettings*)type->tp_alloc(type, 0);
+    if (self) {
+        self->settings = CaptureSettings();
+    }
+    return (PyObject*)self;
+}
+
+static int PyCaptureSettings_init(PyCaptureSettings* self, PyObject* args, PyObject* kwds) {
+    static const char* kwlist[] = {
+        "capture_width", "capture_height", "capture_x", "capture_y", "target_fps",
+        "jpeg_quality", "paint_over_jpeg_quality", "use_paint_over_quality",
+        "paint_over_trigger_frames", "damage_block_threshold", "damage_block_duration",
+        "output_mode", "h264_crf", "h264_fullcolor", "h264_fullframe", "capture_cursor",
+        "watermark_path", "watermark_location_enum", NULL
+    };
+    int capture_width = 1920, capture_height = 1080, capture_x = 0, capture_y = 0;
+    double target_fps = 60.0;
+    int jpeg_quality = 85, paint_over_jpeg_quality = 95, paint_over_trigger_frames = 10;
+    int damage_block_threshold = 15, damage_block_duration = 30, output_mode = 0, h264_crf = 25;
+    int h264_fullcolor = 0, h264_fullframe = 0, capture_cursor = 0, watermark_location_enum = 0;
+    const char* watermark_path = NULL;
+    int use_paint_over_quality = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwds,
+            "|iiiidiiipiiiiiiisi",
+            (char**)kwlist,
+            &capture_width, &capture_height, &capture_x, &capture_y, &target_fps,
+            &jpeg_quality, &paint_over_jpeg_quality, &use_paint_over_quality,
+            &paint_over_trigger_frames, &damage_block_threshold, &damage_block_duration,
+            &output_mode, &h264_crf, &h264_fullcolor, &h264_fullframe, &capture_cursor,
+            &watermark_path, &watermark_location_enum))
+        return -1;
+
+    self->settings = CaptureSettings(
+        capture_width, capture_height, capture_x, capture_y, target_fps,
+        jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
+        paint_over_trigger_frames, damage_block_threshold, damage_block_duration,
+        (OutputMode)output_mode, h264_crf, h264_fullcolor, h264_fullframe, capture_cursor,
+        watermark_path, (WatermarkLocation)watermark_location_enum
+    );
+    return 0;
+}
+
+static PyTypeObject PyCaptureSettingsType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "pixelflux.screen_capture_module.CaptureSettings",         // tp_name
+    sizeof(PyCaptureSettings),                                 // tp_basicsize
+    0,                                                        // tp_itemsize
+    (destructor)PyCaptureSettings_dealloc,                    // tp_dealloc
+    0,                                                        // tp_vectorcall_offset / tp_print (deprecated)
+    0,                                                        // tp_getattr
+    0,                                                        // tp_setattr
+    0,                                                        // tp_as_async / tp_compare (deprecated)
+    0,                                                        // tp_repr
+    0,                                                        // tp_as_number
+    0,                                                        // tp_as_sequence
+    0,                                                        // tp_as_mapping
+    0,                                                        // tp_hash
+    0,                                                        // tp_call
+    0,                                                        // tp_str
+    0,                                                        // tp_getattro
+    0,                                                        // tp_setattro
+    0,                                                        // tp_as_buffer
+    Py_TPFLAGS_DEFAULT,                                       // tp_flags
+    0,                                                        // tp_doc
+    0,                                                        // tp_traverse
+    0,                                                        // tp_clear
+    0,                                                        // tp_richcompare
+    0,                                                        // tp_weaklistoffset
+    0,                                                        // tp_iter
+    0,                                                        // tp_iternext
+    0,                                                        // tp_methods
+    PyCaptureSettings_members,                                // tp_members
+    0,                                                        // tp_getset
+    0,                                                        // tp_base
+    0,                                                        // tp_dict
+    0,                                                        // tp_descr_get
+    0,                                                        // tp_descr_set
+    0,                                                        // tp_dictoffset
+    (initproc)PyCaptureSettings_init,                         // tp_init
+    0,                                                        // tp_alloc
+    PyCaptureSettings_new,                                    // tp_new
+};
+
+///////////////////////
+// Python Type: StripeEncodeResult (pointer wrapper)
+///////////////////////
+typedef struct {
+    PyObject_HEAD
+    StripeEncodeResult* result;
+    int owned;
+} PyStripeEncodeResultPtr;
+
+static void PyStripeEncodeResultPtr_dealloc(PyStripeEncodeResultPtr* self) {
+    if (self->owned && self->result) {
+        free_stripe_encode_result_data(self->result);
+        delete self->result;
+    }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* PyStripeEncodeResultPtr_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+    PyStripeEncodeResultPtr* self = (PyStripeEncodeResultPtr*)type->tp_alloc(type, 0);
+    if (self) {
+        self->result = NULL;
+        self->owned = 0;
+    }
+    return (PyObject*)self;
+}
+
+static int PyStripeEncodeResultPtr_init(PyStripeEncodeResultPtr* self, PyObject* args, PyObject* kwds) {
+    PyErr_SetString(PyExc_RuntimeError, "StripeEncodeResultPtr cannot be instantiated directly.");
+    return -1;
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_data(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result || !self->result->data || self->result->size <= 0)
+        Py_RETURN_NONE;
+    return PyBytes_FromStringAndSize((const char*)self->result->data, self->result->size);
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_size(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result) Py_RETURN_NONE;
+    return PyLong_FromLong(self->result->size);
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_type(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result) Py_RETURN_NONE;
+    return PyLong_FromLong((long)self->result->type);
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_stripe_y_start(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result) Py_RETURN_NONE;
+    return PyLong_FromLong(self->result->stripe_y_start);
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_stripe_height(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result) Py_RETURN_NONE;
+    return PyLong_FromLong(self->result->stripe_height);
+}
+
+static PyObject* PyStripeEncodeResultPtr_get_frame_id(PyStripeEncodeResultPtr* self, void* closure) {
+    if (!self->result) Py_RETURN_NONE;
+    return PyLong_FromLong(self->result->frame_id);
+}
+
+static PyGetSetDef PyStripeEncodeResultPtr_getset[] = {
+    {"data", (getter)PyStripeEncodeResultPtr_get_data, NULL, "encoded data", NULL},
+    {"size", (getter)PyStripeEncodeResultPtr_get_size, NULL, "data size", NULL},
+    {"type", (getter)PyStripeEncodeResultPtr_get_type, NULL, "stripe type", NULL},
+    {"stripe_y_start", (getter)PyStripeEncodeResultPtr_get_stripe_y_start, NULL, "stripe y start", NULL},
+    {"stripe_height", (getter)PyStripeEncodeResultPtr_get_stripe_height, NULL, "stripe height", NULL},
+    {"frame_id", (getter)PyStripeEncodeResultPtr_get_frame_id, NULL, "frame id", NULL},
+    {NULL}
+};
+
+static PyTypeObject PyStripeEncodeResultPtrType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "pixelflux.screen_capture_module.StripeEncodeResult",      // tp_name
+    sizeof(PyStripeEncodeResultPtr),                           // tp_basicsize
+    0,                                                        // tp_itemsize
+    (destructor)PyStripeEncodeResultPtr_dealloc,               // tp_dealloc
+    0,                                                        // tp_vectorcall_offset / tp_print (deprecated)
+    0,                                                        // tp_getattr
+    0,                                                        // tp_setattr
+    0,                                                        // tp_as_async / tp_compare (deprecated)
+    0,                                                        // tp_repr
+    0,                                                        // tp_as_number
+    0,                                                        // tp_as_sequence
+    0,                                                        // tp_as_mapping
+    0,                                                        // tp_hash
+    0,                                                        // tp_call
+    0,                                                        // tp_str
+    0,                                                        // tp_getattro
+    0,                                                        // tp_setattro
+    0,                                                        // tp_as_buffer
+    Py_TPFLAGS_DEFAULT,                                       // tp_flags
+    0,                                                        // tp_doc
+    0,                                                        // tp_traverse
+    0,                                                        // tp_clear
+    0,                                                        // tp_richcompare
+    0,                                                        // tp_weaklistoffset
+    0,                                                        // tp_iter
+    0,                                                        // tp_iternext
+    0,                                                        // tp_methods
+    0,                                                        // tp_members
+    PyStripeEncodeResultPtr_getset,                            // tp_getset
+    0,                                                        // tp_base
+    0,                                                        // tp_dict
+    0,                                                        // tp_descr_get
+    0,                                                        // tp_descr_set
+    0,                                                        // tp_dictoffset
+    (initproc)PyStripeEncodeResultPtr_init,                    // tp_init
+    0,                                                        // tp_alloc
+    PyStripeEncodeResultPtr_new,                               // tp_new
+};
+
+///////////////////////
+// Python Type: StripeCallback
+///////////////////////
+typedef struct {
+    PyObject_HEAD
+    PyObject* callback;
+} PyStripeCallback;
+
+static void PyStripeCallback_dealloc(PyStripeCallback* self) {
+    Py_XDECREF(self->callback);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* PyStripeCallback_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+    PyStripeCallback* self = (PyStripeCallback*)type->tp_alloc(type, 0);
+    if (self != NULL) {
+        self->callback = NULL;
+    }
+    return (PyObject*)self;
+}
+
+static int PyStripeCallback_init(PyStripeCallback* self, PyObject* args, PyObject* kwds) {
+    PyObject* callback = NULL;
+    if (!PyArg_ParseTuple(args, "O", &callback)) {
+        return -1;
+    }
+
+    if (!PyCallable_Check(callback)) {
+        PyErr_SetString(PyExc_TypeError, "parameter must be a callable");
+        return -1;
+    }
+    Py_INCREF(callback);
+    self->callback = callback;
+
+    return 0;
+}
+
+static PyTypeObject PyStripeCallbackType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "pixelflux.screen_capture_module.StripeCallback",         /* tp_name */
+    sizeof(PyStripeCallback),                                 /* tp_basicsize */
+    0,                                                        /* tp_itemsize */
+    (destructor)PyStripeCallback_dealloc,                     /* tp_dealloc */
+    0,                                                        /* tp_vectorcall_offset */
+    0,                                                        /* tp_getattr */
+    0,                                                        /* tp_setattr */
+    0,                                                        /* tp_as_async */
+    0,                                                        /* tp_repr */
+    0,                                                        /* tp_as_number */
+    0,                                                        /* tp_as_sequence */
+    0,                                                        /* tp_as_mapping */
+    0,                                                        /* tp_hash */
+    0,                                                        /* tp_call */
+    0,                                                        /* tp_str */
+    0,                                                        /* tp_getattro */
+    0,                                                        /* tp_setattro */
+    0,                                                        /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,                 /* tp_flags */
+    "StripeCallback object",                                  /* tp_doc */
+    0,                                                        /* tp_traverse */
+    0,                                                        /* tp_clear */
+    0,                                                        /* tp_richcompare */
+    0,                                                        /* tp_weaklistoffset */
+    0,                                                        /* tp_iter */
+    0,                                                        /* tp_iternext */
+    0,                                                        /* tp_methods */
+    0,                                                        /* tp_members */
+    0,                                                        /* tp_getset */
+    0,                                                        /* tp_base */
+    0,                                                        /* tp_dict */
+    0,                                                        /* tp_descr_get */
+    0,                                                        /* tp_descr_set */
+    0,                                                        /* tp_dictoffset */
+    (initproc)PyStripeCallback_init,                          /* tp_init */
+    0,                                                        /* tp_alloc */
+    PyStripeCallback_new,                                     /* tp_new */
+};
+
+///////////////////////
+// Python Type: ScreenCapture
+///////////////////////
+typedef struct {
+    PyObject_HEAD
+    ScreenCaptureModule* module;
+    PyObject* py_callback;
+} PyScreenCapture;
+
+static void PyScreenCapture_dealloc(PyScreenCapture* self) {
+    if (self->module) {
+        delete self->module;
+        self->module = NULL;
+    }
+    Py_XDECREF(self->py_callback);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* PyScreenCapture_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+    PyScreenCapture* self = (PyScreenCapture*)type->tp_alloc(type, 0);
+    if (self) {
+        self->module = new ScreenCaptureModule();
+        self->py_callback = NULL;
+    }
+    return (PyObject*)self;
+}
+
+///////////////////////
+// Stripe callback trampoline
+///////////////////////
+static void py_stripe_callback_trampoline(StripeEncodeResult* result, void* user_data) {
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyScreenCapture* self = (PyScreenCapture*)user_data;
+    if (self && self->py_callback && result) {
+        PyStripeEncodeResultPtr* py_result = PyObject_New(PyStripeEncodeResultPtr, &PyStripeEncodeResultPtrType);
+        if (py_result) {
+            py_result->result = new StripeEncodeResult(std::move(*result));
+            py_result->owned = 1;
+            // Always call Python callback as callback(result_ptr, user_data), ignore return value
+            PyObject* arglist = Py_BuildValue("(OO)", py_result, (PyObject*)self);
+            PyObject* ret = PyObject_CallObject(self->py_callback, arglist);
+            Py_XDECREF(arglist);
+            Py_XDECREF(py_result);
+            Py_XDECREF(ret);
+        }
+    }
+    PyGILState_Release(gstate);
+}
+
+static PyObject* PyScreenCapture_start_capture(PyScreenCapture* self, PyObject* args) {
+    PyObject* py_settings;
+    PyObject* py_callback_obj;
+    if (!PyArg_ParseTuple(args, "OO", &py_settings, &py_callback_obj))
+        return NULL;
+
+    if (!PyObject_TypeCheck(py_settings, &PyCaptureSettingsType)) {
+        PyErr_SetString(PyExc_TypeError, "First argument must be a CaptureSettings object");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(py_callback_obj, &PyStripeCallbackType)) {
+        PyErr_SetString(PyExc_TypeError, "Second argument must be a StripeCallback object");
+        return NULL;
+    }
+
+    PyStripeCallback* stripe_callback = (PyStripeCallback*)py_callback_obj;
+    PyObject* py_callback = stripe_callback->callback;
+
+    if (!PyCallable_Check(py_callback)) {
+        PyErr_SetString(PyExc_TypeError, "The callback object does not contain a callable function.");
+        return NULL;
+    }
+
+    Py_XINCREF(py_callback);
+    Py_XDECREF(self->py_callback);
+    self->py_callback = py_callback;
+
+    // Store the Python callback in user_data
+    self->module->stripe_callback = py_stripe_callback_trampoline;
+    self->module->user_data = (void*)self;
+
+    self->module->modify_settings(((PyCaptureSettings*)py_settings)->settings);
+    self->module->start_capture();
+
+    Py_RETURN_NONE;
+}
+
+static PyObject* PyScreenCapture_stop_capture(PyScreenCapture* self, PyObject* Py_UNUSED(ignored)) {
+    if (self->module)
+        self->module->stop_capture();
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef PyScreenCapture_methods[] = {
+    {"start_capture", (PyCFunction)PyScreenCapture_start_capture, METH_VARARGS, "Start capture with settings and callback"},
+    {"stop_capture", (PyCFunction)PyScreenCapture_stop_capture, METH_NOARGS, "Stop capture"},
+    {NULL}
+};
+
+static PyTypeObject PyScreenCaptureType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "pixelflux.screen_capture_module.ScreenCapture",           // tp_name
+    sizeof(PyScreenCapture),                                   // tp_basicsize
+    0,                                                        // tp_itemsize
+    (destructor)PyScreenCapture_dealloc,                       // tp_dealloc
+    0,                                                        // tp_vectorcall_offset / tp_print (deprecated)
+    0,                                                        // tp_getattr
+    0,                                                        // tp_setattr
+    0,                                                        // tp_as_async / tp_compare (deprecated)
+    0,                                                        // tp_repr
+    0,                                                        // tp_as_number
+    0,                                                        // tp_as_sequence
+    0,                                                        // tp_as_mapping
+    0,                                                        // tp_hash
+    0,                                                        // tp_call
+    0,                                                        // tp_str
+    0,                                                        // tp_getattro
+    0,                                                        // tp_setattro
+    0,                                                        // tp_as_buffer
+    Py_TPFLAGS_DEFAULT,                                       // tp_flags
+    0,                                                        // tp_doc
+    0,                                                        // tp_traverse
+    0,                                                        // tp_clear
+    0,                                                        // tp_richcompare
+    0,                                                        // tp_weaklistoffset
+    0,                                                        // tp_iter
+    0,                                                        // tp_iternext
+    PyScreenCapture_methods,                                   // tp_methods
+    0,                                                        // tp_members
+    0,                                                        // tp_getset
+    0,                                                        // tp_base
+    0,                                                        // tp_dict
+    0,                                                        // tp_descr_get
+    0,                                                        // tp_descr_set
+    0,                                                        // tp_dictoffset
+    0,                                                        // tp_init
+    0,                                                        // tp_alloc
+    PyScreenCapture_new,                                       // tp_new
+};
+
+///////////////////////
+// Module-level function: free_stripe_encode_result_data
+///////////////////////
+static PyObject* py_free_stripe_encode_result_data(PyObject* self, PyObject* args) {
+    PyObject* py_result;
+    if (!PyArg_ParseTuple(args, "O", &py_result))
+        return NULL;
+    if (!PyObject_TypeCheck(py_result, &PyStripeEncodeResultPtrType)) {
+        PyErr_SetString(PyExc_TypeError, "Argument must be a StripeEncodeResult");
+        return NULL;
+    }
+    PyStripeEncodeResultPtr* res = (PyStripeEncodeResultPtr*)py_result;
+    if (res->result && res->result->data) {
+        free_stripe_encode_result_data(res->result);
+    }
+    Py_RETURN_NONE;
+}
+
+///////////////////////
+// Module definition
+///////////////////////
+static PyMethodDef module_methods[] = {
+    {"free_stripe_encode_result_data", py_free_stripe_encode_result_data, METH_VARARGS, "Free the data buffer in StripeEncodeResult"},
+    {NULL}
+};
+
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "pixelflux.screen_capture_module",
+    "Screen capture module (C++ backend)",
+    -1,
+    module_methods,
+};
+
+PyMODINIT_FUNC PyInit_screen_capture_module(void) {
+    if (PyType_Ready(&PyCaptureSettingsType) < 0)
+        return NULL;
+    if (PyType_Ready(&PyStripeEncodeResultPtrType) < 0)
+        return NULL;
+    if (PyType_Ready(&PyStripeCallbackType) < 0)
+        return NULL;
+    if (PyType_Ready(&PyScreenCaptureType) < 0)
+        return NULL;
+
+    PyObject* m = PyModule_Create(&moduledef);
+    if (!m) return NULL;
+
+    Py_INCREF(&PyCaptureSettingsType);
+    Py_INCREF(&PyStripeEncodeResultPtrType);
+    Py_INCREF(&PyScreenCaptureType);
+    Py_INCREF(&PyStripeCallbackType);
+
+    PyModule_AddObject(m, "CaptureSettings", (PyObject*)&PyCaptureSettingsType);
+    PyModule_AddObject(m, "StripeEncodeResult", (PyObject*)&PyStripeEncodeResultPtrType);
+    PyModule_AddObject(m, "ScreenCapture", (PyObject*)&PyScreenCaptureType);
+    PyModule_AddObject(m, "StripeCallback", (PyObject*)&PyStripeCallbackType);
+    return m;
+}
+
+#ifdef __cplusplus
+}
+#endif

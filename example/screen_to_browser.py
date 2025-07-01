@@ -124,10 +124,11 @@ async def ws_handler(websocket, path=None):
 
 def py_stripe_callback(result_ptr, user_data):
     """
-    Callback function invoked by the pixelflux C++ module from a separate thread
+    Callback function invoked by the pixelflux C++ extension from a separate thread
     when an H.264 encoded stripe is ready.
+    Uses pointer access for StripeEncodeResult for performance.
     """
-    global g_is_capturing, g_h264_stripe_queue, g_loop 
+    global g_is_capturing, g_h264_stripe_queue, g_loop
 
     if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
         result = result_ptr.contents
@@ -136,13 +137,12 @@ def py_stripe_callback(result_ptr, user_data):
                 result.data, ctypes.POINTER(ctypes.c_ubyte * result.size)
             )
             h264_stripe_with_prefix = bytes(data_bytes_ptr.contents)
-            
-            if g_loop and not g_loop.is_closed(): 
+            if g_loop and not g_loop.is_closed():
                 asyncio.run_coroutine_threadsafe(
-                    g_h264_stripe_queue.put(h264_stripe_with_prefix), 
+                    g_h264_stripe_queue.put(h264_stripe_with_prefix),
                     g_loop
                 )
-    # Memory for `result.data` is managed by the C++ module.
+    # Memory for `result.data` is managed by the C++ extension.
 
 def start_http_server(port=9001):
     """
