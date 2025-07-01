@@ -1675,30 +1675,30 @@ private:
           local_capture_height_actual);
         if (!shm_image) {
           std::cerr << "Error: XShmCreateImage failed during re-init." << std::endl;
-          if(display) XCloseDisplay(display); display = nullptr; return;
+          if(display) { XCloseDisplay(display); } display = nullptr; return;
         }
         shminfo.shmid = shmget(
           IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height,
           IPC_CREAT | 0600);
         if (shminfo.shmid < 0) {
           perror("shmget re-init"); if(shm_image) XDestroyImage(shm_image); shm_image = nullptr;
-          if(display) XCloseDisplay(display); display = nullptr; return;
+          if(display) { XCloseDisplay(display); } display = nullptr; return;
         }
         shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
         if (shminfo.shmaddr == (char*)-1) {
           perror("shmat re-init"); if(shminfo.shmid != -1) shmctl(shminfo.shmid, IPC_RMID, 0);
           shminfo.shmid = -1;
-          if(shm_image) XDestroyImage(shm_image); shm_image = nullptr;
-          if(display) XCloseDisplay(display); display = nullptr; return;
+          if(shm_image) { XDestroyImage(shm_image); } shm_image = nullptr;
+          if(display) { XCloseDisplay(display); } display = nullptr; return;
         }
         shminfo.readOnly = False;
         shm_image->data = shminfo.shmaddr;
         if (!XShmAttach(display, &shminfo)) {
           std::cerr << "Error: XShmAttach failed during re-init." << std::endl;
-          if(shminfo.shmaddr != (char*)-1) shmdt(shminfo.shmaddr); shminfo.shmaddr = (char*)-1;
-          if(shminfo.shmid != -1) shmctl(shminfo.shmid, IPC_RMID, 0); shminfo.shmid = -1;
-          if(shm_image) XDestroyImage(shm_image); shm_image = nullptr;
-          if(display) XCloseDisplay(display); display = nullptr; return;
+          if(shminfo.shmaddr != (char*)-1) { shmdt(shminfo.shmaddr); } shminfo.shmaddr = (char*)-1;
+          if(shminfo.shmid != -1) { shmctl(shminfo.shmid, IPC_RMID, 0); } shminfo.shmid = -1;
+          if(shm_image) { XDestroyImage(shm_image); } shm_image = nullptr;
+          if(display) { XCloseDisplay(display); } display = nullptr; return;
         }
 
         this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
