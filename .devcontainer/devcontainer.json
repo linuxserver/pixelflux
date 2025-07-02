@@ -32,10 +32,7 @@
         // C++
         "ms-vscode.cpptools",
         "ms-vscode.cpptools-extension-pack",
-        "ms-vscode.cpptools-themes",
-        // CMake
-        "ms-vscode.cmake-tools",
-        "twxs.cmake"
+        "ms-vscode.cpptools-themes"
       ]
     }
   }

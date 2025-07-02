@@ -9,192 +9,180 @@ This module provides a Python interface to a high-performance C++ capture librar
 
 ## Installation
 
-This module relies on a native C++ component.
+This module relies on a native C++ extension that is compiled during installation using your system's C++ compiler.
 
 1.  **Prerequisites (for the current X11 backend on Debian/Ubuntu):**
-    Ensure you have CMake, a C++ compiler, and development files for X11, XShm (Xext), libjpeg-turbo, and libx264.
+    Ensure you have a C++ compiler (`g++`) and development files for Python, X11, Xext (XShm), libjpeg-turbo, and libx264.
 
 ```bash
 sudo apt-get update && \
 sudo apt-get install -y \
-  cmake \
   g++ \
-  gcc \
   libjpeg-turbo8-dev \
   libx11-dev \
   libxfixes-dev \
   libxext-dev \
   libx264-dev \
-  make \
-  python3-dev \
-  python3-pip \
-  python3-websockets
-```
-**Note:** `libjpeg-turbo8-dev` might be `libjpeg62-turbo-dev` or similar on older systems.
-
-2.  **Install via pip:**
-
-```bash
-pip install pixelflux
+  python3-dev
 ```
 
-This command will:
-*   Build the native `screen_capture_module.so` (or similar) library using CMake during the installation process.
-*   Install the Python wrapper and the compiled shared library.
+2.  **Install the Package:**
+    You can install directly from PyPI or from a local source clone.
 
-**Note:** The current backend is designed and tested for **Linux/X11** environments. Future development aims to support a wider range of framebuffers and platforms.
+    **Option A: Install from PyPI**
+    ```bash
+    pip install pixelflux
+    ```
 
-3. **Developer Install From Source**
+    **Option B: Install from a local source directory**
+    ```bash
+    # From the root of the project repository
+    pip install .
+    ```
 
-```bash
-sudo python3 setup.py install
-```
+    This command will use `setuptools` to directly compile the C++ extension (`screen_capture_module.cpp`) and install it alongside the Python code into your environment.
+
+    **Note:** The current backend is designed and tested for **Linux/X11** environments.
 
 ## Usage
 
 ### Basic Capture
 
-Here's a basic example demonstrating how to use the `pixelflux` module to start capturing and process encoded stripes.
+Here is a basic example demonstrating how to use the `pixelflux` module to start capturing and process encoded stripes.
 
 ```python
-import ctypes
 import time
-# These components are provided by the pixelflux Python wrapper:
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback, StripeEncodeResult
-
-# Integer constants for OutputMode (as defined in C++ enum class OutputMode)
-OUTPUT_MODE_JPEG = 0
-OUTPUT_MODE_H264 = 1
-
-# Integer constants for StripeDataType (as defined in C++ enum class StripeDataType)
-STRIPE_TYPE_UNKNOWN = 0
-STRIPE_TYPE_JPEG = 1
-STRIPE_TYPE_H264 = 2
+from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
 
 # Define your Python callback function.
-# The StripeCallback type (a ctypes.CFUNCTYPE) expects this signature.
-def my_python_callback(result_ptr: ctypes.POINTER(StripeEncodeResult), user_data_ptr: ctypes.c_void_p):
-    """Callback function to process encoded stripes."""
-    result = result_ptr.contents
+# This function will be called from a background thread for each encoded stripe.
+def my_python_callback(result, user_data):
+    """
+    Callback function to process encoded stripes.
+    `result` is a StripeEncodeResult object with the stripe's data.
+    `user_data` is whatever object you passed to start_capture (or None).
+    """
+    if result.data:
+        # result.type will be 1 for JPEG, 2 for H.264
+        type_str = "H264" if result.type == 2 else "JPEG"
+
+        print(
+            f"Received {type_str} stripe: "
+            f"frame_id={result.frame_id}, "
+            f"y_start={result.stripe_y_start}, "
+            f"height={result.stripe_height}, "
+            f"size={len(result.data)} bytes"
+        )
     
-    # Note: Based on the current Python wrapper's start_capture method (inferred from previous TypeError),
-    # user_data_ptr might not be actively passed from Python. If user_data is needed,
-    # the Python wrapper for start_capture would need to support passing it.
-    # For this example, user_data_ptr is effectively ignored.
+    # Memory is managed automatically. No need to free anything.
 
-    if result.data and result.size > 0:
-        type_str = "Unknown"
-        if result.type == STRIPE_TYPE_JPEG:
-            type_str = "JPEG"
-        elif result.type == STRIPE_TYPE_H264:
-            type_str = "H264"
+# 1. Configure capture settings
+settings = CaptureSettings()
+settings.capture_width = 1280
+settings.capture_height = 720
+settings.capture_x = 0
+settings.capture_y = 0
+settings.target_fps = 30.0
 
-        print(f"Received {type_str} stripe: frame_id={result.frame_id}, y_start={result.stripe_y_start}, height={result.stripe_height}, size={result.size} bytes")
-    
-    # Memory for result.data is managed by the C++ layer after this callback returns.
-    # Do NOT free result.data here.
+# Set output mode to H.264 (1)
+settings.output_mode = 1
+settings.h264_crf = 25 # H264 Constant Rate Factor (0-51, lower is better quality)
 
-# Configure capture settings
-capture_settings = CaptureSettings()
-capture_settings.capture_width = 1280
-capture_settings.capture_height = 720
-capture_settings.capture_x = 0
-capture_settings.capture_y = 0
-capture_settings.target_fps = 30.0
-
-# Set output mode to H.264
-capture_settings.output_mode = OUTPUT_MODE_H264
-capture_settings.h264_crf = 25 # H264 Constant Rate Factor (0-51, lower is better quality)
-
-# Instantiate the ScreenCapture module
+# 2. Instantiate the ScreenCapture module
 module = ScreenCapture()
 
-# Create a C-callable function pointer from your Python callback.
-# StripeCallback is the CFUNCTYPE provided by the pixelflux module.
-c_callback_func_ptr = StripeCallback(my_python_callback)
+# 3. Create a StripeCallback handler object
+# This object simply holds your Python function.
+callback_handler = StripeCallback(my_python_callback)
 
 try:
-    # Call start_capture with settings and the callback pointer.
-    module.start_capture(capture_settings, c_callback_func_ptr) 
+    # 4. Start the capture, passing the settings and callback handler.
+    # The third argument is optional user_data to be passed to your callback.
+    module.start_capture(settings, callback_handler, None)
     
-    mode_str = "JPEG" if capture_settings.output_mode == OUTPUT_MODE_JPEG else "H264"
-    print(f"Capture started (Mode: {mode_str}). Press Enter to stop...")
-    input() # Keep capture running
+    print("Capture started. Press Enter to stop...")
+    input() # Keep the main thread alive while capture runs in the background.
+
 finally:
+    # 5. Stop the capture. This will block until the background thread has exited.
     module.stop_capture()
     print("Capture stopped.")
 ```
 
 ### Capture Settings
 
-The `CaptureSettings` class, exposed as a `ctypes.Structure` by the Python wrapper, allows configuration of various parameters:
+The `CaptureSettings` class allows for detailed configuration of the capture process.
 
 ```python
-# Python representation of the C++ CaptureSettings struct,
-# provided by the pixelflux Python wrapper.
-class CaptureSettings(ctypes.Structure):
-    _fields_ = [
-        ("capture_width", ctypes.c_int),
-        ("capture_height", ctypes.c_int),
-        ("capture_x", ctypes.c_int),
-        ("capture_y", ctypes.c_int),
-        ("target_fps", ctypes.c_double),
-        ("jpeg_quality", ctypes.c_int),             # (JPEG mode) Quality for changed stripes (0-100)
-        ("paint_over_jpeg_quality", ctypes.c_int),  # (JPEG mode) Quality for static "paint-over" stripes (0-100)
-        ("use_paint_over_quality", ctypes.c_bool),  # (JPEG/H264 mode) Enable paint-over with different quality
-        ("paint_over_trigger_frames", ctypes.c_int),# Frames of no motion to trigger paint-over/IDR request
-        ("damage_block_threshold", ctypes.c_int),   # Consecutive changes to trigger "damaged" state for a stripe
-        ("damage_block_duration", ctypes.c_int),    # Frames a stripe stays "damaged" (affects paint-over logic)
-        ("output_mode", ctypes.c_int),              # 0 for JPEG, 1 for H264
-        ("h264_crf", ctypes.c_int),                 # (H264 mode) CRF value (0-51, lower is better quality/higher bitrate)
-        ("h264_fullcolor", ctypes.c_bool),          # Enable H.264 full color (I444)
-        ("h264_fullframe", ctypes.c_bool),          # Enable H.264 full frame encoding
-        ("capture_cursor", ctypes.c_bool),          # Enable cursor capture
-        ("watermark_path", ctypes.c_char_p),        # Absolute path to watermark PNG file
-        ("watermark_location_enum", ctypes.c_int),  # 0-6 for values table below 
-    ]
-WATERMARK_LOCATION_NONE = 0
-WATERMARK_LOCATION_TL = 1 # Top Left
-WATERMARK_LOCATION_TR = 2 # Top Right
-WATERMARK_LOCATION_BL = 3 # Bottom Left
-WATERMARK_LOCATION_BR = 4 # Bottom Right
-WATERMARK_LOCATION_MI = 5 # Middle
-WATERMARK_LOCATION_AN = 6 # Animated bounces around
-```
+# All attributes of the CaptureSettings object are standard Python properties.
+settings = CaptureSettings()
 
-Adjust these settings to fine-tune capture performance and quality.
+# Core Capture
+settings.capture_width = 1920
+settings.capture_height = 1080
+settings.capture_x = 0
+settings.capture_y = 0
+settings.target_fps = 60.0
+settings.capture_cursor = True
+
+# Encoding Mode (0 for JPEG, 1 for H.264)
+settings.output_mode = 1
+
+# JPEG Quality Settings
+settings.jpeg_quality = 75              # Quality for changed stripes (0-100)
+settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripes (0-100)
+
+# H.264 Quality Settings
+settings.h264_crf = 23                  # CRF value (0-51, lower is better quality/higher bitrate)
+settings.h264_fullcolor = False         # Use I444 (full color) instead of I420
+settings.h264_fullframe = False         # Encode full frames instead of just changed stripes
+
+# Change Detection & Optimization
+settings.use_paint_over_quality = True  # Enable paint-over/IDR requests for static regions
+settings.paint_over_trigger_frames = 15 # Frames of no motion to trigger paint-over
+settings.damage_block_threshold = 10    # Consecutive changes to trigger "damaged" state
+settings.damage_block_duration = 30     # Frames a stripe stays "damaged"
+
+# Watermarking
+settings.watermark_path = b"/path/to/your/watermark.png" # Must be bytes
+settings.watermark_location_enum = 4 # 0:None, 1:TL, 2:TR, 3:BL, 4:BR, 5:Middle, 6:Animated
+```
 
 ### Stripe Callback and Data Structure
 
-The `start_capture` function requires a callback function, invoked by the native C++ module when an encoded stripe is ready. The Python wrapper provides the necessary `StripeCallback` type (a `ctypes.CFUNCTYPE`) and the `StripeEncodeResult` structure (a `ctypes.Structure`).
+The `start_capture` function requires a `StripeCallback` object, which wraps your Python function. This function is invoked from a C++ background thread whenever an encoded stripe is ready.
+
+Your callback function will receive two arguments:
+1.  `result`: A `StripeEncodeResult` object containing the stripe data.
+2.  `user_data`: The optional object you passed to `start_capture`.
+
+The `StripeEncodeResult` object has the following read-only properties:
 
 ```python
-# The pixelflux Python wrapper provides these definitions:
+class StripeEncodeResult:
+    # This is illustrative. You do not define this class.
+    # You receive an instance of it in your callback.
 
-# StripeCallback is a ctypes.CFUNCTYPE defining the callback signature:
-# StripeCallback = ctypes.CFUNCTYPE(
-#    None, ctypes.POINTER(StripeEncodeResult), ctypes.c_void_p # Result pointer, User data pointer
-# )
+    @property
+    def type(self) -> int: ... # StripeDataType: 1 for JPEG, 2 for H.264
 
-# StripeEncodeResult is a ctypes.Structure for the callback data:
-class StripeEncodeResult(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),             # StripeDataType: 0 UNKNOWN, 1 JPEG, 2 H264
-        ("stripe_y_start", ctypes.c_int),
-        ("stripe_height", ctypes.c_int),
-        ("size", ctypes.c_int),
-        ("data", ctypes.POINTER(ctypes.c_ubyte)), # Pointer to the encoded data (includes custom header)
-        ("frame_id", ctypes.c_int)              # Frame counter for this stripe
-    ]
+    @property
+    def stripe_y_start(self) -> int: ...
+
+    @property
+    def stripe_height(self) -> int: ...
+
+    @property
+    def size(self) -> int: ... # The size of the data in bytes
+
+    @property
+    def data(self) -> bytes: ... # The encoded stripe data as a Python bytes object
+
+    @property
+    def frame_id(self) -> int: ... # Frame counter for this stripe
 ```
 
-Your Python callback function must match the `StripeCallback` signature:
-`def my_callback(result_ptr: ctypes.POINTER(StripeEncodeResult), user_data_ptr: ctypes.c_void_p):`
-
-*   `result_ptr`: A ctypes pointer to a `StripeEncodeResult` structure. Access its fields via `result_ptr.contents`.
-*   `user_data_ptr`: A `ctypes.c_void_p` representing the user data you passed to `start_capture`. If you passed `None`, this will be `None` or `0`. You are responsible for casting and interpreting this pointer if you use it.
-
-Inside the callback, process `result_ptr.contents`. **The Python wrapper handles freeing the memory of `result.data` by calling the native `free_stripe_encode_result_data` function after your callback returns. Do not attempt to free it manually.**
+**Memory Management:** The memory for the stripe data is managed automatically. When the `StripeEncodeResult` object received by your callback is garbage-collected by Python, its internal C++ destructor is called, which frees the underlying data buffer. **You do not need to do any manual memory management.**
 
 ## Features
 
@@ -213,25 +201,30 @@ Inside the callback, process `result_ptr.contents`. **The Python wrapper handles
 
 ## Example: Real-time H.264 Streaming with WebSockets
 
-A comprehensive example, `screen_to_browser.py`, is located in the `examples` directory of this repository. This script demonstrates real-time screen capture, H.264 encoding, and streaming via WebSockets. It sets up:
+A comprehensive example, `screen_to_browser.py`, is located in the `example` directory of this repository. This script demonstrates robust, real-time screen capture, H.264 encoding, and streaming via WebSockets. It sets up:
 
-*   A WebSocket server to stream encoded H.264 stripes.
+*   An `asyncio`-based WebSocket server to stream encoded H.264 stripes.
 *   An HTTP server to serve a client-side HTML page for viewing the stream.
-*   The `pixelflux` module to perform the screen capture and encoding.
+*   The `pixelflux` module to perform the screen capture and encoding, with proper asynchronous shutdown logic to prevent deadlocks.
 
 **To run this example:**
 
-**Note:** This example assumes you are on a Linux host with a running X11 session and will only work from localhost unless https is added.
+**Note:** This example assumes you are on a Linux host with a running X11 session and will only work from localhost unless HTTPS is added.
 
-1.  Navigate to the `examples` directory within the repository:
+1.  First, ensure you have the `websockets` library installed (it is a dependency for the example, not the library itself):
     ```bash
-    cd examples
+    pip install websockets
     ```
-2.  Execute the Python script:
+
+2.  Navigate to the `example` directory within the repository:
+    ```bash
+    cd example
+    ```
+3.  Execute the Python script:
     ```bash
     python3 screen_to_browser.py
     ```
-3.  Open your web browser and go to the URL indicated by the script's output `http://localhost:9001` to view the live stream.
+4.  Open your web browser and go to the URL indicated by the script's output (usually `http://localhost:9001/index.html`) to view the live stream.
 
 ## License
 

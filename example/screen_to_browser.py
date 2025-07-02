@@ -1,273 +1,212 @@
+# -*- coding: utf-8 -*-
+"""
+A single-client WebSocket and HTTP server for streaming screen captures.
+
+This script is a demonstration of the pixelflux library. It captures the screen
+and sends it to a single connected WebSocket client. All capture settings can be
+configured in the 'CONFIGURATION SETTINGS' block below.
+"""
+
 # Standard library imports
 import asyncio
-import ctypes
 import http.server
+import os
 import socketserver
 import threading
 import websockets
-import os # For path operations
 
-# pixelflux library imports
+# Third-party library imports
 from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
 
-# --- Global "Context" Variables ---
-# These are effectively global state or shared resources for the demo.
-# Using a more explicit naming convention like 'g_' for clarity.
-g_loop = None                   # The asyncio event loop, set in main()
-g_capture_settings = None       # Capture settings, configured in main()
-g_stripe_callback = None        # CTypes callback, created in main()
-g_module = None                 # ScreenCapture instance, created in main()
+# ==============================================================================
+# --- CONFIGURATION SETTINGS ---
+# Modify the parameters below to test different capture and encoding options.
+# ==============================================================================
+HTTP_PORT = 9001
+WS_PORT = 9000
 
-g_clients = set()               # Set of connected WebSocket clients
-g_is_capturing = False          # Flag indicating if capture is active
-g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes, created when capture starts
-g_send_task = None              # asyncio.Task for broadcasting stripes
-# --- End Global Variables ---
+capture_settings = CaptureSettings()
+
+# --- Core Capture ---
+capture_settings.capture_width = 1920
+capture_settings.capture_height = 1080
+capture_settings.capture_x = 0
+capture_settings.capture_y = 0
+capture_settings.target_fps = 60.0
+capture_settings.capture_cursor = True
+
+# --- Encoding Mode ---
+# Sets the output codec. 0 for JPEG, 1 for H.264.
+capture_settings.output_mode = 1
+
+# --- H.264 Quality Settings ---
+# Constant Rate Factor (0-51, lower is better quality & higher bitrate).
+# Good values are typically 18-28.
+capture_settings.h264_crf = 23
+# Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
+capture_settings.h264_fullcolor = False
+# Encode full frames instead of just changed stripes. Very high bandwidth.
+capture_settings.h264_fullframe = False
+
+# --- Change Detection & Optimization ---
+# Use a higher quality setting for static regions that haven't changed for a while.
+capture_settings.use_paint_over_quality = True
+# Number of frames of no motion in a stripe to trigger a high-quality "paint-over".
+capture_settings.paint_over_trigger_frames = 15
+# Consecutive changes to a stripe to trigger a "damaged" state (uses base quality).
+capture_settings.damage_block_threshold = 10
+# Number of frames a stripe stays "damaged" after being triggered.
+capture_settings.damage_block_duration = 30
+
+# --- Watermarking ---
+# To enable, set a path and change the location enum from 0.
+# The path MUST be a byte string (b'') and point to a valid PNG file.
+# capture_settings.watermark_path = b"/path/to/your/watermark.png"
+
+# Sets the watermark location on the screen. Default is 0 (disabled).
+# Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle
+capture_settings.watermark_location_enum = 0
+
+# ==============================================================================
+# --- Global State ---
+# ==============================================================================
+g_loop = None                   # The main asyncio event loop.
+g_stripe_callback = None        # Callback for stripe data.
+g_module = None                 # The ScreenCapture instance.
+g_active_client = None          # Holds the single active WebSocket client.
+g_is_capturing = False          # Flag indicating if capture is active.
+g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes.
+g_send_task = None              # asyncio.Task for sending stripes.
 
 
 async def send_h264_stripes():
-    """
-    Continuously retrieves H.264 stripe data from the global queue
-    and broadcasts it to all connected WebSocket clients.
-    """
-    global g_h264_stripe_queue, g_clients
-    print("Stripe sending task started.")
+    """Retrieves H.264 stripes from the queue and sends them to the active client."""
+    global g_h264_stripe_queue, g_active_client
     try:
         while True:
-            if g_h264_stripe_queue is None: # Should not happen if task is managed correctly
-                await asyncio.sleep(0.1)
-                continue
-
-            h264_bytes_with_prefix = await g_h264_stripe_queue.get()
-            
-            if not g_clients:
-                g_h264_stripe_queue.task_done()
-                continue
-            
-            # Create a list of tasks to send to current clients
-            active_clients = list(g_clients) # Avoid issues if set modified during iteration
-            tasks = [client.send(h264_bytes_with_prefix) for client in active_clients]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            
+            h264_bytes = await g_h264_stripe_queue.get()
+            if g_active_client:
+                try:
+                    await g_active_client.send(h264_bytes)
+                except websockets.exceptions.ConnectionClosed:
+                    pass  # Client disconnected, main handler will clean up.
             g_h264_stripe_queue.task_done()
     except asyncio.CancelledError:
-        print("Stripe sending task cancelled.")
-        raise
+        pass  # Expected way for the task to be stopped.
     except Exception as e:
-        print(f"Error in send_h264_stripes: {e}")
+        print(f"[ERROR] An unexpected error occurred in the send task: {e}")
     finally:
-        print("Stripe sending task finished.")
+        print("Stripe sending task has stopped.")
 
 
-async def ws_handler(websocket, path=None):
-    """
-    Handles new WebSocket connections, manages client set, and controls capture state.
-    """
-    global g_clients, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
-    global g_capture_settings, g_stripe_callback # These are set in main()
+async def websocket_handler(websocket, path=None):
+    """Manages a single WebSocket connection and the screen capture lifecycle."""
+    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
 
-    g_clients.add(websocket)
-    print(f"Client connected: {websocket.remote_address}. Total clients: {len(g_clients)}")
-
-    if not g_is_capturing and g_module:
-        print("First client connected. Starting H.264 capture...")
-        g_h264_stripe_queue = asyncio.Queue() # Fresh queue for the new capture session
-
-        if g_capture_settings is None or g_stripe_callback is None:
-            print("Error: Critical server components (settings/callback) not initialized.")
-            await websocket.close(code=1011, reason="Server configuration error")
-            g_clients.remove(websocket)
-            return
-
-        g_module.start_capture(g_capture_settings, g_stripe_callback)
-        g_is_capturing = True
-        
-        if g_send_task is None or g_send_task.done():
-            g_send_task = asyncio.create_task(send_h264_stripes())
-        print("H.264 capture process initiated.")
-    elif not g_module:
-        print("Error: Pixelflux module not initialized. Cannot start capture.")
-        try:
-            await websocket.send("ERROR: Server-side capture module not ready.")
-            await websocket.close(code=1011, reason="Server module error")
-        except websockets.exceptions.ConnectionClosed:
-            pass
-        if websocket in g_clients: g_clients.remove(websocket)
+    if g_active_client is not None:
+        print("Rejecting new connection: A client is already active.")
+        await websocket.close(code=1013, reason="Server is busy with another client.")
         return
 
-    try:
-        async for _ in websocket:
-            # This demo doesn't expect messages from the client
-            pass
-    except websockets.exceptions.ConnectionClosedError as e:
-        print(f"Client {websocket.remote_address} disconnected: Code {e.code}, Reason: '{e.reason or 'N/A'}'")
-    except Exception as e:
-        print(f"WebSocket error for client {websocket.remote_address}: {e}")
-    finally:
-        if websocket in g_clients:
-            g_clients.remove(websocket)
-        print(f"Client connection closed: {websocket.remote_address}. Remaining clients: {len(g_clients)}")
+    g_active_client = websocket
+    print("Client connected. Starting screen capture...")
 
-        if g_is_capturing and not g_clients and g_module: # If last client disconnects
-            print("Last client disconnected. Stopping H.264 capture...")
+    try:
+        g_h264_stripe_queue = asyncio.Queue(maxsize=120)
+        g_module.start_capture(capture_settings, g_stripe_callback)
+        g_is_capturing = True
+        g_send_task = asyncio.create_task(send_h264_stripes())
+        print("Screen capture and stream started.")
+
+        async for _ in websocket:
+            pass
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected normally.")
+    except Exception as e:
+        print(f"[ERROR] WebSocket handler error: {e}")
+    finally:
+        if websocket is g_active_client:
+            print("Active client disconnected. Stopping screen capture...")
             g_module.stop_capture()
             g_is_capturing = False
-            if g_send_task and not g_send_task.done():
+            if g_send_task:
                 g_send_task.cancel()
-                # The task will be awaited in the main finally block if needed
-                g_send_task = None 
-            print("H.264 capture process stopped.")
-            # g_h264_stripe_queue can be left for GC or explicitly set to None
+            g_active_client = None
+            g_send_task = None
             g_h264_stripe_queue = None
+            print("Screen capture stopped and resources released.")
 
 
-def py_stripe_callback(result_ptr, user_data):
-    """
-    Callback function invoked by the pixelflux C++ module from a separate thread
-    when an H.264 encoded stripe is ready.
-    """
-    global g_is_capturing, g_h264_stripe_queue, g_loop 
-
-    if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
-        result = result_ptr.contents
-        if result.data and result.size > 0:
-            data_bytes_ptr = ctypes.cast(
-                result.data, ctypes.POINTER(ctypes.c_ubyte * result.size)
+def stripe_callback_handler(result_obj, user_data_obj):
+    """Callback invoked by pixelflux when a new video stripe is ready."""
+    if g_is_capturing and result_obj and g_h264_stripe_queue is not None:
+        if g_loop and not g_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                g_h264_stripe_queue.put(result_obj.data), g_loop
             )
-            h264_stripe_with_prefix = bytes(data_bytes_ptr.contents)
-            
-            if g_loop and not g_loop.is_closed(): 
-                asyncio.run_coroutine_threadsafe(
-                    g_h264_stripe_queue.put(h264_stripe_with_prefix), 
-                    g_loop
-                )
-    # Memory for `result.data` is managed by the C++ module.
 
-def start_http_server(port=9001):
-    """
-    Starts a simple HTTP server in a new thread to serve client-side files.
-    """
+
+def start_http_server(host, port):
+    """Starts a simple HTTP server in a separate thread to serve client files."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    class DirectoryServingHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=script_dir, **kwargs)
         def log_message(self, format, *args):
-            pass # Quieter HTTP logs
-
-    with socketserver.TCPServer(("localhost", port), DirectoryServingHTTPRequestHandler) as httpd:
-        print(f"HTTP server serving files from '{os.path.abspath(script_dir)}' on http://localhost:{port}/")
-        print(f"  (Open http://localhost:{port}/index.html in browser to connect to WebSocket)")
+            pass
+    with socketserver.TCPServer((host, port), QuietHTTPRequestHandler) as httpd:
+        print(f"HTTP server is serving files from '{script_dir}'")
+        print(f"-> Open http://{host}:{port}/index.html in your browser.")
         httpd.serve_forever()
 
-async def main_async_routine():
-    """
-    Main asynchronous routine to set up and run the server.
-    """
-    global g_loop, g_capture_settings, g_stripe_callback, g_module
-    global g_is_capturing, g_send_task # For cleanup
 
-    # asyncio.run() creates and manages the loop. Get a reference for the C callback.
+async def main():
+    """Initializes resources and starts the WebSocket and HTTP servers."""
+    global g_loop, g_stripe_callback, g_module, g_is_capturing, g_send_task
+
     g_loop = asyncio.get_running_loop()
 
-    # --- Configure Screen Capture Parameters ---
-    g_capture_settings = CaptureSettings()
-    g_capture_settings.capture_width = 1920
-    g_capture_settings.capture_height = 1080
-    g_capture_settings.capture_x = 0
-    g_capture_settings.capture_y = 0
-    g_capture_settings.target_fps = 60.0
-    g_capture_settings.output_mode = 1 # 1 for H.264
-    g_capture_settings.h264_crf = 25
-    g_capture_settings.use_paint_over_quality = True 
-    g_capture_settings.paint_over_trigger_frames = 5 
-    g_capture_settings.damage_block_threshold = 15   
-    g_capture_settings.damage_block_duration = 30
-    g_capture_settings.h264_fullcolor = False
-    g_capture_settings.h264_fullframe = False
-    g_capture_settings.capture_cursor = False
-    #g_capture_settings.watermark_path = b"/full/path/to/image.png"
-    #g_capture_settings.watermark_location_enum = 6
-    # --- End Capture Configuration ---
-
-    g_stripe_callback = StripeCallback(py_stripe_callback)
+    g_stripe_callback = StripeCallback(stripe_callback_handler)
     g_module = ScreenCapture()
-
-    ws_server_instance = None # To hold the websockets server object
-
     if not g_module:
-        print("Fatal: Failed to initialize pixelflux ScreenCapture module.")
+        print("[FATAL] Failed to initialize pixelflux ScreenCapture module.")
         return
-
     print("Pixelflux capture module initialized.")
-    
-    # Start HTTP server in a daemon thread.
-    http_thread = threading.Thread(target=start_http_server, args=(9001,), daemon=True)
+
+    http_thread = threading.Thread(
+        target=start_http_server, args=('localhost', HTTP_PORT), daemon=True
+    )
     http_thread.start()
 
-    ws_port = 9000
-    shutdown_event = asyncio.Event() # Used to keep server running until interrupt
-
+    ws_server = None
     try:
-        # websockets.serve should use the currently running loop (managed by asyncio.run())
-        # No explicit `loop=` argument is typically needed here with asyncio.run()
-        ws_server_instance = await websockets.serve(
-            ws_handler,
-            'localhost',
-            ws_port,
-            compression=None
+        ws_server = await websockets.serve(
+            websocket_handler, 'localhost', WS_PORT, compression=None
         )
-        print(f"WebSocket server started (streaming H.264) on ws://localhost:{ws_port}")
-        print("Waiting for client connections... Press Ctrl+C to stop.")
-        
-        await shutdown_event.wait() # Keep the server running until event is set (by KeyboardInterrupt)
-
-    except OSError as e: 
-        print(f"Failed to start server (e.g., port in use?): {e}")
-    # KeyboardInterrupt will be handled by the outer asyncio.run() wrapper,
-    # or we can catch it here to set the shutdown_event.
-    except KeyboardInterrupt: # This allows graceful shutdown of this coroutine
-        print("\nKeyboardInterrupt caught in main_async_routine. Signaling shutdown...")
+        print(f"WebSocket server started on ws://localhost:{WS_PORT}")
+        print("Waiting for a client connection... Press Ctrl+C to stop.")
+        await asyncio.Event().wait()
+    except OSError as e:
+        print(f"[FATAL] Could not start server (is port {WS_PORT} in use?): {e}")
+    except KeyboardInterrupt:
+        print("\nShutdown signal received.")
     finally:
-        print("Cleaning up resources in main_async_routine...")
+        print("Cleaning up resources...")
         if g_is_capturing and g_module:
-            g_module.stop_capture() # Ensure capture is stopped
-            g_is_capturing = False # Update flag
-            print("Capture stopped.")
-
-        if ws_server_instance:
-            ws_server_instance.close()
-            await ws_server_instance.wait_closed()
-            print("WebSocket server closed.")
-
+            g_module.stop_capture()
+        if ws_server:
+            ws_server.close()
+            await ws_server.wait_closed()
         if g_send_task and not g_send_task.done():
             g_send_task.cancel()
-            try:
-                await g_send_task 
-            except asyncio.CancelledError:
-                pass # Expected
-            print("Stripe sending task cancelled and awaited.")
-        
+            await g_send_task
         if g_module:
-            del g_module # Allow C++ destructor to run if applicable
-            g_module = None
-            print("Capture module resources released.")
-        
-        # asyncio.run() handles loop cleanup and cancellation of remaining tasks.
-        print("Async routine cleanup finished.")
+            del g_module
+        print("Cleanup complete.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_async_routine())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        # This handles Ctrl+C if it occurs outside the main_async_routine's try/except,
-        # or if main_async_routine re-raises it.
-        print("\nApplication shutdown initiated by KeyboardInterrupt (at top level).")
-    except Exception as e:
-        print(f"Unhandled exception in __main__: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("Application exiting.")
+        print("\nApplication exiting.")
