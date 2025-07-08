@@ -52,6 +52,13 @@
 #include <dlfcn.h>
 #include "nvEncodeAPI.h"
 #ifndef STB_IMAGE_IMPLEMENTATION_DEFINED
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <va/va.h>
+#include <va/va_drm.h>
+#include <va/va_enc_h264.h>
+#define VA_ENC_PACKED_HEADER_DATA (VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE)
 #define STB_IMAGE_IMPLEMENTATION_DEFINED
 #define STB_IMAGE_IMPLEMENTATION
 #endif
@@ -104,6 +111,70 @@ std::atomic<bool> g_nvenc_force_next_idr_global{true};
 static void* g_nvenc_lib_handle = nullptr;
 typedef NVENCSTATUS(NVENCAPI* PFN_NvEncodeAPICreateInstance)(
   NV_ENCODE_API_FUNCTION_LIST*);
+
+/**
+ * @brief Holds function pointers for the VA-API libraries (libva, libva-drm, libva-x11).
+ * This struct is populated by `LoadVaapiApi` using `dlsym` to allow for
+ * dynamic loading of the VA-API dependencies, avoiding a hard link-time
+ * dependency on the user's system.
+ */
+struct VaapiFunctions {
+    void *va_lib_handle = nullptr;
+    void *va_x11_lib_handle = nullptr;
+    void *va_drm_lib_handle = nullptr;
+    VADisplay (*vaGetDisplay)(Display*) = nullptr;
+    VADisplay (*vaGetDisplayDRM)(int) = nullptr;
+    VAStatus (*vaInitialize)(VADisplay, int*, int*) = nullptr;
+    VAStatus (*vaTerminate)(VADisplay) = nullptr;
+    const char * (*vaQueryVendorString)(VADisplay) = nullptr;
+    VAStatus (*vaCreateConfig)(VADisplay, VAProfile, VAEntrypoint, VAConfigAttrib*, int, VAConfigID*) = nullptr;
+    VAStatus (*vaDestroyConfig)(VADisplay, VAConfigID) = nullptr;
+    VAStatus (*vaCreateSurfaces)(VADisplay, unsigned int, unsigned int, unsigned int, VASurfaceID*, unsigned int, VASurfaceAttrib*, unsigned int) = nullptr;
+    VAStatus (*vaDestroySurfaces)(VADisplay, VASurfaceID*, int) = nullptr;
+    VAStatus (*vaCreateContext)(VADisplay, VAConfigID, int, int, int, VASurfaceID*, int, VAContextID*) = nullptr;
+    VAStatus (*vaDestroyContext)(VADisplay, VAContextID) = nullptr;
+    VAStatus (*vaCreateBuffer)(VADisplay, VAContextID, VABufferType, unsigned int, unsigned int, void*, VABufferID*) = nullptr;
+    VAStatus (*vaDestroyBuffer)(VADisplay, VABufferID) = nullptr;
+    VAStatus (*vaBeginPicture)(VADisplay, VAContextID, VASurfaceID) = nullptr;
+    VAStatus (*vaRenderPicture)(VADisplay, VAContextID, VABufferID*, int) = nullptr;
+    VAStatus (*vaEndPicture)(VADisplay, VAContextID) = nullptr;
+    VAStatus (*vaSyncSurface)(VADisplay, VASurfaceID) = nullptr;
+    VAStatus (*vaMapBuffer)(VADisplay, VABufferID, void**) = nullptr;
+    VAStatus (*vaUnmapBuffer)(VADisplay, VABufferID) = nullptr;
+    VAStatus (*vaDeriveImage)(VADisplay, VASurfaceID, VAImage*) = nullptr;
+    VAStatus (*vaDestroyImage)(VADisplay, VAImageID) = nullptr;
+    VAStatus (*vaCreateImage)(VADisplay, VAImageFormat*, int, int, VAImage*) = nullptr;
+    VAStatus (*vaPutImage)(VADisplay, VASurfaceID, VAImageID, int, int, unsigned int, unsigned int, int, int, unsigned int, unsigned int) = nullptr;
+    VAStatus (*vaGetConfigAttributes)(VADisplay, VAProfile, VAEntrypoint, VAConfigAttrib*, int) = nullptr;
+};
+
+/**
+ * @brief Manages the state of a VA-API H.264 encoder session.
+ * This struct encapsulates all the necessary handles and configuration for a
+ * VA-API encoding pipeline, including the display connection, configuration and
+ * context IDs, a pool of surfaces for video frames, and initialization status.
+ * It is protected by the global `g_vaapi_mutex`.
+ */
+struct VaapiEncoderState {
+    VaapiFunctions va_funcs = {0};
+    VADisplay display = nullptr;
+    VAConfigID config_id = VA_INVALID_ID;
+    VAContextID context_id = VA_INVALID_ID;
+    std::vector<VASurfaceID> surfaces;
+    VABufferID coded_buffer_id = VA_INVALID_ID;
+    int fd = -1;
+    bool initialized = false;
+    int initialized_width = 0;
+    int initialized_height = 0;
+    int initialized_qp = -1;
+    unsigned int frame_count = 0;
+    VAPictureH264 last_ref_pic;
+};
+
+VaapiEncoderState g_vaapi_state;
+std::mutex g_vaapi_mutex;
+std::atomic<bool> g_vaapi_force_next_idr_global{true};
+
 
 /**
  * @brief Manages a pool of H.264 encoders and associated picture buffers.
@@ -239,6 +310,7 @@ struct CaptureSettings {
   bool capture_cursor;
   const char* watermark_path;
   WatermarkLocation watermark_location_enum;
+  int vaapi_render_node_index;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -262,8 +334,8 @@ struct CaptureSettings {
       h264_fullframe(false),
       capture_cursor(false),
       watermark_path(nullptr),
-      watermark_location_enum(WatermarkLocation::NONE) {}
-
+      watermark_location_enum(WatermarkLocation::NONE),
+      vaapi_render_node_index(-1) {}
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -291,7 +363,8 @@ struct CaptureSettings {
                   bool h264_fc = false, bool h264_ff = false,
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
-                  WatermarkLocation wm_loc = WatermarkLocation::NONE)
+                  WatermarkLocation wm_loc = WatermarkLocation::NONE,
+                  int vaapi_idx = -1)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -309,7 +382,8 @@ struct CaptureSettings {
       h264_fullframe(h264_ff),
       capture_cursor(capture_cursor),
       watermark_path(wm_path),
-      watermark_location_enum(wm_loc) {}
+      watermark_location_enum(wm_loc),
+      vaapi_render_node_index(vaapi_idx) {}
 };
 
 /**
@@ -934,6 +1008,560 @@ StripeEncodeResult encode_fullframe_nvenc(int width,
 }
 
 /**
+ * @brief Dynamically loads the VA-API libraries and resolves required function pointers.
+ *
+ * This function uses `dlopen` to load `libva.so.2` (or `.1`) and its backend
+ * libraries like `libva-drm.so.2`. It then uses `dlsym` to find the addresses
+ * of all necessary VA-API functions and stores them in the global
+ * `g_vaapi_state.va_funcs` struct. This must be called successfully before
+ * any other VA-API operations.
+ *
+ * @return true if all libraries were loaded and functions were resolved, false otherwise.
+ */
+bool LoadVaapiApi() {
+    if (g_vaapi_state.va_funcs.vaInitialize) {
+        return true;
+    }
+
+    g_vaapi_state.va_funcs.va_lib_handle = dlopen("libva.so.2", RTLD_LAZY);
+    if (!g_vaapi_state.va_funcs.va_lib_handle) {
+        g_vaapi_state.va_funcs.va_lib_handle = dlopen("libva.so.1", RTLD_LAZY);
+    }
+    if (!g_vaapi_state.va_funcs.va_lib_handle) {
+        std::cerr << "VAAPI_API_LOAD: dlopen failed for libva.so" << std::endl;
+        return false;
+    }
+
+    g_vaapi_state.va_funcs.va_drm_lib_handle = dlopen("libva-drm.so.2", RTLD_LAZY);
+    if (!g_vaapi_state.va_funcs.va_drm_lib_handle) {
+        g_vaapi_state.va_funcs.va_drm_lib_handle = dlopen("libva-drm.so.1", RTLD_LAZY);
+    }
+    if (!g_vaapi_state.va_funcs.va_drm_lib_handle) {
+        std::cerr << "VAAPI_API_LOAD: dlopen failed for libva-drm.so" << std::endl;
+        dlclose(g_vaapi_state.va_funcs.va_lib_handle);
+        g_vaapi_state.va_funcs.va_lib_handle = nullptr;
+        return false;
+    }
+
+    g_vaapi_state.va_funcs.va_x11_lib_handle = dlopen("libva-x11.so.2", RTLD_LAZY);
+    if (!g_vaapi_state.va_funcs.va_x11_lib_handle) {
+        g_vaapi_state.va_funcs.va_x11_lib_handle = dlopen("libva-x11.so.1", RTLD_LAZY);
+    }
+
+    auto unload_all_and_fail = [&]() {
+        std::cerr << "VAAPI_API_LOAD: dlsym failed for one or more functions." << std::endl;
+        if (g_vaapi_state.va_funcs.va_lib_handle) dlclose(g_vaapi_state.va_funcs.va_lib_handle);
+        if (g_vaapi_state.va_funcs.va_x11_lib_handle) dlclose(g_vaapi_state.va_funcs.va_x11_lib_handle);
+        if (g_vaapi_state.va_funcs.va_drm_lib_handle) dlclose(g_vaapi_state.va_funcs.va_drm_lib_handle);
+        g_vaapi_state.va_funcs = {};
+        return false;
+    };
+
+    #define LOAD_VA_FUNC(lib, name) \
+        g_vaapi_state.va_funcs.name = (decltype(g_vaapi_state.va_funcs.name))dlsym(lib, #name); \
+        if (!g_vaapi_state.va_funcs.name) return unload_all_and_fail()
+
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_drm_lib_handle, vaGetDisplayDRM);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaInitialize);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaTerminate);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaQueryVendorString);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateConfig);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyConfig);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateSurfaces);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroySurfaces);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateContext);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyContext);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateBuffer);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyBuffer);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaBeginPicture);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaRenderPicture);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaEndPicture);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaSyncSurface);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaMapBuffer);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaUnmapBuffer);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDeriveImage);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyImage);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateImage);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaPutImage);
+    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaGetConfigAttributes);
+
+    #undef LOAD_VA_FUNC
+
+    return true;
+}
+
+/**
+ * @brief Resets the global VA-API encoder, releasing all associated resources.
+ *
+ * This function is thread-safe. If the encoder is initialized, it destroys the
+ * VA context, configuration, surfaces, and coded buffer. It also terminates
+ * the display connection and closes the DRM device file descriptor. This is
+ * called when capture settings change or when stopping the capture.
+ */
+void UnloadVaapiApi() {
+    if (g_vaapi_state.va_funcs.va_lib_handle) {
+        dlclose(g_vaapi_state.va_funcs.va_lib_handle);
+    }
+    if (g_vaapi_state.va_funcs.va_x11_lib_handle) {
+        dlclose(g_vaapi_state.va_funcs.va_x11_lib_handle);
+    }
+    if (g_vaapi_state.va_funcs.va_drm_lib_handle) {
+        dlclose(g_vaapi_state.va_funcs.va_drm_lib_handle);
+    }
+    g_vaapi_state.va_funcs = {};
+}
+
+/**
+ * @brief Resets the global VA-API encoder, releasing all associated resources.
+ *
+ * This function is thread-safe. If the encoder is initialized, it destroys the
+ * VA context, configuration, surfaces, and coded buffer. It also terminates
+ * the display connection and closes the DRM device file descriptor. This is
+ * called when capture settings change or when stopping the capture.
+ */
+void reset_vaapi_encoder() {
+    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
+    if (!g_vaapi_state.initialized) {
+        return;
+    }
+
+    auto& funcs = g_vaapi_state.va_funcs;
+    if (g_vaapi_state.context_id != VA_INVALID_ID) {
+        funcs.vaDestroyContext(g_vaapi_state.display, g_vaapi_state.context_id);
+    }
+    if (g_vaapi_state.config_id != VA_INVALID_ID) {
+        funcs.vaDestroyConfig(g_vaapi_state.display, g_vaapi_state.config_id);
+    }
+    if (!g_vaapi_state.surfaces.empty()) {
+        funcs.vaDestroySurfaces(g_vaapi_state.display, g_vaapi_state.surfaces.data(), g_vaapi_state.surfaces.size());
+    }
+    if (g_vaapi_state.coded_buffer_id != VA_INVALID_ID) {
+        funcs.vaDestroyBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id);
+    }
+    if (g_vaapi_state.display) {
+        funcs.vaTerminate(g_vaapi_state.display);
+    }
+    if (g_vaapi_state.fd >= 0) {
+        close(g_vaapi_state.fd);
+    }
+
+    g_vaapi_state = {};
+}
+
+/**
+ * @brief Completely unloads the VA-API libraries and resets the encoder state.
+ *
+ * This function is thread-safe. It first calls `reset_vaapi_encoder` to release
+ * any active session resources, then calls `UnloadVaapiApi` to `dlclose` the
+ * library handles, ensuring a full cleanup.
+ */
+void unload_vaapi_library_if_loaded() {
+    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
+    if (g_vaapi_state.initialized) {
+        g_vaapi_mutex.unlock();
+        reset_vaapi_encoder();
+        g_vaapi_mutex.lock();
+    }
+    UnloadVaapiApi();
+}
+
+/**
+ * @brief Scans the system for available VA-API compatible DRM render nodes.
+ *
+ * This function searches the `/dev/dri/` directory for device files named
+ * `renderD*`, which represent GPU render nodes that can be used for
+ * hardware-accelerated computation like video encoding without needing a
+ * graphical display server.
+ *
+ * @return A sorted vector of strings, where each string is the full path to a
+ *         found render node (e.g., "/dev/dri/renderD128").
+ */
+std::vector<std::string> find_vaapi_render_nodes() {
+    std::vector<std::string> nodes;
+    const char* drm_dir_path = "/dev/dri/";
+    DIR *dir = opendir(drm_dir_path);
+    if (!dir) {
+        return nodes;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strncmp(entry->d_name, "renderD", 7) == 0) {
+            nodes.push_back(std::string(drm_dir_path) + entry->d_name);
+        }
+    }
+    closedir(dir);
+    std::sort(nodes.begin(), nodes.end());
+    return nodes;
+}
+
+/**
+ * @brief Initializes or re-initializes the global VA-API encoder with specified parameters.
+ *
+ * This function is thread-safe. It checks if an encoder is already initialized with
+ * the same parameters. If not, it resets any existing encoder and proceeds to
+ * set up a new VA-API encoding session via the DRM backend. This involves:
+ * 1. Finding and opening the specified DRM render node.
+ * 2. Getting a `VADisplay` from the file descriptor.
+ * 3. Initializing the VA-API library connection.
+ * 4. Creating an encoder configuration for H.264 with appropriate attributes (e.g., CQP).
+ * 5. Allocating a pool of `VASurfaceID`s to hold input video frames.
+ * 6. Creating the main encoding `VAContextID`.
+ *
+ * @param render_node_idx The index of the DRM render node to use from the list
+ *                        found by `find_vaapi_render_nodes`.
+ * @param width The width of the video frames to be encoded.
+ * @param height The height of the video frames to be encoded.
+ * @param qp The target Quantization Parameter (QP) for constant quality encoding.
+ * @return true if the encoder was successfully initialized, false on any failure.
+ */
+bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp) {
+    std::unique_lock<std::mutex> lock(g_vaapi_mutex);
+
+    if (g_vaapi_state.initialized && g_vaapi_state.initialized_width == width &&
+        g_vaapi_state.initialized_height == height && g_vaapi_state.initialized_qp == qp) {
+        return true;
+    }
+
+    if (g_vaapi_state.initialized) {
+        lock.unlock();
+        reset_vaapi_encoder();
+        lock.lock();
+    }
+
+    if (!LoadVaapiApi()) {
+        std::cerr << "VAAPI_INIT: Failed to load VAAPI libraries." << std::endl;
+        return false;
+    }
+
+    auto& funcs = g_vaapi_state.va_funcs;
+    std::vector<std::string> nodes = find_vaapi_render_nodes();
+    if (nodes.empty()) {
+        std::cerr << "VAAPI_INIT: No /dev/dri/renderD nodes found." << std::endl;
+        return false;
+    }
+
+    std::string node_to_use = (render_node_idx >= 0 && render_node_idx < (int)nodes.size()) ? nodes[render_node_idx] : nodes[0];
+    std::cout << "VAAPI_INIT: Using render node: " << node_to_use << std::endl;
+
+    g_vaapi_state.fd = open(node_to_use.c_str(), O_RDWR);
+    if (g_vaapi_state.fd < 0) {
+        std::cerr << "VAAPI_INIT: Failed to open " << node_to_use << std::endl;
+        return false;
+    }
+
+    g_vaapi_state.display = funcs.vaGetDisplayDRM(g_vaapi_state.fd);
+    if (!g_vaapi_state.display) {
+        std::cerr << "VAAPI_INIT: vaGetDisplayDRM failed." << std::endl;
+        close(g_vaapi_state.fd);
+        g_vaapi_state.fd = -1;
+        return false;
+    }
+
+    int major_ver, minor_ver;
+    VAStatus status = funcs.vaInitialize(g_vaapi_state.display, &major_ver, &minor_ver);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaInitialize failed: " << status << std::endl;
+        return false;
+    }
+    std::cout << "libva info: VA-API version " << major_ver << "." << minor_ver << ".0" << std::endl;
+
+    VAProfile va_profile = VAProfileH264Main;
+    VAEntrypoint entrypoint = VAEntrypointEncSlice;
+    std::vector<VAConfigAttrib> attribs;
+    attribs.push_back({VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420});
+
+    VAConfigAttrib query_attrib;
+    query_attrib.type = VAConfigAttribRateControl;
+    if (funcs.vaGetConfigAttributes(g_vaapi_state.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
+        (query_attrib.value & VA_RC_CQP)) {
+        std::cout << "VAAPI_INIT: Driver supports CQP rate control." << std::endl;
+        attribs.push_back({VAConfigAttribRateControl, VA_RC_CQP});
+    } else {
+        std::cout << "VAAPI_INIT: Driver does NOT support CQP. Skipping rate control attribute." << std::endl;
+    }
+
+    query_attrib.type = VAConfigAttribEncPackedHeaders;
+    if (funcs.vaGetConfigAttributes(g_vaapi_state.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
+        (query_attrib.value & VA_ENC_PACKED_HEADER_DATA)) {
+        std::cout << "VAAPI_INIT: Driver supports packed headers." << std::endl;
+        attribs.push_back({VAConfigAttribEncPackedHeaders, VA_ENC_PACKED_HEADER_DATA});
+    } else {
+        std::cout << "VAAPI_INIT: Driver does NOT support packed headers. Skipping attribute." << std::endl;
+    }
+
+    status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateConfig failed with Main profile: " << status << ". Trying VAProfileH264High..." << std::endl;
+        va_profile = VAProfileH264High;
+        status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
+        if (status != VA_STATUS_SUCCESS) {
+            std::cerr << "VAAPI_INIT: vaCreateConfig failed with High profile too: " << status << std::endl;
+            std::cerr << "VAAPI_INIT: Retrying with ONLY VAConfigAttribRTFormat..." << std::endl;
+            VAConfigAttrib minimal_attrib = {VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420};
+            status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, &minimal_attrib, 1, &g_vaapi_state.config_id);
+            if (status != VA_STATUS_SUCCESS) {
+                std::cerr << "VAAPI_INIT: Failed even with minimal config. Error: " << status << std::endl;
+                return false;
+            }
+            std::cout << "VAAPI_INIT: Minimal config created successfully. Some features may be disabled." << std::endl;
+        }
+    }
+
+    const unsigned int num_surfaces = 4;
+    g_vaapi_state.surfaces.resize(num_surfaces);
+    status = funcs.vaCreateSurfaces(g_vaapi_state.display, VA_RT_FORMAT_YUV420, width, height, g_vaapi_state.surfaces.data(), num_surfaces, nullptr, 0);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateSurfaces failed: " << status << std::endl;
+        return false;
+    }
+
+    status = funcs.vaCreateContext(g_vaapi_state.display, g_vaapi_state.config_id, width, height, VA_PROGRESSIVE, nullptr, 0, &g_vaapi_state.context_id);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateContext failed: " << status << std::endl;
+        return false;
+    }
+
+    g_vaapi_state.initialized = true;
+    g_vaapi_state.initialized_width = width;
+    g_vaapi_state.initialized_height = height;
+    g_vaapi_state.initialized_qp = qp;
+    g_vaapi_state.frame_count = 0;
+    std::cout << "VAAPI encoder initialized successfully via DRM backend." << std::endl;
+    return true;
+}
+
+/**
+ * @brief Helper function to calculate log2(N) - 4 for H.264 SPS header fields.
+ *
+ * The H.264 specification requires certain fields in the Sequence Parameter Set
+ * (SPS), like `log2_max_frame_num_minus4`, to be encoded in this format. This
+ * function computes the value, clamping it to the valid range required by the spec.
+ *
+ * @param num The input number (e.g., GOP size or max picture order count).
+ * @return The calculated value suitable for the SPS field.
+ */
+static unsigned int get_log2_val_minus4(unsigned int num) {
+    unsigned int ret = 0;
+    while (num > 0) {
+        ret++;
+        num >>= 1;
+    }
+    if (ret < 4) ret = 4;
+    if (ret > 16) ret = 16;
+    return ret - 4;
+}
+
+/**
+ * @brief Encodes a full frame of YUV data using the pre-initialized global VA-API encoder.
+ *
+ * This function is thread-safe. It takes raw I420 YUV data and performs one
+ * full frame encoding cycle. The process includes:
+ * 1. Uploading the I420 data to a hardware surface in NV12 format via `vaPutImage`.
+ * 2. Setting up parameter buffers: SPS (on IDR frames), PPS, and Slice parameters.
+ * 3. Executing the encoding pipeline with `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture`.
+ * 4. Syncing the resulting surface and mapping the output coded buffer to get the bitstream.
+ * 5. Packaging the H.264 bitstream into a `StripeEncodeResult` with a custom header.
+ *
+ * @param width The width of the input frame.
+ * @param height The height of the input frame.
+ * @param fps The target frames per second, used for SPS timing info.
+ * @param y_plane Pointer to the Y (luma) plane data.
+ * @param y_stride Stride of the Y plane.
+ * @param u_plane Pointer to the U (chroma) plane data.
+ * @param u_stride Stride of the U plane.
+ * @param v_plane Pointer to the V (chroma) plane data.
+ * @param v_stride Stride of the V plane.
+ * @param frame_counter The current frame number.
+ * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame
+ *                        and include SPS/PPS headers in the bitstream.
+ * @return A `StripeEncodeResult` containing the encoded H.264 data.
+ * @throws std::runtime_error if any VA-API call fails during the encoding process.
+ */
+StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
+                                          const uint8_t* y_plane, int y_stride,
+                                          const uint8_t* u_plane, int u_stride,
+                                          const uint8_t* v_plane, int v_stride,
+                                          int frame_counter,
+                                          bool force_idr_frame) {
+    StripeEncodeResult result;
+    result.type = StripeDataType::H264;
+    result.stripe_y_start = 0;
+    result.stripe_height = height;
+    result.frame_id = frame_counter;
+
+    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
+    if (!g_vaapi_state.initialized) {
+        throw std::runtime_error("VAAPI_ENCODE_FATAL: Not initialized.");
+    }
+
+    auto& funcs = g_vaapi_state.va_funcs;
+    VASurfaceID current_surface = g_vaapi_state.surfaces[g_vaapi_state.frame_count % g_vaapi_state.surfaces.size()];
+    VAStatus status;
+
+    if (g_vaapi_state.frame_count == 0) {
+        g_vaapi_state.last_ref_pic = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+    }
+
+    {
+        VAImage image = {};
+        image.format.fourcc = VA_FOURCC_NV12;
+        image.width = width;
+        image.height = height;
+
+        status = funcs.vaCreateImage(g_vaapi_state.display, &image.format, width, height, &image);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateImage failed: " + std::to_string(status));
+
+        void *image_ptr = nullptr;
+        status = funcs.vaMapBuffer(g_vaapi_state.display, image.buf, &image_ptr);
+        if (status != VA_STATUS_SUCCESS) {
+            funcs.vaDestroyImage(g_vaapi_state.display, image.image_id);
+            throw std::runtime_error("vaMapBuffer for VAImage failed: " + std::to_string(status));
+        }
+
+        uint8_t* y_dest = (uint8_t*)image_ptr + image.offsets[0];
+        uint8_t* uv_dest = (uint8_t*)image_ptr + image.offsets[1];
+        libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+                           y_dest, image.pitches[0], uv_dest, image.pitches[1], width, height);
+        
+        funcs.vaUnmapBuffer(g_vaapi_state.display, image.buf);
+        status = funcs.vaPutImage(g_vaapi_state.display, current_surface, image.image_id,
+                                  0, 0, width, height, 0, 0, width, height);
+        funcs.vaDestroyImage(g_vaapi_state.display, image.image_id);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaPutImage failed: " + std::to_string(status));
+    }
+
+    if (g_vaapi_state.coded_buffer_id == VA_INVALID_ID) {
+        status = funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncCodedBufferType,
+                                      width * height * 3 / 2, 1, nullptr, &g_vaapi_state.coded_buffer_id);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for coded buffer failed.");
+    }
+
+    std::vector<VABufferID> param_buffers;
+    try {
+        if (force_idr_frame) {
+            VAEncSequenceParameterBufferH264 sps = {};
+            const unsigned int gop_size = 30;
+            const unsigned int max_ref_frames_in_gop = 1;
+
+            sps.seq_parameter_set_id = 0;
+            sps.level_idc = 41;
+            sps.intra_idr_period = gop_size;
+            sps.intra_period = gop_size;
+            sps.ip_period = 1;
+            sps.bits_per_second = 0;
+            sps.max_num_ref_frames = max_ref_frames_in_gop;
+            sps.picture_width_in_mbs = (width + 15) / 16;
+            sps.picture_height_in_mbs = (height + 15) / 16;
+            sps.seq_fields.bits.chroma_format_idc = 1;
+            sps.seq_fields.bits.frame_mbs_only_flag = 1;
+            sps.seq_fields.bits.direct_8x8_inference_flag = 1;
+            sps.seq_fields.bits.pic_order_cnt_type = 0;
+            unsigned int log2_max_frame_num_val = get_log2_val_minus4(gop_size);
+            sps.seq_fields.bits.log2_max_frame_num_minus4 = log2_max_frame_num_val;
+            unsigned int poc_val = 1 << (log2_max_frame_num_val + 4 + 1);
+            sps.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = get_log2_val_minus4(poc_val);
+            sps.vui_parameters_present_flag = 1;
+            sps.vui_fields.bits.timing_info_present_flag = 1;
+            sps.vui_fields.bits.fixed_frame_rate_flag = 1;
+            sps.vui_fields.bits.bitstream_restriction_flag = 1;
+            sps.vui_fields.bits.motion_vectors_over_pic_boundaries_flag = 1;
+            sps.vui_fields.bits.aspect_ratio_info_present_flag = 1;
+            sps.aspect_ratio_idc = 255;
+            sps.sar_width = 1;
+            sps.sar_height = 1;
+            sps.num_units_in_tick = 1;
+            sps.time_scale = static_cast<unsigned int>(fps * 2);
+
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncSequenceParameterBufferType, sizeof(sps), 1, &sps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for SPS failed.");
+            param_buffers.push_back(buf_id);
+        }
+
+        {
+            VAEncPictureParameterBufferH264 pps = {};
+            pps.CurrPic = {current_surface, g_vaapi_state.frame_count, 0, static_cast<int32_t>(g_vaapi_state.frame_count * 2), static_cast<int32_t>(g_vaapi_state.frame_count * 2)};
+            for (int i = 0; i < 16; ++i) pps.ReferenceFrames[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+            if (!force_idr_frame) pps.ReferenceFrames[0] = g_vaapi_state.last_ref_pic;
+            pps.coded_buf = g_vaapi_state.coded_buffer_id;
+            pps.frame_num = g_vaapi_state.frame_count;
+            pps.pic_init_qp = g_vaapi_state.initialized_qp;
+            pps.pic_fields.bits.idr_pic_flag = force_idr_frame ? 1 : 0;
+            pps.pic_fields.bits.reference_pic_flag = 1;
+            pps.pic_fields.bits.entropy_coding_mode_flag = 1;
+            pps.pic_fields.bits.deblocking_filter_control_present_flag = 1;
+            pps.pic_fields.bits.transform_8x8_mode_flag = 1;
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncPictureParameterBufferType, sizeof(pps), 1, &pps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for PPS failed.");
+            param_buffers.push_back(buf_id);
+        }
+
+        {
+            VAEncSliceParameterBufferH264 slice = {};
+            slice.slice_type = force_idr_frame ? 2 : 0;
+            slice.num_macroblocks = ((width + 15) / 16) * ((height + 15) / 16);
+            slice.pic_order_cnt_lsb = (g_vaapi_state.frame_count * 2);
+            for (int i = 0; i < 32; ++i) slice.RefPicList0[i] = slice.RefPicList1[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+            if (!force_idr_frame) slice.RefPicList0[0] = g_vaapi_state.last_ref_pic;
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncSliceParameterBufferType, sizeof(slice), 1, &slice, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for Slice failed.");
+            param_buffers.push_back(buf_id);
+        }
+    } catch (const std::runtime_error& e) {
+        for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
+        throw;
+    }
+
+    status = funcs.vaBeginPicture(g_vaapi_state.display, g_vaapi_state.context_id, current_surface);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaBeginPicture failed: " + std::to_string(status));
+
+    status = funcs.vaRenderPicture(g_vaapi_state.display, g_vaapi_state.context_id, param_buffers.data(), param_buffers.size());
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaRenderPicture failed: " + std::to_string(status));
+
+    status = funcs.vaEndPicture(g_vaapi_state.display, g_vaapi_state.context_id);
+    if (status != VA_STATUS_SUCCESS) {
+        for(VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
+        throw std::runtime_error("vaEndPicture failed: " + std::to_string(status));
+    }
+
+    for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
+
+    status = funcs.vaSyncSurface(g_vaapi_state.display, current_surface);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaSyncSurface failed: " + std::to_string(status));
+
+    VACodedBufferSegment* coded_segment = nullptr;
+    status = funcs.vaMapBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id, (void**)&coded_segment);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaMapBuffer for coded data failed: " + std::to_string(status));
+
+    if (coded_segment && coded_segment->size > 0 && coded_segment->buf) {
+        const unsigned char TAG = 0x04;
+        unsigned char type_hdr = (force_idr_frame) ? 0x01 : 0x00;
+        int header_sz = 10;
+        result.data = new unsigned char[coded_segment->size + header_sz];
+        result.size = coded_segment->size + header_sz;
+
+        result.data[0] = TAG;
+        result.data[1] = type_hdr;
+        uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+        std::memcpy(result.data + 2, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+        std::memcpy(result.data + 4, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(width));
+        std::memcpy(result.data + 6, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(height));
+        std::memcpy(result.data + 8, &net_val, 2);
+        std::memcpy(result.data + header_sz, coded_segment->buf, coded_segment->size);
+    }
+
+    funcs.vaUnmapBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id);
+
+    g_vaapi_state.last_ref_pic = {current_surface, g_vaapi_state.frame_count, VA_PICTURE_H264_SHORT_TERM_REFERENCE, 0, 0};
+    g_vaapi_state.frame_count++;
+
+    return result;
+}
+
+/**
  * @brief Callback function type for processing encoded stripes.
  * @param result Pointer to the StripeEncodeResult containing the encoded data.
  * @param user_data User-defined data passed to the callback.
@@ -1087,6 +1715,8 @@ public:
   mutable std::mutex settings_mutex;
   bool is_nvidia_system_detected = false;
   bool nvenc_operational = false;
+  int vaapi_render_node_index = -1;
+  bool vaapi_operational = false;
 
 private:
     std::vector<uint8_t> full_frame_y_plane_;
@@ -1183,6 +1813,10 @@ public:
     if (g_nvenc_state.initialized) {
       reset_nvenc_encoder();
     }
+    if (g_vaapi_state.initialized) {
+      reset_vaapi_encoder();
+    }
+    unload_vaapi_library_if_loaded();
     unload_nvenc_library_if_loaded();
     UnloadCudaApi();
   }
@@ -1212,6 +1846,7 @@ public:
     h264_fullcolor = new_settings.h264_fullcolor;
     h264_fullframe = new_settings.h264_fullframe;
     capture_cursor = new_settings.capture_cursor;
+    vaapi_render_node_index = new_settings.vaapi_render_node_index;
     std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
     bool path_actually_changed_in_settings = (watermark_path_internal != new_wm_path_str);
   
@@ -1238,7 +1873,8 @@ public:
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
       h264_fullcolor, h264_fullframe, capture_cursor,
-      watermark_path_internal.c_str(), watermark_location_internal
+      watermark_path_internal.c_str(), watermark_location_internal,
+      vaapi_render_node_index
       );
   }
 
@@ -1365,6 +2001,7 @@ private:
     bool local_current_h264_fullframe;
     OutputMode local_current_output_mode;
     bool local_current_capture_cursor;
+    int local_vaapi_render_node_index;
     int xfixes_event_base = 0;
     int xfixes_error_base = 0;
     std::string local_watermark_path_setting;
@@ -1388,6 +2025,7 @@ private:
       local_current_h264_fullcolor = h264_fullcolor;
       local_current_h264_fullframe = h264_fullframe;
       local_current_capture_cursor = capture_cursor;
+      local_vaapi_render_node_index = vaapi_render_node_index;
       local_watermark_path_setting = watermark_path_internal;
       local_watermark_location_setting = watermark_location_internal;
     }
@@ -1512,25 +2150,39 @@ private:
     std::cout << "XShm setup complete for " << local_capture_width_actual
               << "x" << local_capture_height_actual << "." << std::endl;
 
+    this->vaapi_operational = false;
     this->nvenc_operational = false;
-    if (this->is_nvidia_system_detected &&
+
+    if (local_vaapi_render_node_index >= 0 &&
         local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-      if (initialize_nvenc_encoder(local_capture_width_actual,
-                                   local_capture_height_actual,
-                                   local_current_h264_crf,
-                                   local_current_target_fps,
-                                   local_current_h264_fullcolor)) {
-        this->nvenc_operational = true;
-        g_nvenc_force_next_idr_global = true;
-        std::cout << "NVENC Encoder Initialized successfully." << std::endl;
+        if (initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
+                                     local_capture_height_actual, local_current_h264_crf)) {
+            this->vaapi_operational = true;
+            g_vaapi_force_next_idr_global = true;
+            std::cout << "VAAPI Encoder Initialized successfully." << std::endl;
+        } else {
+            std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
+        }
+    } else {
+      if (this->is_nvidia_system_detected &&
+          local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
+        if (initialize_nvenc_encoder(local_capture_width_actual,
+                                     local_capture_height_actual,
+                                     local_current_h264_crf,
+                                     local_current_target_fps,
+                                     local_current_h264_fullcolor)) {
+          this->nvenc_operational = true;
+          g_nvenc_force_next_idr_global = true;
+          std::cout << "NVENC Encoder Initialized successfully." << std::endl;
+        } else {
+          std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
+        }
       } else {
-        std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
+          if (!this->nvenc_operational && g_nvenc_state.initialized) {
+            reset_nvenc_encoder();
+          }
       }
     }
-    if (!this->nvenc_operational && g_nvenc_state.initialized) {
-      reset_nvenc_encoder();
-    }
-
     int num_cores = std::max(1, (int)std::thread::hardware_concurrency());
     std::cout << "CPU cores available: " << num_cores << std::endl;
     int num_stripes_config = num_cores;
@@ -1598,6 +2250,7 @@ private:
         local_current_h264_fullcolor = h264_fullcolor;
         local_current_h264_fullframe = h264_fullframe;
         local_current_capture_cursor = capture_cursor;
+        local_vaapi_render_node_index = vaapi_render_node_index;
         local_watermark_path_setting = watermark_path_internal;
         local_watermark_location_setting = watermark_location_internal;
       }
@@ -2170,7 +2823,21 @@ private:
                 quality_to_use,
                 this->frame_counter));
             } else {
-              if (this->nvenc_operational) {
+              if (this->vaapi_operational) {
+                std::packaged_task<StripeEncodeResult()> task([=]() {
+                    bool force_idr = g_vaapi_force_next_idr_global.exchange(false);
+                    return encode_fullframe_vaapi(
+                        local_capture_width_actual, local_capture_height_actual, local_current_target_fps,
+                        full_frame_y_plane_.data(), full_frame_y_stride_,
+                        full_frame_u_plane_.data(), full_frame_u_stride_,
+                        full_frame_v_plane_.data(), full_frame_v_stride_,
+                        this->frame_counter, force_idr
+                    );
+                });
+                futures.push_back(task.get_future());
+                threads.push_back(std::thread(std::move(task)));
+              
+              } else if (this->nvenc_operational) {
                 std::packaged_task<StripeEncodeResult()> task([=]() {
                     bool force_idr = g_nvenc_force_next_idr_global.exchange(false);
                     return encode_fullframe_nvenc(
@@ -2241,6 +2908,12 @@ private:
                 this->nvenc_operational = false;
                 reset_nvenc_encoder();
                 g_nvenc_force_next_idr_global = true;
+            } else if (std::string(e.what()).find("VAAPI_") != std::string::npos) {
+                std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
+                std::cerr << "Disabling VAAPI for this session due to runtime error." << std::endl;
+                this->vaapi_operational = false;
+                reset_vaapi_encoder();
+                g_vaapi_force_next_idr_global = true;
             } else {
                 std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
             }
@@ -2298,7 +2971,7 @@ private:
           std::cout << "Res: " << local_capture_width_actual << "x"
                     << local_capture_height_actual
                     << " Mode: "
-                    << (local_current_output_mode == OutputMode::JPEG ? "JPEG" : (this->nvenc_operational ? "H264 (NVENC)" : "H264 (CPU)"))
+                    << (local_current_output_mode == OutputMode::JPEG ? "JPEG" : (this->vaapi_operational ? "H264 (VAAPI)" : (this->nvenc_operational ? "H264 (NVENC)" : "H264 (CPU)")))
                     << (local_current_output_mode == OutputMode::H264
                         ? (std::string(local_current_h264_fullcolor ?
                                        " CS_IN:I444" : " CS_IN:I420") +
@@ -2916,7 +3589,7 @@ uint64_t calculate_yuv_stripe_hash(const uint8_t* y_plane_stripe_start, int y_st
     XXH3_state_t hash_state;
     XXH3_64bits_reset(&hash_state);
 
-    for (int r = 0; r < height; ++r) {
+    for (int r = 0; r < height; r += 16) {
         XXH3_64bits_update(&hash_state, y_plane_stripe_start +
                            static_cast<size_t>(r) * y_stride, width);
     }
@@ -2925,17 +3598,18 @@ uint64_t calculate_yuv_stripe_hash(const uint8_t* y_plane_stripe_start, int y_st
     int chroma_height = is_i420 ? (height / 2) : height;
 
     if (is_i420) {
-        if (width % 2 != 0 && chroma_width > 0) chroma_width = (width-1)/2;
-        if (height % 2 != 0 && chroma_height > 0) chroma_height = (height-1)/2;
+        if (width % 2 != 0 && chroma_width > 0) chroma_width = (width - 1) / 2;
+        if (height % 2 != 0 && chroma_height > 0) chroma_height = (height - 1) / 2;
     }
 
-    if (chroma_width <=0 || chroma_height <=0) {
+    if (chroma_width <= 0 || chroma_height <= 0) {
+        // Dimensions invalid
     } else {
-        for (int r = 0; r < chroma_height; ++r) {
+        for (int r = 0; r < chroma_height; r += 16) {
             XXH3_64bits_update(&hash_state, u_plane_stripe_start +
                                static_cast<size_t>(r) * u_stride, chroma_width);
         }
-        for (int r = 0; r < chroma_height; ++r) {
+        for (int r = 0; r < chroma_height; r += 16) {
             XXH3_64bits_update(&hash_state, v_plane_stripe_start +
                                static_cast<size_t>(r) * v_stride, chroma_width);
         }
@@ -3127,6 +3801,7 @@ static PyMemberDef PyCaptureSettings_members[] = {
   { "h264_fullframe", T_BOOL, offsetof(PyCaptureSettings, settings.h264_fullframe), 0, "h264 fullframe" },
   { "capture_cursor", T_BOOL, offsetof(PyCaptureSettings, settings.capture_cursor), 0, "capture cursor" },
   { "watermark_location_enum", T_INT, offsetof(PyCaptureSettings, settings.watermark_location_enum), 0, "watermark location enum" },
+  { "vaapi_render_node_index", T_INT, offsetof(PyCaptureSettings, settings.vaapi_render_node_index), 0, "vaapi render node index (-1 to disable)" },
   { NULL }
 };
 

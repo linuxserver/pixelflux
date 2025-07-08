@@ -8,9 +8,11 @@ screen_capture_module = Extension(
         'pixelflux/include/xxhash.c'
     ],
     include_dirs=['pixelflux/include'],
-    libraries=['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl'],
+    libraries=['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl', 'va', 'va-drm'],
     language='c++',
-    extra_compile_args=['-std=c++17', '-Wno-unused-function']
+    #extra_compile_args=['-std=c++17', '-Wno-unused-function']
+    extra_compile_args=['-g', '-O0'],
+    extra_link_args=['-g']
 )
 
 with open("README.md", "r", encoding="utf-8") as fh:

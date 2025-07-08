@@ -33,7 +33,7 @@ capture_settings.capture_height = 1080
 capture_settings.capture_x = 0
 capture_settings.capture_y = 0
 capture_settings.target_fps = 60.0
-capture_settings.capture_cursor = True
+capture_settings.capture_cursor = False
 
 # --- Encoding Mode ---
 # Sets the output codec. 0 for JPEG, 1 for H.264.
@@ -42,11 +42,13 @@ capture_settings.output_mode = 1
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
 # Good values are typically 18-28.
-capture_settings.h264_crf = 23
+capture_settings.h264_crf = 25
 # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
 capture_settings.h264_fullcolor = False
-# Encode full frames instead of just changed stripes. Very high bandwidth.
+# Encode full frames instead of just changed stripes.
 capture_settings.h264_fullframe = False
+# Pass a vaapi node index 0 = renderD128, -1 to disable
+capture_settings.vaapi_render_node_index = -1
 
 # --- Change Detection & Optimization ---
 # Use a higher quality setting for static regions that haven't changed for a while.
