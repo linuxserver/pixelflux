@@ -1268,7 +1268,7 @@ bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp
     }
     std::cout << "libva info: VA-API version " << major_ver << "." << minor_ver << ".0" << std::endl;
 
-    VAProfile va_profile = VAProfileH264Main;
+    VAProfile va_profile = VAProfileH264ConstrainedBaseline;
     VAEntrypoint entrypoint = VAEntrypointEncSlice;
     std::vector<VAConfigAttrib> attribs;
     attribs.push_back({VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420});
@@ -1294,11 +1294,11 @@ bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp
 
     status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
     if (status != VA_STATUS_SUCCESS) {
-        std::cerr << "VAAPI_INIT: vaCreateConfig failed with Main profile: " << status << ". Trying VAProfileH264High..." << std::endl;
-        va_profile = VAProfileH264High;
+        std::cerr << "VAAPI_INIT: vaCreateConfig failed with Baseline profile: " << status << ". Trying VAProfileH264Main..." << std::endl;
+        va_profile = VAProfileH264Main;
         status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
         if (status != VA_STATUS_SUCCESS) {
-            std::cerr << "VAAPI_INIT: vaCreateConfig failed with High profile too: " << status << std::endl;
+            std::cerr << "VAAPI_INIT: vaCreateConfig failed with Main profile too: " << status << std::endl;
             std::cerr << "VAAPI_INIT: Retrying with ONLY VAConfigAttribRTFormat..." << std::endl;
             VAConfigAttrib minimal_attrib = {VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420};
             status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, &minimal_attrib, 1, &g_vaapi_state.config_id);
@@ -1984,6 +1984,7 @@ private:
    * The loop runs until stop_requested is set to true.
    */
   void capture_loop() {
+    static bool vaapi_444_warning_shown = false;
     auto start_time_loop = std::chrono::high_resolution_clock::now();
     int frame_count_loop = 0;
 
@@ -2031,7 +2032,6 @@ private:
       local_watermark_path_setting = watermark_path_internal;
       local_watermark_location_setting = watermark_location_internal;
     }
-
     if (local_current_output_mode == OutputMode::H264) {
       if (local_capture_width_actual % 2 != 0 && local_capture_width_actual > 0) {
         local_capture_width_actual--;
@@ -2501,7 +2501,14 @@ private:
         }
 
         if (local_current_output_mode == OutputMode::H264) {
-            if (this->yuv_planes_are_i444_) {
+            bool force_420_conversion = this->vaapi_operational;
+            if (force_420_conversion && !vaapi_444_warning_shown) {
+              std::cerr << "VAAPI_WARNING: 4:4:4 colorspace is not supported in VAAPI mode. "
+                           "Forcing 4:2:0 conversion for encoder."
+                        << std::endl;
+              vaapi_444_warning_shown = true;
+            }
+            if (this->yuv_planes_are_i444_ && !force_420_conversion) {
                 libyuv::ARGBToI444(shm_data_ptr, shm_stride_bytes,
                                    full_frame_y_plane_.data(), full_frame_y_stride_,
                                    full_frame_u_plane_.data(), full_frame_u_stride_,
