@@ -1,3 +1,45 @@
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.cibuildwheel]
+archs = [ "x86_64", "aarch64" ]
+
+[tool.cibuildwheel.linux]
+before-all = """
+    set -euxo pipefail
+    if command -v dnf; then
+        # This is a manylinux (glibc) container
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+        dnf install -y \
+            libX11-devel \
+            libXext-devel \
+            libjpeg-turbo-devel \
+            libev-devel \
+            x264-devel \
+            libyuv-devel \
+            libXcomposite-devel \
+            libva-devel \
+            libdrm-devel
+    elif command -v apk; then
+        # This is a musllinux (Alpine) container
+        apk add --no-cache \
+            libx11-dev \
+            libxext-dev \
+            libxfixes-dev \
+            jpeg-dev \
+            libev-dev \
+            x264-dev \
+            libyuv \
+            libyuv-dev \
+            libxcomposite-dev \
+            libva-dev \
+            libdrm-dev \
+            musl-dev 
+    else
+        echo "Unsupported package manager"
+        exit 1
+    fi
+"""
