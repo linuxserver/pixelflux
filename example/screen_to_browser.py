@@ -80,6 +80,27 @@ g_is_capturing = False          # Flag indicating if capture is active.
 g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes.
 g_send_task = None              # asyncio.Task for sending stripes.
 
+g_is_shutting_down = False 
+async def cleanup():
+    """A single, race-proof function to shut down all capture resources."""
+    global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client
+    if g_is_shutting_down:
+        return
+    g_is_shutting_down = True
+    print("Cleanup initiated...")
+    if g_is_capturing:
+        g_is_capturing = False
+    if g_module:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, g_module.stop_capture)
+    if g_send_task and not g_send_task.done():
+        g_send_task.cancel()
+        try:
+            await g_send_task
+        except asyncio.CancelledError:
+            pass
+    g_active_client = None
+    print("Cleanup complete.")
 
 async def send_h264_stripes():
     """Retrieves H.264 stripes from the queue and sends them to the active client."""
@@ -128,16 +149,7 @@ async def websocket_handler(websocket, path=None):
         print(f"[ERROR] WebSocket handler error: {e}")
     finally:
         if websocket is g_active_client:
-            print("Active client disconnected. Stopping screen capture...")
-            g_module.stop_capture()
-            g_is_capturing = False
-            if g_send_task:
-                g_send_task.cancel()
-            g_active_client = None
-            g_send_task = None
-            g_h264_stripe_queue = None
-            print("Screen capture stopped and resources released.")
-
+            await cleanup()
 
 def stripe_callback_handler(result_obj, user_data_obj):
     """Callback invoked by pixelflux when a new video stripe is ready."""
@@ -193,19 +205,11 @@ async def main():
     except KeyboardInterrupt:
         print("\nShutdown signal received.")
     finally:
-        print("Cleaning up resources...")
-        if g_is_capturing and g_module:
-            g_module.stop_capture()
+        await cleanup()
         if ws_server:
             ws_server.close()
             await ws_server.wait_closed()
-        if g_send_task and not g_send_task.done():
-            g_send_task.cancel()
-            await g_send_task
-        if g_module:
-            del g_module
         print("Cleanup complete.")
-
 
 if __name__ == "__main__":
     try:

@@ -643,11 +643,12 @@ void reset_nvenc_encoder() {
  * handle and clears the global NVENC function list struct.
  */
 void unload_nvenc_library_if_loaded() {
-  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
+  std::unique_lock<std::mutex> lock(g_nvenc_mutex); 
+  
   if (g_nvenc_state.initialized) {
-    g_nvenc_mutex.unlock();
+    lock.unlock();
     reset_nvenc_encoder();
-    g_nvenc_mutex.lock();
+    lock.lock();
   }
 
   if (g_nvenc_lib_handle) {
@@ -1156,11 +1157,12 @@ void reset_vaapi_encoder() {
  * library handles, ensuring a full cleanup.
  */
 void unload_vaapi_library_if_loaded() {
-    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
+    std::unique_lock<std::mutex> lock(g_vaapi_mutex);
+    
     if (g_vaapi_state.initialized) {
-        g_vaapi_mutex.unlock();
+        lock.unlock();
         reset_vaapi_encoder();
-        g_vaapi_mutex.lock();
+        lock.lock();
     }
     UnloadVaapiApi();
 }
