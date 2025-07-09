@@ -3589,7 +3589,7 @@ uint64_t calculate_yuv_stripe_hash(const uint8_t* y_plane_stripe_start, int y_st
     XXH3_state_t hash_state;
     XXH3_64bits_reset(&hash_state);
 
-    for (int r = 0; r < height; r += 16) {
+    for (int r = 0; r < height; r += 12) {
         XXH3_64bits_update(&hash_state, y_plane_stripe_start +
                            static_cast<size_t>(r) * y_stride, width);
     }
@@ -3605,11 +3605,11 @@ uint64_t calculate_yuv_stripe_hash(const uint8_t* y_plane_stripe_start, int y_st
     if (chroma_width <= 0 || chroma_height <= 0) {
         // Dimensions invalid
     } else {
-        for (int r = 0; r < chroma_height; r += 16) {
+        for (int r = 0; r < chroma_height; r += 12) {
             XXH3_64bits_update(&hash_state, u_plane_stripe_start +
                                static_cast<size_t>(r) * u_stride, chroma_width);
         }
-        for (int r = 0; r < chroma_height; r += 16) {
+        for (int r = 0; r < chroma_height; r += 12) {
             XXH3_64bits_update(&hash_state, v_plane_stripe_start +
                                static_cast<size_t>(r) * v_stride, chroma_width);
         }
