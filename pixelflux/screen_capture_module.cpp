@@ -3859,6 +3859,35 @@ typedef struct {
 } PyStripeEncodeResult;
 
 /**
+ * @brief Implementation of the buffer protocol for zero-copy access.
+ */
+static int PyStripeEncodeResult_getbuffer(PyObject* obj, Py_buffer* view, int flags) {
+  PyStripeEncodeResult* self = (PyStripeEncodeResult*)obj;
+  
+  if (self->result.data == nullptr || self->result.size <= 0) {
+    PyErr_SetString(PyExc_ValueError, "Cannot create view of empty buffer");
+    return -1;
+  }
+  
+  if (PyBuffer_FillInfo(view, obj, (void*)self->result.data, self->result.size,
+                        1, // Read-only
+                        flags) != 0) {
+    return -1;
+  }
+  
+  return 0;
+}
+
+static void PyStripeEncodeResult_releasebuffer(PyObject* obj, Py_buffer* view) {
+  // No special cleanup needed
+}
+
+static PyBufferProcs PyStripeEncodeResult_buffer_procs = {
+  .bf_getbuffer = PyStripeEncodeResult_getbuffer,
+  .bf_releasebuffer = PyStripeEncodeResult_releasebuffer
+};
+
+/**
  * @brief Deallocator for PyStripeEncodeResult objects.
  * The move constructor for the C++ StripeEncodeResult transfers ownership of
  * the data buffer, so its destructor (called implicitly) handles freeing memory.
@@ -3867,28 +3896,6 @@ typedef struct {
 static void PyStripeEncodeResult_dealloc(PyStripeEncodeResult* self) {
   Py_TYPE(self)->tp_free((PyObject*)self);
 }
-
-/**
- * @brief Getter for the 'data' attribute of a PyStripeEncodeResult object.
- * @param self The PyStripeEncodeResult object.
- * @param closure Unused.
- * @return The encoded data as a Python bytes object, or Py_None if no data.
- */
-static PyObject* PyStripeEncodeResult_get_data(PyStripeEncodeResult* self, void* closure) {
-  if (!self->result.data || self->result.size <= 0) {
-    Py_RETURN_NONE;
-  }
-  return PyBytes_FromStringAndSize((const char*)self->result.data, self->result.size);
-}
-
-/**
- * @brief Getter/setter definitions for the PyStripeEncodeResult type.
- * Exposes the encoded 'data' as a bytes object.
- */
-static PyGetSetDef PyStripeEncodeResult_getset[] = {
-  { "data", (getter)PyStripeEncodeResult_get_data, NULL, "encoded data", NULL },
-  { NULL }
-};
 
 /**
  * @brief Member definitions for the PyStripeEncodeResult type.
@@ -3912,13 +3919,14 @@ static PyTypeObject PyStripeEncodeResultType = {
   sizeof(PyStripeEncodeResult),
   0,
   (destructor)PyStripeEncodeResult_dealloc,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-  "Stripe Encode Result",
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  &PyStripeEncodeResult_buffer_procs,  // tp_as_buffer
+  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  // tp_flags
+  "Stripe Encode Result",  // tp_doc
   0, 0, 0, 0, 0, 0,
   0, // No methods
   PyStripeEncodeResult_members,
-  PyStripeEncodeResult_getset,
+  0, // No getset
   0, 0, 0, 0, 0, 0, 0, 0
 };
 
@@ -4044,18 +4052,40 @@ static void py_stripe_callback_trampoline(StripeEncodeResult* result, void* user
   PyGILState_STATE gstate = PyGILState_Ensure();
 
   PyScreenCapture* py_capture_module = (PyScreenCapture*)user_data;
-  if (py_capture_module && py_capture_module->py_callback_obj && result && result->data) {
+  if (!py_capture_module || !py_capture_module->py_callback_obj) {
+    if (result && result->data) {
+      delete[] result->data;
+      result->data = nullptr;
+    }
+    PyGILState_Release(gstate);
+    return;
+  }
+
+  if (result && result->data) {
     PyStripeEncodeResult* py_result_obj = (PyStripeEncodeResult*)PyStripeEncodeResultType.tp_alloc(&PyStripeEncodeResultType, 0);
     if (py_result_obj) {
+      // Transfer ownership to Python wrapper
       py_result_obj->result = std::move(*result);
-      PyObject* ret = PyObject_CallFunction(py_capture_module->py_callback_obj, "OO", py_result_obj, py_capture_module);
-      Py_XDECREF(ret);
+      
+      // Call Python callback with proper reference counting
+      PyObject* py_args = Py_BuildValue("OO", py_result_obj, py_capture_module);
+      if (py_args) {
+        PyObject* ret = PyObject_Call(py_capture_module->py_callback_obj, py_args, NULL);
+        Py_DECREF(py_args);
+        
+        if (ret) {
+          Py_DECREF(ret);
+        } else {
+          // Handle Python exception
+          PyErr_Print();
+        }
+      }
       Py_DECREF(py_result_obj);
+    } else {
+      // Failed to allocate wrapper - clean up result
+      delete[] result->data;
+      result->data = nullptr;
     }
-  }
-  else if (result && result->data) {
-    delete[] result->data;
-    result->data = nullptr;
   }
 
   PyGILState_Release(gstate);
@@ -4156,7 +4186,7 @@ static struct PyModuleDef moduledef = {
  * is imported. It prepares and registers all the custom Python types.
  * @return A new PyObject pointer to the module, or NULL on failure.
  */
-PyMODINIT_FUNC PyInit_screen_capture_module(void) {
+PyMODINIT_FUNC PyInit_screen_capture_module(void) {  
   if (PyType_Ready(&PyCaptureSettingsType) < 0) return NULL;
   if (PyType_Ready(&PyStripeEncodeResultType) < 0) return NULL;
   if (PyType_Ready(&PyStripeCallbackType) < 0) return NULL;

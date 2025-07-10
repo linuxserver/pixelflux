@@ -155,8 +155,9 @@ def stripe_callback_handler(result_obj, user_data_obj):
     """Callback invoked by pixelflux when a new video stripe is ready."""
     if g_is_capturing and result_obj and g_h264_stripe_queue is not None:
         if g_loop and not g_loop.is_closed():
+            # Get the memoryview from the result object (which supports buffer protocol)
             asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(result_obj.data), g_loop
+                g_h264_stripe_queue.put(memoryview(result_obj)), g_loop
             )
 
 
