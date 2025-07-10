@@ -30,8 +30,6 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
-#include <Python.h>
-#include <structmember.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xfixes.h>
@@ -265,7 +263,7 @@ MinimalEncoderStore g_h264_minimal_store;
 /**
  * @brief Enumerates the possible output modes for encoding.
  */
-enum class OutputMode {
+enum class OutputMode : int {
   JPEG = 0, /**< Output frames as JPEG images. */
   H264 = 1  /**< Output frames as H.264 video. */
 };
@@ -282,7 +280,7 @@ enum class StripeDataType {
 /**
  * @brief Enumerates the watermark location identifiers
  */
-enum class WatermarkLocation {
+enum class WatermarkLocation : int {
   NONE = 0, TL = 1, TR = 2, BL = 3, BR = 4, MI = 5, AN = 6
 };
 
@@ -3697,491 +3695,72 @@ uint64_t calculate_rgb_stripe_hash(const std::vector<unsigned char>& rgb_data) {
   return XXH3_64bits(rgb_data.data(), rgb_data.size());
 }
 
-#ifdef __cplusplus
 extern "C" {
-#endif
 
-/**
- * @brief Python type wrapper for the C++ CaptureSettings struct.
- * This struct allows CaptureSettings to be created and manipulated from Python,
- * with members directly corresponding to the C++ struct's fields. It also
- * safely manages the memory for the watermark_path string.
- */
-typedef struct {
-  PyObject_HEAD
-  CaptureSettings settings;
-  char* watermark_path_buffer;
-} PyCaptureSettings;
+  typedef void* ScreenCaptureModuleHandle;
 
-
-/**
- * @brief Deallocator for PyCaptureSettings objects.
- * Frees the dynamically allocated buffer for the watermark path string before
- * freeing the object itself.
- * @param self A pointer to the PyCaptureSettings object to be deallocated.
- */
-static void PyCaptureSettings_dealloc(PyCaptureSettings* self) {
-  free(self->watermark_path_buffer);
-  Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-/**
- * @brief Allocator for PyCaptureSettings objects.
- * Creates a new PyCaptureSettings object and initializes the wrapped C++
- * settings with default values.
- * @param type The Python type object.
- * @param args Unused.
- * @param kwds Unused.
- * @return A new PyObject pointer to the allocated PyCaptureSettings.
- */
-static PyObject* PyCaptureSettings_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
-  PyCaptureSettings* self = (PyCaptureSettings*)type->tp_alloc(type, 0);
-  if (self) {
-    self->settings = {};
-    self->watermark_path_buffer = NULL;
-  }
-  return (PyObject*)self;
-}
-
-/**
- * @brief Getter for the 'watermark_path' attribute of a PyCaptureSettings object.
- * @param self The PyCaptureSettings object.
- * @param closure Unused.
- * @return A Python string object representing the path, or Py_None if not set.
- */
-static PyObject* PyCaptureSettings_get_watermark_path(PyCaptureSettings* self, void* closure) {
-  if (self->settings.watermark_path == NULL) {
-    Py_RETURN_NONE;
-  }
-  return PyUnicode_FromString(self->settings.watermark_path);
-}
-
-/**
- * @brief Setter for the 'watermark_path' attribute of a PyCaptureSettings object.
- * Safely handles converting the Python string to a C-style string and manages
- * the underlying memory buffer.
- * @param self The PyCaptureSettings object.
- * @param value The new Python string value for the path, or Py_None.
- * @param closure Unused.
- * @return 0 on success, -1 on failure.
- */
-static int PyCaptureSettings_set_watermark_path(PyCaptureSettings* self, PyObject* value, void* closure) {
-  if (value == NULL || value == Py_None) {
-    free(self->watermark_path_buffer);
-    self->watermark_path_buffer = NULL;
-    self->settings.watermark_path = NULL;
-    return 0;
-  }
-  if (!PyUnicode_Check(value)) {
-    PyErr_SetString(PyExc_TypeError, "The 'watermark_path' attribute value must be a string or None");
-    return -1;
-  }
-  const char* path_str = PyUnicode_AsUTF8(value);
-  if (path_str == NULL) {
-    return -1;
+  /**
+   * @brief Creates a new instance of the ScreenCaptureModule.
+   * @return A handle to the created ScreenCaptureModule instance.
+   */
+  ScreenCaptureModuleHandle create_screen_capture_module() {
+    return static_cast<ScreenCaptureModuleHandle>(new ScreenCaptureModule());
   }
 
-  free(self->watermark_path_buffer);
-  self->watermark_path_buffer = strdup(path_str);
-  self->settings.watermark_path = self->watermark_path_buffer;
-  return 0;
-}
-
-/**
- * @brief Member definitions for the PyCaptureSettings type.
- * This array maps the fields of the C++ CaptureSettings struct to Python
- * attributes, allowing direct access.
- */
-static PyMemberDef PyCaptureSettings_members[] = {
-  { "capture_width", T_INT, offsetof(PyCaptureSettings, settings.capture_width), 0, "capture width" },
-  { "capture_height", T_INT, offsetof(PyCaptureSettings, settings.capture_height), 0, "capture height" },
-  { "capture_x", T_INT, offsetof(PyCaptureSettings, settings.capture_x), 0, "capture x" },
-  { "capture_y", T_INT, offsetof(PyCaptureSettings, settings.capture_y), 0, "capture y" },
-  { "target_fps", T_DOUBLE, offsetof(PyCaptureSettings, settings.target_fps), 0, "target fps" },
-  { "jpeg_quality", T_INT, offsetof(PyCaptureSettings, settings.jpeg_quality), 0, "jpeg quality" },
-  { "paint_over_jpeg_quality", T_INT, offsetof(PyCaptureSettings, settings.paint_over_jpeg_quality), 0, "paint over jpeg quality" },
-  { "use_paint_over_quality", T_BOOL, offsetof(PyCaptureSettings, settings.use_paint_over_quality), 0, "use paint over quality" },
-  { "paint_over_trigger_frames", T_INT, offsetof(PyCaptureSettings, settings.paint_over_trigger_frames), 0, "paint over trigger frames" },
-  { "damage_block_threshold", T_INT, offsetof(PyCaptureSettings, settings.damage_block_threshold), 0, "damage block threshold" },
-  { "damage_block_duration", T_INT, offsetof(PyCaptureSettings, settings.damage_block_duration), 0, "damage block duration" },
-  { "output_mode", T_INT, offsetof(PyCaptureSettings, settings.output_mode), 0, "output mode" },
-  { "h264_crf", T_INT, offsetof(PyCaptureSettings, settings.h264_crf), 0, "h264 crf" },
-  { "h264_fullcolor", T_BOOL, offsetof(PyCaptureSettings, settings.h264_fullcolor), 0, "h264 fullcolor" },
-  { "h264_fullframe", T_BOOL, offsetof(PyCaptureSettings, settings.h264_fullframe), 0, "h264 fullframe" },
-  { "capture_cursor", T_BOOL, offsetof(PyCaptureSettings, settings.capture_cursor), 0, "capture cursor" },
-  { "watermark_location_enum", T_INT, offsetof(PyCaptureSettings, settings.watermark_location_enum), 0, "watermark location enum" },
-  { "vaapi_render_node_index", T_INT, offsetof(PyCaptureSettings, settings.vaapi_render_node_index), 0, "vaapi render node index (-1 to disable)" },
-  { NULL }
-};
-
-/**
- * @brief Getter/setter definitions for the PyCaptureSettings type.
- * Defines the 'watermark_path' attribute, which requires custom logic for
- * memory management.
- */
-static PyGetSetDef PyCaptureSettings_getsetters[] = {
-  { "watermark_path", (getter)PyCaptureSettings_get_watermark_path, (setter)PyCaptureSettings_set_watermark_path, "watermark path", NULL },
-  { NULL }
-};
-
-/**
- * @brief Type object definition for PyCaptureSettings.
- * This structure defines the PyCaptureSettings type for the Python interpreter.
- */
-static PyTypeObject PyCaptureSettingsType = {
-  PyVarObject_HEAD_INIT(NULL, 0)
-  "pixelflux.screen_capture_module.CaptureSettings",
-  sizeof(PyCaptureSettings),
-  0,
-  (destructor)PyCaptureSettings_dealloc,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-  "Capture Settings",
-  0, 0, 0, 0, 0, 0,
-  0, // No methods for this type
-  PyCaptureSettings_members,
-  PyCaptureSettings_getsetters,
-  0, 0, 0, 0, 0,
-  0, // No __init__ for this type
-  0,
-  PyCaptureSettings_new,
-};
-
-/**
- * @brief Python type wrapper for the C++ StripeEncodeResult struct.
- * This object holds the result of an encoding operation from the C++ side.
- * Ownership of the underlying data buffer is transferred to this Python object,
- * and it is freed when the object is garbage collected.
- */
-typedef struct {
-  PyObject_HEAD
-  StripeEncodeResult result;
-} PyStripeEncodeResult;
-
-/**
- * @brief Deallocator for PyStripeEncodeResult objects.
- * The move constructor for the C++ StripeEncodeResult transfers ownership of
- * the data buffer, so its destructor (called implicitly) handles freeing memory.
- * @param self The PyStripeEncodeResult object to be deallocated.
- */
-static void PyStripeEncodeResult_dealloc(PyStripeEncodeResult* self) {
-  Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-/**
- * @brief Getter for the 'data' attribute of a PyStripeEncodeResult object.
- * @param self The PyStripeEncodeResult object.
- * @param closure Unused.
- * @return The encoded data as a Python bytes object, or Py_None if no data.
- */
-static PyObject* PyStripeEncodeResult_get_data(PyStripeEncodeResult* self, void* closure) {
-  if (!self->result.data || self->result.size <= 0) {
-    Py_RETURN_NONE;
-  }
-  return PyBytes_FromStringAndSize((const char*)self->result.data, self->result.size);
-}
-
-/**
- * @brief Getter/setter definitions for the PyStripeEncodeResult type.
- * Exposes the encoded 'data' as a bytes object.
- */
-static PyGetSetDef PyStripeEncodeResult_getset[] = {
-  { "data", (getter)PyStripeEncodeResult_get_data, NULL, "encoded data", NULL },
-  { NULL }
-};
-
-/**
- * @brief Member definitions for the PyStripeEncodeResult type.
- * Exposes metadata from the C++ result struct as read-only attributes.
- */
-static PyMemberDef PyStripeEncodeResult_members[] = {
-  { "type", T_INT, offsetof(PyStripeEncodeResult, result.type), READONLY, "stripe type" },
-  { "stripe_y_start", T_INT, offsetof(PyStripeEncodeResult, result.stripe_y_start), READONLY, "stripe y start" },
-  { "stripe_height", T_INT, offsetof(PyStripeEncodeResult, result.stripe_height), READONLY, "stripe height" },
-  { "size", T_INT, offsetof(PyStripeEncodeResult, result.size), READONLY, "data size" },
-  { "frame_id", T_INT, offsetof(PyStripeEncodeResult, result.frame_id), READONLY, "frame id" },
-  { NULL }
-};
-
-/**
- * @brief Type object definition for PyStripeEncodeResult.
- */
-static PyTypeObject PyStripeEncodeResultType = {
-  PyVarObject_HEAD_INIT(NULL, 0)
-  "pixelflux.screen_capture_module.StripeEncodeResult",
-  sizeof(PyStripeEncodeResult),
-  0,
-  (destructor)PyStripeEncodeResult_dealloc,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-  "Stripe Encode Result",
-  0, 0, 0, 0, 0, 0,
-  0, // No methods
-  PyStripeEncodeResult_members,
-  PyStripeEncodeResult_getset,
-  0, 0, 0, 0, 0, 0, 0, 0
-};
-
-/**
- * @brief A wrapper object to hold a Python callable for type checking.
- * This allows Python code to pass a callback function that can be validated
- * and stored before being used by the capture module.
- */
-typedef struct {
-  PyObject_HEAD
-  PyObject* callback;
-} PyStripeCallback;
-
-/**
- * @brief Initializer for PyStripeCallback objects.
- * Verifies that the object passed during construction is a callable.
- * @param self The PyStripeCallback object.
- * @param args A tuple containing the Python callable.
- * @param kwds Unused.
- * @return 0 on success, -1 on failure.
- */
-static int PyStripeCallback_init(PyStripeCallback* self, PyObject* args, PyObject* kwds) {
-  PyObject* callback = NULL;
-  if (!PyArg_ParseTuple(args, "O:StripeCallback", &callback)) {
-    return -1;
-  }
-  if (!PyCallable_Check(callback)) {
-    PyErr_SetString(PyExc_TypeError, "parameter must be a callable");
-    return -1;
-  }
-  Py_INCREF(callback);
-  self->callback = callback;
-  return 0;
-}
-
-/**
- * @brief Deallocator for PyStripeCallback objects.
- * Decrements the reference count of the stored Python callable.
- * @param self The PyStripeCallback object.
- */
-static void PyStripeCallback_dealloc(PyStripeCallback* self) {
-  Py_XDECREF(self->callback);
-  Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-/**
- * @brief Type object definition for PyStripeCallback.
- */
-static PyTypeObject PyStripeCallbackType = {
-  PyVarObject_HEAD_INIT(NULL, 0)
-  "pixelflux.screen_capture_module.StripeCallback",
-  sizeof(PyStripeCallback),
-  0,
-  (destructor)PyStripeCallback_dealloc,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-  "StripeCallback object",
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  (initproc)PyStripeCallback_init,
-  PyType_GenericAlloc,
-  PyType_GenericNew
-};
-
-/**
- * @brief The main Python type that wraps the C++ ScreenCaptureModule.
- * This class exposes the primary functionality of starting and stopping the
- * screen capture process to Python.
- */
-typedef struct {
-  PyObject_HEAD
-  ScreenCaptureModule* module;
-  PyObject* py_callback_obj;
-} PyScreenCapture;
-
-/**
- * @brief Deallocator for PyScreenCapture objects.
- * Ensures the capture thread is stopped and the C++ module is deleted,
- * then decrements the reference to the Python callback object.
- * @param self The PyScreenCapture object.
- */
-static void PyScreenCapture_dealloc(PyScreenCapture* self) {
-  if (self->module) {
-    self->module->stop_capture();
-    delete self->module;
-    self->module = NULL;
-  }
-  Py_XDECREF(self->py_callback_obj);
-  Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-/**
- * @brief Allocator for PyScreenCapture objects.
- * Creates a new PyScreenCapture object and instantiates the underlying C++
- * ScreenCaptureModule.
- * @param type The Python type object.
- * @param args Unused.
- * @param kwds Unused.
- * @return A new PyObject pointer to the allocated PyScreenCapture.
- */
-static PyObject* PyScreenCapture_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
-  PyScreenCapture* self = (PyScreenCapture*)type->tp_alloc(type, 0);
-  if (self) {
-    self->module = new ScreenCaptureModule();
-    self->py_callback_obj = NULL;
-  }
-  return (PyObject*)self;
-}
-
-/**
- * @brief C-style callback function that acts as a bridge from the C++ capture
- *        thread to the Python interpreter.
- *
- * This function is called by the C++ ScreenCaptureModule from a background
- * thread. It acquires the Python GIL, creates a Python wrapper object for the
- * encode result, calls the user-provided Python callback, and then cleans up.
- * It transfers ownership of the result's data buffer to the Python wrapper
- * via `std::move` to ensure proper memory management.
- *
- * @param result A pointer to the StripeEncodeResult from the C++ side.
- * @param user_data A void pointer to the PyScreenCapture object instance.
- */
-static void py_stripe_callback_trampoline(StripeEncodeResult* result, void* user_data) {
-  PyGILState_STATE gstate = PyGILState_Ensure();
-
-  PyScreenCapture* py_capture_module = (PyScreenCapture*)user_data;
-  if (py_capture_module && py_capture_module->py_callback_obj && result && result->data) {
-    PyStripeEncodeResult* py_result_obj = (PyStripeEncodeResult*)PyStripeEncodeResultType.tp_alloc(&PyStripeEncodeResultType, 0);
-    if (py_result_obj) {
-      py_result_obj->result = std::move(*result);
-      PyObject* ret = PyObject_CallFunction(py_capture_module->py_callback_obj, "OO", py_result_obj, py_capture_module);
-      Py_XDECREF(ret);
-      Py_DECREF(py_result_obj);
+  /**
+   * @brief Destroys a ScreenCaptureModule instance.
+   * @param module_handle Handle to the ScreenCaptureModule instance to destroy.
+   */
+  void destroy_screen_capture_module(ScreenCaptureModuleHandle module_handle) {
+    if (module_handle) {
+      delete static_cast<ScreenCaptureModule*>(module_handle);
     }
   }
-  else if (result && result->data) {
-    delete[] result->data;
-    result->data = nullptr;
+
+  /**
+   * @brief Starts the screen capture process with the given settings and callback.
+   * @param module_handle Handle to the ScreenCaptureModule instance.
+   * @param settings The initial capture and encoding settings.
+   * @param callback A function pointer to be called when an encoded stripe is ready.
+   * @param user_data User-defined data to be passed to the callback function.
+   */
+  void start_screen_capture(ScreenCaptureModuleHandle module_handle,
+                            CaptureSettings settings,
+                            StripeCallback callback,
+                            void* user_data) {
+    if (module_handle) {
+      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
+      module->modify_settings(settings);
+
+      {
+        std::lock_guard<std::mutex> lock(module->settings_mutex);
+        module->stripe_callback = callback;
+        module->user_data = user_data;
+      }
+
+      module->start_capture();
+    }
+  }
+  /**
+   * @brief Stops the screen capture process.
+   * @param module_handle Handle to the ScreenCaptureModule instance.
+   */
+  void stop_screen_capture(ScreenCaptureModuleHandle module_handle) {
+    if (module_handle) {
+      static_cast<ScreenCaptureModule*>(module_handle)->stop_capture();
+    }
   }
 
-  PyGILState_Release(gstate);
+  /**
+   * @brief Frees the data buffer within a StripeEncodeResult.
+   * This is called from Python via ctypes to prevent memory leaks.
+   * @param result Pointer to the StripeEncodeResult whose data needs freeing.
+   */
+  void free_stripe_encode_result_data(StripeEncodeResult* result) {
+    if (result && result->data) {
+      delete[] result->data;
+      result->data = nullptr;
+    }
+  }
+
 }
-
-/**
- * @brief Python method to start the capture process.
- * Takes CaptureSettings and a StripeCallback object, configures the underlying
- * C++ module, sets up the callback trampoline, and starts the capture thread.
- * @param self The PyScreenCapture object.
- * @param args A tuple containing a PyCaptureSettings and PyStripeCallback object.
- * @return Py_None on success, NULL on failure.
- */
-static PyObject* PyScreenCapture_start_capture(PyScreenCapture* self, PyObject* args) {
-  PyObject* py_settings;
-  PyObject* py_callback_wrapper;
-  if (!PyArg_ParseTuple(args, "OO", &py_settings, &py_callback_wrapper)) {
-    return NULL;
-  }
-
-  if (!PyObject_TypeCheck(py_settings, &PyCaptureSettingsType)) {
-    PyErr_SetString(PyExc_TypeError, "First argument must be a CaptureSettings object");
-    return NULL;
-  }
-  if (!PyObject_TypeCheck(py_callback_wrapper, &PyStripeCallbackType)) {
-    PyErr_SetString(PyExc_TypeError, "Second argument must be a StripeCallback object");
-    return NULL;
-  }
-
-  PyObject* callable = ((PyStripeCallback*)py_callback_wrapper)->callback;
-  Py_XDECREF(self->py_callback_obj);
-  Py_INCREF(callable);
-  self->py_callback_obj = callable;
-
-  self->module->modify_settings(((PyCaptureSettings*)py_settings)->settings);
-  self->module->stripe_callback = py_stripe_callback_trampoline;
-  self->module->user_data = (void*)self;
-  self->module->start_capture();
-
-  Py_RETURN_NONE;
-}
-
-/**
- * @brief Python method to stop the capture process.
- * Signals the background thread to stop and waits for it to join.
- * @param self The PyScreenCapture object.
- * @param ignored Unused.
- * @return Py_None.
- */
-static PyObject* PyScreenCapture_stop_capture(PyScreenCapture* self, PyObject* Py_UNUSED(ignored)) {
-  if (self->module) {
-    self->module->stop_capture();
-  }
-  Py_RETURN_NONE;
-}
-
-/**
- * @brief Method definitions for the PyScreenCapture type.
- */
-static PyMethodDef PyScreenCapture_methods[] = {
-  { "start_capture", (PyCFunction)PyScreenCapture_start_capture, METH_VARARGS, "Start capture with settings and callback" },
-  { "stop_capture", (PyCFunction)PyScreenCapture_stop_capture, METH_NOARGS, "Stop capture" },
-  { NULL }
-};
-
-/**
- * @brief Type object definition for PyScreenCapture.
- */
-static PyTypeObject PyScreenCaptureType = {
-  PyVarObject_HEAD_INIT(NULL, 0)
-  "pixelflux.screen_capture_module.ScreenCapture",
-  sizeof(PyScreenCapture),
-  0,
-  (destructor)PyScreenCapture_dealloc,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  Py_TPFLAGS_DEFAULT,
-  "Screen Capture object",
-  0, 0, 0, 0, 0, 0,
-  PyScreenCapture_methods,
-  0, 0, 0, 0, 0, 0, 0, 0, 0,
-  PyScreenCapture_new
-};
-
-/**
- * @brief Module definition structure.
- */
-static struct PyModuleDef moduledef = {
-  PyModuleDef_HEAD_INIT,
-  "pixelflux.screen_capture_module",
-  "Screen capture module (C++ backend)",
-  -1,
-  NULL,
-};
-
-/**
- * @brief The initialization function for the Python module.
- * This is the entry point called by the Python interpreter when the module
- * is imported. It prepares and registers all the custom Python types.
- * @return A new PyObject pointer to the module, or NULL on failure.
- */
-PyMODINIT_FUNC PyInit_screen_capture_module(void) {
-  if (PyType_Ready(&PyCaptureSettingsType) < 0) return NULL;
-  if (PyType_Ready(&PyStripeEncodeResultType) < 0) return NULL;
-  if (PyType_Ready(&PyStripeCallbackType) < 0) return NULL;
-  if (PyType_Ready(&PyScreenCaptureType) < 0) return NULL;
-
-  PyObject* m = PyModule_Create(&moduledef);
-  if (!m) {
-    return NULL;
-  }
-
-  Py_INCREF(&PyCaptureSettingsType);
-  PyModule_AddObject(m, "CaptureSettings", (PyObject*)&PyCaptureSettingsType);
-
-  Py_INCREF(&PyStripeEncodeResultType);
-  PyModule_AddObject(m, "StripeEncodeResult", (PyObject*)&PyStripeEncodeResultType);
-
-  Py_INCREF(&PyStripeCallbackType);
-  PyModule_AddObject(m, "StripeCallback", (PyObject*)&PyStripeCallbackType);
-
-  Py_INCREF(&PyScreenCaptureType);
-  PyModule_AddObject(m, "ScreenCapture", (PyObject*)&PyScreenCaptureType);
-
-  return m;
-}
-
-#ifdef __cplusplus
-}
-#endif

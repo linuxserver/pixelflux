@@ -61,9 +61,8 @@ capture_settings.damage_block_threshold = 10
 capture_settings.damage_block_duration = 30
 
 # --- Watermarking ---
-# To enable, set a path and change the location enum from 0.
-# The path MUST be a byte string (b'') and point to a valid PNG file.
-# capture_settings.watermark_path = b"/path/to/your/watermark.png"
+# The path MUST be a byte string (b"") and point to a valid PNG file.
+#capture_settings.watermark_path = b"/path/to/your/watermark.png"
 
 # Sets the watermark location on the screen. Default is 0 (disabled).
 # Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle
@@ -73,7 +72,6 @@ capture_settings.watermark_location_enum = 0
 # --- Global State ---
 # ==============================================================================
 g_loop = None                   # The main asyncio event loop.
-g_stripe_callback = None        # Callback for stripe data.
 g_module = None                 # The ScreenCapture instance.
 g_active_client = None          # Holds the single active WebSocket client.
 g_is_capturing = False          # Flag indicating if capture is active.
@@ -124,7 +122,7 @@ async def send_h264_stripes():
 
 async def websocket_handler(websocket, path=None):
     """Manages a single WebSocket connection and the screen capture lifecycle."""
-    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
+    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task, g_stripe_callback
 
     if g_active_client is not None:
         print("Rejecting new connection: A client is already active.")
@@ -136,7 +134,7 @@ async def websocket_handler(websocket, path=None):
 
     try:
         g_h264_stripe_queue = asyncio.Queue(maxsize=120)
-        g_module.start_capture(capture_settings, g_stripe_callback)
+        g_module.start_capture(capture_settings, stripe_callback_handler)
         g_is_capturing = True
         g_send_task = asyncio.create_task(send_h264_stripes())
         print("Screen capture and stream started.")
@@ -151,12 +149,18 @@ async def websocket_handler(websocket, path=None):
         if websocket is g_active_client:
             await cleanup()
 
-def stripe_callback_handler(result_obj, user_data_obj):
+def stripe_callback_handler(result_ptr, user_data_ptr):
     """Callback invoked by pixelflux when a new video stripe is ready."""
-    if g_is_capturing and result_obj and g_h264_stripe_queue is not None:
+    if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
+        result = result_ptr.contents
+        if result.size <= 0:
+            return
+
+        data_copy = bytes(result.data[:result.size])
+
         if g_loop and not g_loop.is_closed():
             asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(result_obj.data), g_loop
+                g_h264_stripe_queue.put(data_copy), g_loop
             )
 
 
@@ -176,11 +180,10 @@ def start_http_server(host, port):
 
 async def main():
     """Initializes resources and starts the WebSocket and HTTP servers."""
-    global g_loop, g_stripe_callback, g_module, g_is_capturing, g_send_task
+    global g_loop, g_module, g_is_capturing, g_send_task
 
     g_loop = asyncio.get_running_loop()
 
-    g_stripe_callback = StripeCallback(stripe_callback_handler)
     g_module = ScreenCapture()
     if not g_module:
         print("[FATAL] Failed to initialize pixelflux ScreenCapture module.")
