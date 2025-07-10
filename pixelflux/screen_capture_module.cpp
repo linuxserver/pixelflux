@@ -2496,10 +2496,6 @@ private:
             }
           }
 
-          size_t shm_data_size = static_cast<size_t>(shm_image->height) * shm_image->bytes_per_line;
-          frame_data->shm_data.resize(shm_data_size);
-          std::memcpy(frame_data->shm_data.data(), shm_image->data, shm_data_size);
-
           if (local_current_output_mode == OutputMode::H264) {
               bool is_i444 = local_current_h264_fullcolor;
               bool force_420_conversion = this->vaapi_operational;
@@ -2519,12 +2515,12 @@ private:
                   frame_data->u_plane.resize(plane_size);
                   frame_data->v_plane.resize(plane_size);
 
-                  libyuv::ARGBToI444(frame_data->shm_data.data(), frame_data->shm_stride_bytes,
+                  libyuv::ARGBToI444((const uint8_t*)shm_image->data, shm_image->bytes_per_line,
                                     frame_data->y_plane.data(), frame_data->y_stride,
                                     frame_data->u_plane.data(), frame_data->u_stride,
                                     frame_data->v_plane.data(), frame_data->v_stride,
                                     local_capture_width_actual, local_capture_height_actual);
-              } else { // I420
+              } else { 
                   frame_data->is_i444 = false;
                   frame_data->y_stride = local_capture_width_actual;
                   frame_data->u_stride = local_capture_width_actual / 2;
@@ -2535,12 +2531,16 @@ private:
                   frame_data->u_plane.resize(chroma_plane_size);
                   frame_data->v_plane.resize(chroma_plane_size);
 
-                  libyuv::ARGBToI420(frame_data->shm_data.data(), frame_data->shm_stride_bytes,
+                  libyuv::ARGBToI420((const uint8_t*)shm_image->data, shm_image->bytes_per_line,
                                     frame_data->y_plane.data(), frame_data->y_stride,
                                     frame_data->u_plane.data(), frame_data->u_stride,
                                     frame_data->v_plane.data(), frame_data->v_stride,
                                     local_capture_width_actual, local_capture_height_actual);
               }
+          } else {
+              size_t shm_data_size = static_cast<size_t>(shm_image->height) * shm_image->bytes_per_line;
+              frame_data->shm_data.resize(shm_data_size);
+              std::memcpy(frame_data->shm_data.data(), shm_image->data, shm_data_size);
           }
           int N_processing_stripes;
           if (local_capture_height_actual <= 0) {
