@@ -2947,6 +2947,23 @@ private:
                           job.frame_data->v_plane.data(), job.frame_data->v_stride,
                           job.frame_data->is_i444, job.frame_data->frame_id, force_idr
                       );
+                  } else {
+                      const uint8_t* y_plane_stripe_start = job.frame_data->y_plane.data() + static_cast<size_t>(job.stripe_y_start) * job.frame_data->y_stride;
+                      const uint8_t* u_plane_stripe_start = job.frame_data->u_plane.data() + (static_cast<size_t>(job.frame_data->is_i444 ? job.stripe_y_start : (job.stripe_y_start / 2)) * job.frame_data->u_stride);
+                      const uint8_t* v_plane_stripe_start = job.frame_data->v_plane.data() + (static_cast<size_t>(job.frame_data->is_i444 ? job.stripe_y_start : (job.stripe_y_start / 2)) * job.frame_data->v_stride);
+
+                      int colorspace_setting = job.frame_data->is_i444 ? 444 : 420;
+                      bool use_full_range = job.frame_data->is_i444;
+
+                      result = encode_stripe_h264(
+                          job.thread_id, job.stripe_y_start, job.stripe_height, job.capture_width,
+                          y_plane_stripe_start, job.frame_data->y_stride,
+                          u_plane_stripe_start, job.frame_data->u_stride,
+                          v_plane_stripe_start, job.frame_data->v_stride,
+                          job.frame_data->is_i444, job.frame_data->frame_id,
+                          job.h264_crf, colorspace_setting, use_full_range,
+                          job.force_idr
+                      );
                   }
               } else if (job.mode == OutputMode::JPEG) {
                   result = encode_stripe_jpeg(
