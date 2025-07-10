@@ -62,10 +62,10 @@ capture_settings.damage_block_duration = 30
 
 # --- Watermarking ---
 # The path MUST be a byte string (b"") and point to a valid PNG file.
-#capture_settings.watermark_path = b"/path/to/your/watermark.png"
+#capture_settings.watermark_path = b"/path/to/image.png"
 
 # Sets the watermark location on the screen. Default is 0 (disabled).
-# Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle
+# Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle, 6:Animated
 capture_settings.watermark_location_enum = 0
 
 # ==============================================================================
