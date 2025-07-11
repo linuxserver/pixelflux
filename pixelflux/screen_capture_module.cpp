@@ -4049,16 +4049,31 @@ static PyObject* PyScreenCapture_new(PyTypeObject* type, PyObject* args, PyObjec
  * @param user_data A void pointer to the PyScreenCapture object instance.
  */
 static void py_stripe_callback_trampoline(StripeEncodeResult* result, void* user_data) {
+  if (user_data == nullptr) {
+      if (result && result->data) {
+          delete[] result->data;
+          result->data = nullptr;
+      }
+      return;
+  }
+  PyScreenCapture* py_capture_module = (PyScreenCapture*)user_data;
+  if (py_capture_module->module == nullptr || py_capture_module->module->stop_requested.load()) {
+      if (result && result->data) {
+          delete[] result->data;
+          result->data = nullptr;
+      }
+      return;
+  }
+
   PyGILState_STATE gstate = PyGILState_Ensure();
 
-  PyScreenCapture* py_capture_module = (PyScreenCapture*)user_data;
-  if (!py_capture_module || !py_capture_module->py_callback_obj) {
-    if (result && result->data) {
-      delete[] result->data;
-      result->data = nullptr;
-    }
-    PyGILState_Release(gstate);
-    return;
+  if (!py_capture_module->py_callback_obj) {
+      if (result && result->data) {
+          delete[] result->data;
+          result->data = nullptr;
+      }
+      PyGILState_Release(gstate);
+      return;
   }
 
   if (result && result->data) {
@@ -4186,7 +4201,7 @@ static struct PyModuleDef moduledef = {
  * is imported. It prepares and registers all the custom Python types.
  * @return A new PyObject pointer to the module, or NULL on failure.
  */
-PyMODINIT_FUNC PyInit_screen_capture_module(void) {  
+PyMODINIT_FUNC PyInit_screen_capture_module(void) {
   if (PyType_Ready(&PyCaptureSettingsType) < 0) return NULL;
   if (PyType_Ready(&PyStripeEncodeResultType) < 0) return NULL;
   if (PyType_Ready(&PyStripeCallbackType) < 0) return NULL;
