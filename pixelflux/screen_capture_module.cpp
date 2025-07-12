@@ -4065,16 +4065,15 @@ static void py_stripe_callback_trampoline(StripeEncodeResult* result, void* user
       return;
   }
 
-  PyGILState_STATE gstate = PyGILState_Ensure();
-
   if (!py_capture_module->py_callback_obj) {
       if (result && result->data) {
           delete[] result->data;
           result->data = nullptr;
       }
-      PyGILState_Release(gstate);
       return;
   }
+
+  PyGILState_STATE gstate = PyGILState_Ensure();
 
   if (result && result->data) {
     PyStripeEncodeResult* py_result_obj = (PyStripeEncodeResult*)PyStripeEncodeResultType.tp_alloc(&PyStripeEncodeResultType, 0);

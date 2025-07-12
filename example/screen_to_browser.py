@@ -100,6 +100,7 @@ async def cleanup():
         except asyncio.CancelledError:
             pass
     g_active_client = None
+    g_is_shutting_down = False  # Reset shutdown flag for future connections
     print("Cleanup complete.")
 
 async def send_h264_stripes():
@@ -150,6 +151,7 @@ async def websocket_handler(websocket, path=None):
     finally:
         if websocket is g_active_client:
             await cleanup()
+            g_active_client = None  # Ensure active client is reset after cleanup
 
 def stripe_callback_handler(result_obj, user_data_obj):
     """Callback invoked by pixelflux when a new video stripe is ready."""
@@ -169,7 +171,10 @@ def start_http_server(host, port):
             super().__init__(*args, directory=script_dir, **kwargs)
         def log_message(self, format, *args):
             pass
-    with socketserver.TCPServer((host, port), QuietHTTPRequestHandler) as httpd:
+    class ReuseAddressTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True
+        
+    with ReuseAddressTCPServer((host, port), QuietHTTPRequestHandler) as httpd:
         print(f"HTTP server is serving files from '{script_dir}'")
         print(f"-> Open http://{host}:{port}/index.html in your browser.")
         httpd.serve_forever()
