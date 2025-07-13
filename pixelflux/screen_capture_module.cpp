@@ -206,8 +206,8 @@ struct MinimalEncoderStore {
   std::vector<int> initialized_colorspaces;
   std::vector<bool> initialized_full_range_flags;
   std::vector<bool> force_idr_flags;
-  std::vector<std::unique_ptr<std::mutex>> encoder_locks; // Protects individual encoders
-  std::mutex store_mutex; // Protects the vectors themselves during resize
+  std::vector<std::unique_ptr<std::mutex>> encoder_locks;
+  std::mutex store_mutex;
 
   /**
    * @brief Ensures that the internal vectors are large enough for the given thread_id.
@@ -2537,10 +2537,6 @@ private:
                                     frame_data->v_plane.data(), frame_data->v_stride,
                                     local_capture_width_actual, local_capture_height_actual);
               }
-          } else {
-              size_t shm_data_size = static_cast<size_t>(shm_image->height) * shm_image->bytes_per_line;
-              frame_data->shm_data.resize(shm_data_size);
-              std::memcpy(frame_data->shm_data.data(), shm_image->data, shm_data_size);
           }
           int N_processing_stripes;
           if (local_capture_height_actual <= 0) {
@@ -2577,186 +2573,119 @@ private:
               previous_hashes.assign(N_processing_stripes, 0);
               no_motion_frame_counts.assign(N_processing_stripes, 0);
               paint_over_sent.assign(N_processing_stripes, false);
-              current_jpeg_qualities.resize(N_processing_stripes);
-              consecutive_stripe_changes.assign(N_processing_stripes, 0);
-              stripe_is_in_damage_block.assign(N_processing_stripes, false);
-              stripe_damage_block_frames_remaining.assign(N_processing_stripes, 0);
-              stripe_hash_at_damage_block_start.assign(N_processing_stripes, 0);
-
-              for(int k=0; k < N_processing_stripes; ++k) {
-                  current_jpeg_qualities[k] = local_current_use_paint_over_quality ?
-                                              local_current_paint_over_jpeg_quality :
-                                              local_current_jpeg_quality;
-              }
           }
 
-          int h264_base_even_height = 0;
-          int h264_num_stripes_with_extra_pair = 0;
-          int current_y_start_for_stripe = 0;
-
-          if (local_current_output_mode == OutputMode::H264 && !local_current_h264_fullframe &&
-              N_processing_stripes > 0 && local_capture_height_actual > 0) {
-            int H = local_capture_height_actual;
-            int N = N_processing_stripes;
-            int base_h = H / N;
-            h264_base_even_height = (base_h > 0) ? (base_h - (base_h % 2)) : 0;
-            if (h264_base_even_height == 0 && H >= 2) {
-              h264_base_even_height = 2;
-            } else if (h264_base_even_height == 0 && H > 0 && N == 1) {
-              h264_base_even_height = H - (H % 2);
-              if (h264_base_even_height == 0 && H >= 2) h264_base_even_height = 2;
-            } else if (h264_base_even_height == 0 && H > 0) {
-              N_processing_stripes = 0;
-            }
-
-            if (h264_base_even_height > 0) {
-              int H_base_covered = h264_base_even_height * N;
-              int H_remaining = H - H_base_covered;
-              if (H_remaining < 0) H_remaining = 0;
-              h264_num_stripes_with_extra_pair = H_remaining / 2;
-              h264_num_stripes_with_extra_pair =
-                std::min(h264_num_stripes_with_extra_pair, N);
-            } else if (H > 0 && N_processing_stripes > 0) {
-              N_processing_stripes = 0;
-            }
-          }
           bool any_stripe_encoded_this_frame = false;
 
-          for (int i = 0; i < N_processing_stripes; ++i) {
-            int start_y = 0;
-            int current_stripe_height = 0;
+          if (N_processing_stripes > 0) {
+              std::vector<std::future<uint64_t>> hash_futures;
+              std::vector<std::pair<int, int>> stripe_geometries(N_processing_stripes);
+              
+              int current_y_start_for_stripe = 0;
+              int h264_base_even_height = 0, h264_num_stripes_with_extra_pair = 0;
 
-            if (local_current_output_mode == OutputMode::H264) {
-              if (local_current_h264_fullframe) {
-                  start_y = 0;
-                  current_stripe_height = local_capture_height_actual;
-              } else {
-                  start_y = current_y_start_for_stripe;
-                  if (h264_base_even_height > 0) {
-                      current_stripe_height = h264_base_even_height;
-                      if (i < h264_num_stripes_with_extra_pair) {
-                          current_stripe_height += 2;
+              if (local_current_output_mode == OutputMode::H264 && !local_current_h264_fullframe) {
+                  int H = local_capture_height_actual, N = N_processing_stripes;
+                  if (N > 0) {
+                      int base_h = H / N;
+                      h264_base_even_height = (base_h > 0) ? (base_h - (base_h % 2)) : 0;
+                      if (h264_base_even_height == 0 && H >= 2) h264_base_even_height = 2;
+                      if (h264_base_even_height > 0) {
+                          int H_rem = H - (h264_base_even_height * N);
+                          h264_num_stripes_with_extra_pair = std::min(N, (H_rem >= 0 ? H_rem : 0) / 2);
                       }
-                  } else if (N_processing_stripes == 1) {
-                      current_stripe_height = local_capture_height_actual -
-                                              (local_capture_height_actual % 2);
-                      if (current_stripe_height == 0 && local_capture_height_actual >=2)
-                          current_stripe_height = 2;
-                  } else {
-                      current_stripe_height = 0;
-                  }
-              }
-            } else {
-              if (N_processing_stripes > 0) {
-                  int base_stripe_height_jpeg = local_capture_height_actual / N_processing_stripes;
-                  int remainder_height_jpeg = local_capture_height_actual % N_processing_stripes;
-                  start_y = i * base_stripe_height_jpeg + std::min(i, remainder_height_jpeg);
-                  current_stripe_height = base_stripe_height_jpeg +
-                                          (i < remainder_height_jpeg ? 1 : 0);
-              } else {
-                  current_stripe_height = 0;
-              }
-            }
-
-            if (current_stripe_height <= 0) {
-              continue;
-            }
-
-            if (start_y + current_stripe_height > local_capture_height_actual) {
-              current_stripe_height = local_capture_height_actual - start_y;
-              if (current_stripe_height <= 0) continue;
-              if (local_current_output_mode == OutputMode::H264 && !local_current_h264_fullframe &&
-                  current_stripe_height % 2 != 0 && current_stripe_height > 0) {
-                  current_stripe_height--;
-              }
-              if (current_stripe_height <= 0) continue;
-            }
-
-            if (local_current_output_mode == OutputMode::H264 && !local_current_h264_fullframe) {
-              current_y_start_for_stripe += current_stripe_height;
-            }
-
-            uint64_t current_hash = 0;
-            bool send_this_stripe = false;
-            bool force_this_stripe_to_be_idr = false;
-
-            if (local_current_output_mode == OutputMode::H264) {
-                const uint8_t* y_plane_stripe_ptr = frame_data->y_plane.data() + static_cast<size_t>(start_y) * frame_data->y_stride;
-                const uint8_t* u_plane_stripe_ptr = frame_data->u_plane.data() + (static_cast<size_t>(frame_data->is_i444 ? start_y : (start_y / 2)) * frame_data->u_stride);
-                const uint8_t* v_plane_stripe_ptr = frame_data->v_plane.data() + (static_cast<size_t>(frame_data->is_i444 ? start_y : (start_y / 2)) * frame_data->v_stride);
-                current_hash = calculate_yuv_stripe_hash(
-                    y_plane_stripe_ptr, frame_data->y_stride,
-                    u_plane_stripe_ptr, frame_data->u_stride,
-                    v_plane_stripe_ptr, frame_data->v_stride,
-                    local_capture_width_actual, current_stripe_height,
-                    !frame_data->is_i444);
-            } else {
-                const unsigned char* shm_stripe_start_ptr = frame_data->shm_data.data() + static_cast<size_t>(start_y) * frame_data->shm_stride_bytes;
-                current_hash = calculate_bgr_stripe_hash_from_shm(
-                    shm_stripe_start_ptr, frame_data->shm_stride_bytes,
-                    local_capture_width_actual, current_stripe_height,
-                    frame_data->shm_bytes_per_pixel);
-            }
-
-            if (current_hash != previous_hashes[i] || frame_counter == 0) {
-                send_this_stripe = true;
-                no_motion_frame_counts[i] = 0;
-                paint_over_sent[i] = false;
-                if (!stripe_is_in_damage_block[i] || frame_counter == 0) {
-                    force_this_stripe_to_be_idr = true;
-                }
-            } else {
-                no_motion_frame_counts[i]++;
-                if (no_motion_frame_counts[i] >= local_current_paint_over_trigger_frames && !paint_over_sent[i]) {
-                    send_this_stripe = true;
-                    force_this_stripe_to_be_idr = true;
-                    paint_over_sent[i] = true;
-                }
-            }
-            previous_hashes[i] = current_hash;
-
-            if (send_this_stripe) {
-              any_stripe_encoded_this_frame = true;
-              total_stripes_encoded_this_interval++;
-              stripe_is_in_damage_block[i] = true;
-
-              EncodeJob job;
-              job.frame_data = frame_data;
-              job.thread_id = i;
-              job.stripe_y_start = start_y;
-              job.stripe_height = current_stripe_height;
-              job.capture_width = local_capture_width_actual;
-              job.capture_height = local_capture_height_actual;
-              job.mode = local_current_output_mode;
-              job.force_idr = force_this_stripe_to_be_idr;
-              job.is_full_frame = (local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe);
-
-              if (job.mode == OutputMode::JPEG) {
-                  job.jpeg_quality = (paint_over_sent[i] && local_current_use_paint_over_quality)
-                                        ? local_current_paint_over_jpeg_quality
-                                        : local_current_jpeg_quality;
-              } else {
-                  if (paint_over_sent[i]) {
-                      job.h264_crf = 10;
-                  } else {
-                      job.h264_crf = local_current_h264_crf;
                   }
               }
 
-              {
-                  std::lock_guard<std::mutex> lock(queue_mutex_);
-                  job_queue_.push(std::move(job));
-              }
-              queue_cv_.notify_one();
+              for (int i = 0; i < N_processing_stripes; ++i) {
+                  int start_y, height;
+                  if (local_current_h264_fullframe) {
+                      start_y = 0;
+                      height = local_capture_height_actual;
+                  } else if (local_current_output_mode == OutputMode::H264) {
+                      start_y = current_y_start_for_stripe;
+                      height = h264_base_even_height + (i < h264_num_stripes_with_extra_pair ? 2 : 0);
+                      current_y_start_for_stripe += height;
+                  } else {
+                      int base_h = local_capture_height_actual / N_processing_stripes;
+                      int rem = local_capture_height_actual % N_processing_stripes;
+                      start_y = i * base_h + std::min(i, rem);
+                      height = base_h + (i < rem ? 1 : 0);
+                  }
+                  if (height <= 0) continue;
+                  stripe_geometries[i] = {start_y, height};
 
-              if (job.is_full_frame) {
-                  break;
+                  hash_futures.push_back(std::async(std::launch::async, [=, &shm_image, &frame_data]() -> uint64_t {
+                      if (local_current_output_mode == OutputMode::H264) {
+                          const uint8_t* y_ptr = frame_data->y_plane.data() + static_cast<size_t>(start_y) * frame_data->y_stride;
+                          const uint8_t* u_ptr = frame_data->u_plane.data() + (static_cast<size_t>(frame_data->is_i444 ? start_y : start_y / 2) * frame_data->u_stride);
+                          const uint8_t* v_ptr = frame_data->v_plane.data() + (static_cast<size_t>(frame_data->is_i444 ? start_y : start_y / 2) * frame_data->v_stride);
+                          return calculate_yuv_stripe_hash(y_ptr, frame_data->y_stride, u_ptr, frame_data->u_stride, v_ptr, frame_data->v_stride, local_capture_width_actual, height, !frame_data->is_i444);
+                      } else {
+                          const unsigned char* shm_ptr = (const unsigned char*)shm_image->data + static_cast<size_t>(start_y) * shm_image->bytes_per_line;
+                          return calculate_bgr_stripe_hash_from_shm(shm_ptr, shm_image->bytes_per_line, local_capture_width_actual, height, frame_data->shm_bytes_per_pixel);
+                      }
+                  }));
               }
-            } else {
-              stripe_is_in_damage_block[i] = false;
-            }
+
+              for (int i = 0; i < N_processing_stripes; ++i) {
+                  if (i >= static_cast<int>(hash_futures.size())) continue;
+                  uint64_t current_hash = hash_futures[i].get();
+                  
+                  int start_y = stripe_geometries[i].first;
+                  int height = stripe_geometries[i].second;
+
+                  bool send_this_stripe = false;
+                  bool is_paint_over = false;
+
+                  if (current_hash != previous_hashes[i]) {
+                      send_this_stripe = true;
+                      no_motion_frame_counts[i] = 0;
+                      paint_over_sent[i] = false;
+                  } else {
+                      no_motion_frame_counts[i]++;
+                      if (no_motion_frame_counts[i] >= local_current_paint_over_trigger_frames && !paint_over_sent[i]) {
+                          send_this_stripe = true;
+                          is_paint_over = true;
+                          paint_over_sent[i] = true;
+                      }
+                  }
+
+                  if (send_this_stripe) {
+                      any_stripe_encoded_this_frame = true;
+                      total_stripes_encoded_this_interval++;
+
+                      if (local_current_output_mode == OutputMode::JPEG) {
+                          int quality_to_use = local_current_jpeg_quality;
+                          if (is_paint_over && local_current_use_paint_over_quality) {
+                              quality_to_use = local_current_paint_over_jpeg_quality;
+                          }
+                          StripeEncodeResult result = encode_stripe_jpeg(i, start_y, height, local_capture_width_actual, (const unsigned char*)shm_image->data, shm_image->bytes_per_line, frame_data->shm_bytes_per_pixel, quality_to_use, frame_counter);
+                          if (stripe_callback && result.data && result.size > 0) {
+                              stripe_callback(&result, user_data);
+                          }
+                      } else {
+                          EncodeJob job;
+                          job.frame_data = frame_data;
+                          job.thread_id = i;
+                          job.stripe_y_start = start_y;
+                          job.stripe_height = height;
+                          job.capture_width = local_capture_width_actual;
+                          job.capture_height = local_capture_height_actual;
+                          job.mode = local_current_output_mode;
+                          job.is_full_frame = local_current_h264_fullframe;
+                          job.force_idr = is_paint_over || (job.is_full_frame && (g_nvenc_force_next_idr_global.exchange(false) || g_vaapi_force_next_idr_global.exchange(false)));
+                          job.h264_crf = is_paint_over ? 10 : local_current_h264_crf;
+                          {
+                              std::lock_guard<std::mutex> lock(queue_mutex_);
+                              job_queue_.push(std::move(job));
+                          }
+                          queue_cv_.notify_one();
+                      }
+                  }
+                  previous_hashes[i] = current_hash;
+              }
           }
-
           this->frame_counter++;
           if (any_stripe_encoded_this_frame) {
             encoded_frame_count++;
@@ -3425,20 +3354,13 @@ uint64_t calculate_bgr_stripe_hash_from_shm(const unsigned char* shm_stripe_phys
     XXH3_state_t hash_state;
     XXH3_64bits_reset(&hash_state);
 
-    std::vector<unsigned char> bgr_row_buffer(static_cast<size_t>(stripe_width) * 3);
+    size_t row_hash_size_bytes = static_cast<size_t>(stripe_width) * shm_bytes_per_pixel;
 
-    for (int r = 0; r < stripe_height; ++r) {
-        const unsigned char* shm_row_ptr =
-            shm_stripe_physical_start + static_cast<size_t>(r) * shm_stride_bytes;
-        for (int x = 0; x < stripe_width; ++x) {
-            const unsigned char* shm_pixel =
-                shm_row_ptr + static_cast<size_t>(x) * shm_bytes_per_pixel;
-            bgr_row_buffer[static_cast<size_t>(x) * 3 + 0] = shm_pixel[0]; // B
-            bgr_row_buffer[static_cast<size_t>(x) * 3 + 1] = shm_pixel[1]; // G
-            bgr_row_buffer[static_cast<size_t>(x) * 3 + 2] = shm_pixel[2]; // R
-        }
-        XXH3_64bits_update(&hash_state, bgr_row_buffer.data(), bgr_row_buffer.size());
+    for (int r = 0; r < stripe_height; r += 12) {
+        const unsigned char* shm_row_ptr = shm_stripe_physical_start + static_cast<size_t>(r) * shm_stride_bytes;
+        XXH3_64bits_update(&hash_state, shm_row_ptr, row_hash_size_bytes);
     }
+
     return XXH3_64bits_digest(&hash_state);
 }
 
