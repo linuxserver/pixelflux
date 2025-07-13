@@ -9,7 +9,6 @@ archs = [ "x86_64", "aarch64" ]
 before-all = """
     set -euxo pipefail
     if command -v dnf; then
-        # This is a manylinux (glibc) container
         dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm && \
         dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm && \
         dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
@@ -35,18 +34,21 @@ before-all = """
             make -j$(nproc) && \
             make install) && \
         \
-        (cd /tmp && \
-            git clone --branch stable --depth 1 https://chromium.googlesource.com/libyuv/libyuv && \
-            cd libyuv && \
-            mkdir build && cd build && \
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
-            make -j$(nproc) && \
-            make install) && \
+        if [ "$(uname -m)" = "aarch64" ]; then \
+            dnf install -y libyuv-devel; \
+        else \
+            (cd /tmp && \
+                git clone --branch stable --depth 1 https://chromium.googlesource.com/libyuv/libyuv && \
+                cd libyuv && \
+                mkdir build && cd build && \
+                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
+                make -j$(nproc) && \
+                make install); \
+        fi && \
         \
         ldconfig
 
     elif command -v apk; then
-        # This is a musllinux (Alpine) container
         apk add --no-cache \
             libx11-dev \
             libxext-dev \
