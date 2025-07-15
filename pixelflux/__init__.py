@@ -78,6 +78,29 @@ stop_capture.argtypes = [ctypes.c_void_p]
 free_stripe_encode_result_data = lib.free_stripe_encode_result_data
 free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
 
+PyMemoryView_FromMemory = ctypes.pythonapi.PyMemoryView_FromMemory
+PyMemoryView_FromMemory.argtypes = (ctypes.c_char_p, ctypes.c_ssize_t, ctypes.c_int)
+PyMemoryView_FromMemory.restype = ctypes.py_object
+
+def create_memoryview_from_result(result_ptr):
+    """
+    Create a zero-copy memoryview from the encoded result data.
+    
+    Args:
+        result_ptr: Pointer to StripeEncodeResult
+    
+    Returns:
+        memoryview for the data, or None if result_ptr is invalid.
+    """
+    if not result_ptr or not result_ptr.contents.data:
+        return None
+    # Create read-only memoryview
+    return PyMemoryView_FromMemory(
+        ctypes.cast(result_ptr.contents.data, ctypes.c_char_p),
+        result_ptr.contents.size,
+        0x100
+    )
+
 
 class ScreenCapture:
     """Python wrapper for screen capture module using ctypes."""
@@ -123,5 +146,5 @@ class ScreenCapture:
         if self._is_capturing and self._python_stripe_callback:
             try:
                 self._python_stripe_callback(result_ptr, user_data)
-            finally:
-                free_stripe_encode_result_data(result_ptr)
+            except Exception as e:
+                print(f"[ERROR] Exception in stripe callback: {e}")

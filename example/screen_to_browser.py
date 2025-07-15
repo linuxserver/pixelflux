@@ -16,7 +16,7 @@ import threading
 import websockets
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
+from pixelflux import CaptureSettings, ScreenCapture, create_memoryview_from_result, free_stripe_encode_result_data
 
 # ==============================================================================
 # --- CONFIGURATION SETTINGS ---
@@ -78,7 +78,7 @@ g_is_capturing = False          # Flag indicating if capture is active.
 g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes.
 g_send_task = None              # asyncio.Task for sending stripes.
 
-g_is_shutting_down = False 
+g_is_shutting_down = False
 async def cleanup():
     """A single, race-proof function to shut down all capture resources."""
     global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client
@@ -98,6 +98,7 @@ async def cleanup():
         except asyncio.CancelledError:
             pass
     g_active_client = None
+    g_is_shutting_down = False
     print("Cleanup complete.")
 
 async def send_h264_stripes():
@@ -105,12 +106,18 @@ async def send_h264_stripes():
     global g_h264_stripe_queue, g_active_client
     try:
         while True:
-            h264_bytes = await g_h264_stripe_queue.get()
+            mv, result_ptr = await g_h264_stripe_queue.get()
             if g_active_client:
                 try:
-                    await g_active_client.send(h264_bytes)
+                    # Send memoryview directly for zero-copy
+                    await g_active_client.send(mv)
                 except websockets.exceptions.ConnectionClosed:
                     pass  # Client disconnected, main handler will clean up.
+                finally:
+                    # Manually free buffer after sending
+                    free_stripe_encode_result_data(result_ptr)
+            else:
+                free_stripe_encode_result_data(result_ptr)
             g_h264_stripe_queue.task_done()
     except asyncio.CancelledError:
         pass  # Expected way for the task to be stopped.
@@ -122,7 +129,7 @@ async def send_h264_stripes():
 
 async def websocket_handler(websocket, path=None):
     """Manages a single WebSocket connection and the screen capture lifecycle."""
-    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task, g_stripe_callback
+    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
 
     if g_active_client is not None:
         print("Rejecting new connection: A client is already active.")
@@ -152,15 +159,15 @@ async def websocket_handler(websocket, path=None):
 def stripe_callback_handler(result_ptr, user_data_ptr):
     """Callback invoked by pixelflux when a new video stripe is ready."""
     if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
-        result = result_ptr.contents
-        if result.size <= 0:
+        # Get memoryview for zero-copy transfer
+        mv = create_memoryview_from_result(result_ptr)
+        if mv is None or mv.nbytes == 0:
             return
 
-        data_copy = bytes(result.data[:result.size])
-
         if g_loop and not g_loop.is_closed():
+            # Put both memoryview and result_ptr for later freeing
             asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(data_copy), g_loop
+                g_h264_stripe_queue.put((mv, result_ptr)), g_loop
             )
 
 
@@ -172,7 +179,9 @@ def start_http_server(host, port):
             super().__init__(*args, directory=script_dir, **kwargs)
         def log_message(self, format, *args):
             pass
-    with socketserver.TCPServer((host, port), QuietHTTPRequestHandler) as httpd:
+    class ReuseAddressTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True
+    with ReuseAddressTCPServer((host, port), QuietHTTPRequestHandler) as httpd:
         print(f"HTTP server is serving files from '{script_dir}'")
         print(f"-> Open http://{host}:{port}/index.html in your browser.")
         httpd.serve_forever()

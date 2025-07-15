@@ -117,8 +117,6 @@ class StripeEncodeResult(ctypes.Structure):
     ]
 ```
 
-**Memory Management:** The data pointed to by `result.contents.data` is valid **only within the scope of your callback function**. The C++ library automatically frees this memory after your callback returns. To use the data, you must copy it, for example by using `ctypes.string_at(result.contents.data, result.contents.size)`.
-
 ## Features
 
 *   **Efficient Pixel Capture:** Leverages a native C++ module using XShm for optimized X11 screen capture performance.
@@ -131,7 +129,7 @@ class StripeEncodeResult(ctypes.Structure):
 *   **Dynamic Quality Optimizations:**
     *   **Paint-Over for Static Regions:** After a region remains static for `paint_over_trigger_frames`, it is resent at high quality (JPEG) or as a new IDR frame (H.264) to correct any compression artifacts.
     *   **Damage Throttling:** For highly active regions, the system can temporarily reduce the frequency of change detection to save CPU cycles.
-*   **Direct Callback Mechanism:** Provides encoded stripe data directly to your Python code for real-time processing or streaming.
+*   **Direct Callback Mechanism:** Provides encoded stripe data directly to your Python code for real-time processing or streaming, using zero-copy `memoryview` objects.
 
 ## Example: Real-time H.264 Streaming with WebSockets
 
@@ -147,7 +145,7 @@ A comprehensive example, `screen_to_browser.py`, is located in the `example` dir
 
 1.  First, ensure you have the `websockets` library installed:
     ```bash
-    pip install websockets
+    pip install 'websockets>=14'
     ```
 
 2.  Navigate to the `example` directory within the repository:
