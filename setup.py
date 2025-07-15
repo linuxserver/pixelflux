@@ -23,7 +23,7 @@ class BuildCtypesExt(build_ext):
         ]
         include_dirs = ['pixelflux/include']
         libraries = ['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl', 'va', 'va-drm']
-        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-g']
+        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-shared', '-O3']
 
         command = [compiler]
         command.extend(extra_compile_args)
@@ -54,7 +54,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pixelflux",
-    version="1.2.7",
+    version="1.2.8",
     author="Linuxserver.io",
     author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",
