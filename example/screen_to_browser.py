@@ -98,6 +98,7 @@ async def cleanup():
         except asyncio.CancelledError:
             pass
     g_active_client = None
+    g_is_shutting_down = False
     print("Cleanup complete.")
 
 async def send_h264_stripes():
