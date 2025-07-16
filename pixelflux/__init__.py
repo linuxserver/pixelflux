@@ -24,14 +24,6 @@ class CaptureSettings(ctypes.Structure):
         ("vaapi_render_node_index", ctypes.c_int),
     ]
 
-WATERMARK_LOCATION_NONE = 0
-WATERMARK_LOCATION_TL = 1
-WATERMARK_LOCATION_TR = 2
-WATERMARK_LOCATION_BL = 3
-WATERMARK_LOCATION_BR = 4
-WATERMARK_LOCATION_MI = 5
-WATERMARK_LOCATION_AN = 6
-
 class StripeEncodeResult(ctypes.Structure):
     _fields_ = [
         ("type", ctypes.c_int),
@@ -58,22 +50,22 @@ except OSError as e:
     ) from e
 
 # Define the C function signatures for ctypes
-create_module = lib.create_screen_capture_module
-create_module.restype = ctypes.c_void_p
+create_screen_capture_module = lib.create_screen_capture_module
+create_screen_capture_module.restype = ctypes.c_void_p
 
-destroy_module = lib.destroy_screen_capture_module
-destroy_module.argtypes = [ctypes.c_void_p]
+destroy_screen_capture_module = lib.destroy_screen_capture_module
+destroy_screen_capture_module.argtypes = [ctypes.c_void_p]
 
-start_capture = lib.start_screen_capture
-start_capture.argtypes = [
+start_screen_capture = lib.start_screen_capture
+start_screen_capture.argtypes = [
     ctypes.c_void_p,
     CaptureSettings,
     StripeCallback,
     ctypes.c_void_p
 ]
 
-stop_capture = lib.stop_screen_capture
-stop_capture.argtypes = [ctypes.c_void_p]
+stop_screen_capture = lib.stop_screen_capture
+stop_screen_capture.argtypes = [ctypes.c_void_p]
 
 free_stripe_encode_result_data = lib.free_stripe_encode_result_data
 free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
@@ -83,7 +75,7 @@ class ScreenCapture:
     """Python wrapper for screen capture module using ctypes."""
 
     def __init__(self):
-        self._module = create_module()
+        self._module = create_screen_capture_module()
         if not self._module:
             raise Exception("Failed to create screen capture module.")
         self._is_capturing = False
@@ -92,8 +84,8 @@ class ScreenCapture:
 
     def __del__(self):
         if hasattr(self, '_module') and self._module:
-            self.stop_capture()
-            destroy_module(self._module)
+            self.stop_screen_capture()
+            destroy_screen_capture_module(self._module)
             self._module = None
 
     def start_capture(self, settings: CaptureSettings, stripe_callback):
@@ -104,13 +96,13 @@ class ScreenCapture:
 
         self._python_stripe_callback = stripe_callback
         self._c_callback = StripeCallback(self._internal_c_callback)
-        start_capture(self._module, settings, self._c_callback, None)
+        start_screen_capture(self._module, settings, self._c_callback, None)
         self._is_capturing = True
 
     def stop_capture(self):
         if not self._is_capturing:
             return
-        stop_capture(self._module)
+        stop_screen_capture(self._module)
         self._is_capturing = False
         self._python_stripe_callback = None
         self._c_callback = None
