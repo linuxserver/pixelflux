@@ -3366,21 +3366,19 @@ uint64_t calculate_bgr_stripe_hash_from_shm(const unsigned char* shm_stripe_phys
 
 extern "C" {
 
-  typedef void* ScreenCaptureModuleHandle;
-
   /**
    * @brief Creates a new instance of the ScreenCaptureModule.
    * @return A handle to the created ScreenCaptureModule instance.
    */
-  ScreenCaptureModuleHandle create_screen_capture_module() {
-    return static_cast<ScreenCaptureModuleHandle>(new ScreenCaptureModule());
+  void* create_screen_capture_module() {
+    return static_cast<void*>(new ScreenCaptureModule());
   }
 
   /**
    * @brief Destroys a ScreenCaptureModule instance.
    * @param module_handle Handle to the ScreenCaptureModule instance to destroy.
    */
-  void destroy_screen_capture_module(ScreenCaptureModuleHandle module_handle) {
+  void destroy_screen_capture_module(void* module_handle) {
     if (module_handle) {
       delete static_cast<ScreenCaptureModule*>(module_handle);
     }
@@ -3393,7 +3391,7 @@ extern "C" {
    * @param callback A function pointer to be called when an encoded stripe is ready.
    * @param user_data User-defined data to be passed to the callback function.
    */
-  void start_screen_capture(ScreenCaptureModuleHandle module_handle,
+  void start_screen_capture(void* module_handle,
                             CaptureSettings settings,
                             StripeCallback callback,
                             void* user_data) {
@@ -3414,7 +3412,7 @@ extern "C" {
    * @brief Stops the screen capture process.
    * @param module_handle Handle to the ScreenCaptureModule instance.
    */
-  void stop_screen_capture(ScreenCaptureModuleHandle module_handle) {
+  void stop_screen_capture(void* module_handle) {
     if (module_handle) {
       static_cast<ScreenCaptureModule*>(module_handle)->stop_capture();
     }
