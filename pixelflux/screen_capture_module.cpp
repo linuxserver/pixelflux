@@ -3349,7 +3349,7 @@ StripeEncodeResult encode_stripe_h264(
         param.b_annexb = 1;
         param.i_sync_lookahead = 0;
         param.i_bframe = 0;
-        param.i_threads = 0;
+        param.i_threads = 1;
         param.i_log_level = X264_LOG_ERROR;
         param.vui.b_fullrange = use_full_range ? 1 : 0;
         param.vui.i_sar_width = 1;
