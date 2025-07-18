@@ -310,7 +310,7 @@ enum class WatermarkLocation : int {
  * This struct aggregates all configurable parameters for the capture process,
  * including dimensions, frame rate, quality settings, and output mode.
  */
-struct CaptureSettings {
+struct CaptureSettingsStruct {
   int capture_width;
   int capture_height;
   int capture_x;
@@ -332,10 +332,10 @@ struct CaptureSettings {
   int vaapi_render_node_index;
 
   /**
-   * @brief Default constructor for CaptureSettings.
+   * @brief Default constructor for CaptureSettingsStruct.
    * Initializes settings with common default values.
    */
-  CaptureSettings()
+  CaptureSettingsStruct()
     : capture_width(1920),
       capture_height(1080),
       capture_x(0),
@@ -357,7 +357,7 @@ struct CaptureSettings {
       vaapi_render_node_index(-1) {}
 
   /**
-   * @brief Parameterized constructor for CaptureSettings.
+   * @brief Parameterized constructor for CaptureSettingsStruct.
    * Allows initializing all settings with specific values.
    * @param cw Capture width.
    * @param ch Capture height.
@@ -376,7 +376,7 @@ struct CaptureSettings {
    * @param h264_ff H.264 full frame encoding flag.
    * @param capture_cursor Capture cursor flag.
    */
-  CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
+  CaptureSettingsStruct(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
                   OutputMode om = OutputMode::JPEG, int crf = 25,
                   bool h264_fc = false, bool h264_ff = false,
@@ -410,7 +410,7 @@ struct CaptureSettings {
  * Contains the encoded data, its type, dimensions, and frame identifier.
  * This struct uses move semantics for efficient data transfer.
  */
-struct StripeEncodeResult {
+struct StripeEncodeResultStruct {
   StripeDataType type;
   int stripe_y_start;
   int stripe_height;
@@ -419,10 +419,10 @@ struct StripeEncodeResult {
   int frame_id;
 
   /**
-   * @brief Default constructor for StripeEncodeResult.
+   * @brief Default constructor for StripeEncodeResultStruct.
    * Initializes members to default/null values.
    */
-  StripeEncodeResult()
+  StripeEncodeResultStruct()
     : type(StripeDataType::UNKNOWN),
       stripe_y_start(0),
       stripe_height(0),
@@ -431,30 +431,30 @@ struct StripeEncodeResult {
       frame_id(-1) {}
 
   /**
-   * @brief Move constructor for StripeEncodeResult.
+   * @brief Move constructor for StripeEncodeResultStruct.
    * Transfers ownership of data from the 'other' object.
-   * @param other The StripeEncodeResult to move from.
+   * @param other The StripeEncodeResultStruct to move from.
    */
-  StripeEncodeResult(StripeEncodeResult&& other) noexcept;
+  StripeEncodeResultStruct(StripeEncodeResultStruct&& other) noexcept;
 
   /**
-   * @brief Move assignment operator for StripeEncodeResult.
+   * @brief Move assignment operator for StripeEncodeResultStruct.
    * Transfers ownership of data from the 'other' object, freeing existing data.
-   * @param other The StripeEncodeResult to move assign from.
+   * @param other The StripeEncodeResultStruct to move assign from.
    * @return Reference to this object.
    */
-  StripeEncodeResult& operator=(StripeEncodeResult&& other) noexcept;
+  StripeEncodeResultStruct& operator=(StripeEncodeResultStruct&& other) noexcept;
 
 private:
-  StripeEncodeResult(const StripeEncodeResult&) = delete;
-  StripeEncodeResult& operator=(const StripeEncodeResult&) = delete;
+  StripeEncodeResultStruct(const StripeEncodeResultStruct&) = delete;
+  StripeEncodeResultStruct& operator=(const StripeEncodeResultStruct&) = delete;
 };
 
 /**
- * @brief Move constructor implementation for StripeEncodeResult.
- * @param other The StripeEncodeResult to move data from.
+ * @brief Move constructor implementation for StripeEncodeResultStruct.
+ * @param other The StripeEncodeResultStruct to move data from.
  */
-StripeEncodeResult::StripeEncodeResult(StripeEncodeResult&& other) noexcept
+StripeEncodeResultStruct::StripeEncodeResultStruct(StripeEncodeResultStruct&& other) noexcept
   : type(other.type),
     stripe_y_start(other.stripe_y_start),
     stripe_height(other.stripe_height),
@@ -470,11 +470,11 @@ StripeEncodeResult::StripeEncodeResult(StripeEncodeResult&& other) noexcept
 }
 
 /**
- * @brief Move assignment operator implementation for StripeEncodeResult.
- * @param other The StripeEncodeResult to move data from.
- * @return A reference to this StripeEncodeResult.
+ * @brief Move assignment operator implementation for StripeEncodeResultStruct.
+ * @param other The StripeEncodeResultStruct to move data from.
+ * @return A reference to this StripeEncodeResultStruct.
  */
-StripeEncodeResult& StripeEncodeResult::operator=(StripeEncodeResult&& other) noexcept {
+StripeEncodeResultStruct& StripeEncodeResultStruct::operator=(StripeEncodeResultStruct&& other) noexcept {
   if (this != &other) {
     if (data) {
       delete[] data;
@@ -891,7 +891,7 @@ bool initialize_nvenc_encoder(int width,
  * copies the provided Y, U, and V plane data into it (converting to NV12 if the
  * input is I420), and then submits it to the encoder. After encoding, it locks the
  * corresponding output bitstream buffer, packages the H.264 data into a
- * `StripeEncodeResult` with a custom header, and returns it. It manages a circular
+ * `StripeEncodeResultStruct` with a custom header, and returns it. It manages a circular
  * pool of input/output buffers to pipeline encoding operations.
  *
  * @param width The width of the input frame.
@@ -905,12 +905,12 @@ bool initialize_nvenc_encoder(int width,
  * @param is_i444 True if the input is YUV 4:4:4, false if it is YUV 4:2:0.
  * @param frame_counter The current frame number, used for timestamping.
  * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame.
- * @return A `StripeEncodeResult` containing the encoded H.264 NAL units and a
+ * @return A `StripeEncodeResultStruct` containing the encoded H.264 NAL units and a
  *         custom header. The result's data buffer is dynamically allocated and
  *         must be freed by the caller.
  * @throws std::runtime_error if any NVENC API call fails during the encoding process.
  */
-StripeEncodeResult encode_fullframe_nvenc(int width,
+StripeEncodeResultStruct encode_fullframe_nvenc(int width,
                                           int height,
                                           const uint8_t* y_plane, int y_stride,
                                           const uint8_t* u_plane, int u_stride,
@@ -918,7 +918,7 @@ StripeEncodeResult encode_fullframe_nvenc(int width,
                                           bool is_i444,
                                           int frame_counter,
                                           bool force_idr_frame) {
-  StripeEncodeResult result;
+  StripeEncodeResultStruct result;
   result.type = StripeDataType::H264;
   result.stripe_y_start = 0;
   result.stripe_height = height;
@@ -1382,7 +1382,7 @@ static unsigned int get_log2_val_minus4(unsigned int num) {
  * 2. Setting up parameter buffers: SPS (on IDR frames), PPS, and Slice parameters.
  * 3. Executing the encoding pipeline with `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture`.
  * 4. Syncing the resulting surface and mapping the output coded buffer to get the bitstream.
- * 5. Packaging the H.264 bitstream into a `StripeEncodeResult` with a custom header.
+ * 5. Packaging the H.264 bitstream into a `StripeEncodeResultStruct` with a custom header.
  *
  * @param width The width of the input frame.
  * @param height The height of the input frame.
@@ -1396,16 +1396,16 @@ static unsigned int get_log2_val_minus4(unsigned int num) {
  * @param frame_counter The current frame number.
  * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame
  *                        and include SPS/PPS headers in the bitstream.
- * @return A `StripeEncodeResult` containing the encoded H.264 data.
+ * @return A `StripeEncodeResultStruct` containing the encoded H.264 data.
  * @throws std::runtime_error if any VA-API call fails during the encoding process.
  */
-StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
+StripeEncodeResultStruct encode_fullframe_vaapi(int width, int height, double fps,
                                           const uint8_t* y_plane, int y_stride,
                                           const uint8_t* u_plane, int u_stride,
                                           const uint8_t* v_plane, int v_stride,
                                           int frame_counter,
                                           bool force_idr_frame) {
-    StripeEncodeResult result;
+    StripeEncodeResultStruct result;
     result.type = StripeDataType::H264;
     result.stripe_y_start = 0;
     result.stripe_height = height;
@@ -1584,10 +1584,10 @@ StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
 
 /**
  * @brief Callback function type for processing encoded stripes.
- * @param result Pointer to the StripeEncodeResult containing the encoded data.
+ * @param result Pointer to the StripeEncodeResultStruct containing the encoded data.
  * @param user_data User-defined data passed to the callback.
  */
-typedef void (*StripeCallback)(StripeEncodeResult* result, void* user_data);
+typedef void (*StripeCallback)(StripeEncodeResultStruct* result, void* user_data);
 
 /**
  * @brief Encodes a horizontal stripe of an image from shared memory into JPEG format.
@@ -1600,11 +1600,11 @@ typedef void (*StripeCallback)(StripeEncodeResult* result, void* user_data);
  * @param shm_bytes_per_pixel The number of bytes per pixel in the shared memory image (e.g., 4 for BGRX).
  * @param jpeg_quality The JPEG quality setting (0-100).
  * @param frame_counter The identifier of the current frame.
- * @return A StripeEncodeResult containing the JPEG data, or an empty result on failure.
+ * @return A StripeEncodeResultStruct containing the JPEG data, or an empty result on failure.
  *         The result data includes a custom 4-byte header: frame_id (uint16_t network byte order)
  *         and stripe_y_start (uint16_t network byte order).
  */
-StripeEncodeResult encode_stripe_jpeg(
+StripeEncodeResultStruct encode_stripe_jpeg(
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -1633,12 +1633,12 @@ StripeEncodeResult encode_stripe_jpeg(
  * @param colorspace_setting An integer indicating input YUV format (420 for I420, 444 for I444).
  * @param use_full_range True if full range color should be signaled in VUI, false for limited range.
  * @param force_idr_command If true, forces the encoder to generate an IDR (key) frame.
- * @return A StripeEncodeResult containing the H.264 NAL units, or an empty result on failure.
+ * @return A StripeEncodeResultStruct containing the H.264 NAL units, or an empty result on failure.
  *         The result data includes a custom 10-byte header: type tag (0x04), frame type,
  *         frame_id (uint16_t), stripe_y_start (uint16_t), width (uint16_t), height (uint16_t),
  *         all multi-byte fields in network byte order.
  */
-StripeEncodeResult encode_stripe_h264(
+StripeEncodeResultStruct encode_stripe_h264(
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -1892,9 +1892,9 @@ public:
    * This function is thread-safe. The new settings will be picked up by
    * the capture loop at the beginning of its next iteration.
    * If dimensions or H.264 color format change, XShm and encoders may be reinitialized.
-   * @param new_settings A CaptureSettings struct containing the new settings.
+   * @param new_settings A CaptureSettingsStruct struct containing the new settings.
    */
-  void modify_settings(const CaptureSettings& new_settings) {
+  void modify_settings(const CaptureSettingsStruct& new_settings) {
     std::lock_guard<std::mutex> lock(settings_mutex);
     capture_width = new_settings.capture_width;
     capture_height = new_settings.capture_height;
@@ -1928,12 +1928,12 @@ public:
   /**
    * @brief Retrieves the current capture and encoding settings.
    * This function is thread-safe.
-   * @return A CaptureSettings struct containing the current settings as known
+   * @return A CaptureSettingsStruct struct containing the current settings as known
    *         to the module (may not yet be active in the capture loop if recently modified).
    */
-  CaptureSettings get_current_settings() const {
+  CaptureSettingsStruct get_current_settings() const {
     std::lock_guard<std::mutex> lock(settings_mutex);
-    return CaptureSettings(
+    return CaptureSettingsStruct(
       capture_width, capture_height, capture_x, capture_y, target_fps,
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
@@ -2660,7 +2660,7 @@ private:
                           if (is_paint_over && local_current_use_paint_over_quality) {
                               quality_to_use = local_current_paint_over_jpeg_quality;
                           }
-                          StripeEncodeResult result = encode_stripe_jpeg(i, start_y, height, local_capture_width_actual, (const unsigned char*)shm_image->data, shm_image->bytes_per_line, frame_data->shm_bytes_per_pixel, quality_to_use, frame_counter);
+                          StripeEncodeResultStruct result = encode_stripe_jpeg(i, start_y, height, local_capture_width_actual, (const unsigned char*)shm_image->data, shm_image->bytes_per_line, frame_data->shm_bytes_per_pixel, quality_to_use, frame_counter);
                           if (stripe_callback && result.data && result.size > 0) {
                               stripe_callback(&result, user_data);
                           }
@@ -2855,7 +2855,7 @@ private:
               job_queue_.pop();
           }
 
-          StripeEncodeResult result;
+          StripeEncodeResultStruct result;
           try {
               if (job.is_full_frame) {
                   if (this->vaapi_operational) {
@@ -2962,7 +2962,7 @@ private:
  *                            (e.g., 4 for BGRX, 3 for BGR).
  * @param jpeg_quality The desired JPEG quality, ranging from 0 (lowest) to 100 (highest).
  * @param frame_counter An identifier for the current frame, included in the output header.
- * @return A StripeEncodeResult struct.
+ * @return A StripeEncodeResultStruct struct.
  *         - If successful, `type` is `StripeDataType::JPEG`, `data` points to the
  *           encoded JPEG (including a 4-byte custom header: frame_id (uint16_t MSB)
  *           and stripe_y_start (uint16_t MSB)), and `size` is the total size of `data`.
@@ -2971,7 +2971,7 @@ private:
  *         The caller is responsible for freeing `result.data` using
  *         `free_stripe_encode_result_data` or `delete[]`.
  */
-StripeEncodeResult encode_stripe_jpeg(
+StripeEncodeResultStruct encode_stripe_jpeg(
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -2981,7 +2981,7 @@ StripeEncodeResult encode_stripe_jpeg(
   int shm_bytes_per_pixel,
   int jpeg_quality,
   int frame_counter) {
-  StripeEncodeResult result;
+  StripeEncodeResultStruct result;
   result.type = StripeDataType::JPEG;
   result.stripe_y_start = stripe_y_start;
   result.stripe_height = stripe_height;
@@ -3101,7 +3101,7 @@ StripeEncodeResult encode_stripe_jpeg(
  * @param use_full_range True if full range color (e.g., JPEG levels 0-255) should be
  *                       signaled in the VUI (Video Usability Information). False for
  *                       limited range (e.g., TV levels 16-235).
- * @return A StripeEncodeResult struct.
+ * @return A StripeEncodeResultStruct struct.
  *         - If successful, `type` is `StripeDataType::H264`, `data` points to the
  *           encoded H.264 NAL units (including a 10-byte custom header: type tag (0x04),
  *           frame type, frame_id (uint16_t), stripe_y_start (uint16_t), width (uint16_t),
@@ -3109,7 +3109,7 @@ StripeEncodeResult encode_stripe_jpeg(
  *         - On failure, `type` is `StripeDataType::UNKNOWN`, `data` is `nullptr`.
  *         The caller is responsible for freeing `result.data`.
  */
-StripeEncodeResult encode_stripe_h264(
+StripeEncodeResultStruct encode_stripe_h264(
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -3127,7 +3127,7 @@ StripeEncodeResult encode_stripe_h264(
   g_h264_minimal_store.ensure_size(thread_id);
   std::lock_guard<std::mutex> encoder_lock(*g_h264_minimal_store.encoder_locks[thread_id]);
 
-  StripeEncodeResult result;
+  StripeEncodeResultStruct result;
   result.type = StripeDataType::H264;
   result.stripe_y_start = stripe_y_start;
   result.stripe_height = stripe_height;
@@ -3392,7 +3392,7 @@ extern "C" {
    * @param user_data User-defined data to be passed to the callback function.
    */
   void start_screen_capture(void* module_handle,
-                            CaptureSettings settings,
+                            CaptureSettingsStruct settings,
                             StripeCallback callback,
                             void* user_data) {
     if (module_handle) {
@@ -3419,11 +3419,11 @@ extern "C" {
   }
 
   /**
-   * @brief Frees the data buffer within a StripeEncodeResult.
+   * @brief Frees the data buffer within a StripeEncodeResultStruct.
    * This is called from Python via ctypes to prevent memory leaks.
-   * @param result Pointer to the StripeEncodeResult whose data needs freeing.
+   * @param result Pointer to the StripeEncodeResultStruct whose data needs freeing.
    */
-  void free_stripe_encode_result_data(StripeEncodeResult* result) {
+  void free_stripe_encode_result_data(StripeEncodeResultStruct* result) {
     if (result && result->data) {
       delete[] result->data;
       result->data = nullptr;

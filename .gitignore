@@ -75,3 +75,4 @@ dmypy.json
 cython_debug/
 .ruff_cache/
 .pypirc
+pixelflux/screen_capture.cpp

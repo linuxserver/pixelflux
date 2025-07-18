@@ -16,7 +16,7 @@ import threading
 import websockets
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
+from pixelflux import CaptureSettings, ScreenCapture, StripeEncodeResult
 
 # ==============================================================================
 # --- CONFIGURATION SETTINGS ---
@@ -123,7 +123,7 @@ async def send_h264_stripes():
 
 async def websocket_handler(websocket, path=None):
     """Manages a single WebSocket connection and the screen capture lifecycle."""
-    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task, g_stripe_callback
+    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
 
     if g_active_client is not None:
         print("Rejecting new connection: A client is already active.")
@@ -150,18 +150,13 @@ async def websocket_handler(websocket, path=None):
         if websocket is g_active_client:
             await cleanup()
 
-def stripe_callback_handler(result_ptr, user_data_ptr):
+def stripe_callback_handler(result):
     """Callback invoked by pixelflux when a new video stripe is ready."""
-    if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
-        result = result_ptr.contents
-        if result.size <= 0:
-            return
-
-        data_copy = bytes(result.data[:result.size])
-
+    if g_is_capturing and result and g_h264_stripe_queue is not None:
+        # The result object contains the encoded video data
         if g_loop and not g_loop.is_closed():
             asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(data_copy), g_loop
+                g_h264_stripe_queue.put(result.data), g_loop
             )
 
 

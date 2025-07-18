@@ -1,14 +1,24 @@
-import os
-import shutil
-import subprocess
-import sys
-from pathlib import Path
 import setuptools
 from setuptools import Extension, setup
-from setuptools.command.build_ext import build_ext
+from Cython.Build import cythonize
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
+
+# Set up the extension with proper build flags
+extensions = [
+    Extension(
+        name='pixelflux.screen_capture',
+        sources=[
+            'pixelflux/screen_capture.pyx',
+            'pixelflux/include/xxhash.c'
+        ],
+        include_dirs=['pixelflux/include'],
+        libraries=['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'va', 'va-drm'],
+        extra_compile_args=['-std=c++17', '-fPIC', '-O3', '-Wno-unused-function'],
+        language='c++',
+    )
+]
 
 setup(
     name="pixelflux",
@@ -21,19 +31,7 @@ setup(
     license="MPL-2.0",
     url="https://github.com/linuxserver/pixelflux",
     packages=setuptools.find_packages(),
-    ext_modules=[
-        Extension(
-            name='pixelflux.screen_capture_module',
-            sources=[
-                'pixelflux/screen_capture_module.cpp',
-                'pixelflux/include/xxhash.c'
-            ],
-            include_dirs=['pixelflux/include'],
-            libraries=['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl', 'va', 'va-drm'],
-            extra_compile_args=['-std=c++17', '-Wno-unused-function', '-fPIC', '-shared', '-O3'],
-            language='c++',
-        )
-    ],
+    ext_modules=cythonize(extensions, compiler_directives={'language_level': "3"}),
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: POSIX :: Linux",
