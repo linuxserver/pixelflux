@@ -5,17 +5,16 @@ from Cython.Build import cythonize
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-# Set up the extension with proper build flags
 extensions = [
     Extension(
-        name='pixelflux.screen_capture',
-        sources=[
+        name = 'pixelflux.screen_capture',
+        sources = [
             'pixelflux/screen_capture.pyx',
             'pixelflux/include/xxhash.c'
         ],
-        include_dirs=['pixelflux/include'],
-        libraries=['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'va', 'va-drm'],
-        extra_compile_args=['-std=c++17', '-fPIC', '-O3', '-Wno-unused-function'],
+        include_dirs = ['pixelflux/include'],
+        libraries = ['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'va', 'va-drm'],
+        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-shared', '-O3'],
         language='c++',
     )
 ]

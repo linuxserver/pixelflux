@@ -84,10 +84,10 @@ async def cleanup():
     global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client
     if g_is_shutting_down:
         return
-    g_is_shutting_down = True
     print("Cleanup initiated...")
     if g_is_capturing:
         g_is_capturing = False
+    g_is_shutting_down = True
     if g_module:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, g_module.stop_capture)
@@ -153,11 +153,13 @@ async def websocket_handler(websocket, path=None):
 def stripe_callback_handler(result):
     """Callback invoked by pixelflux when a new video stripe is ready."""
     if g_is_capturing and result and g_h264_stripe_queue is not None:
-        # The result object contains the encoded video data
-        if g_loop and not g_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(result.data), g_loop
-            )
+        data = result.data
+        if data and data.nbytes > 0:
+            # The result object contains the encoded video data
+            if g_loop and not g_loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    g_h264_stripe_queue.put(bytes(data)), g_loop
+                )
 
 
 def start_http_server(host, port):
