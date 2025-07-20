@@ -46,9 +46,9 @@ capture_settings.h264_crf = 25
 # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
 capture_settings.h264_fullcolor = False
 # Encode full frames instead of just changed stripes.
-capture_settings.h264_fullframe = True
+capture_settings.h264_fullframe = False
 # Flag the stream to be in streaming mode to bypass all vnc logic
-capture_settings.h264_streaming_mode = True
+capture_settings.h264_streaming_mode = False
 # Pass a vaapi node index 0 = renderD128, -1 to disable
 capture_settings.vaapi_render_node_index = -1
 
