@@ -309,6 +309,7 @@ struct CaptureSettings {
   int h264_crf;
   bool h264_fullcolor;
   bool h264_fullframe;
+  bool h264_streaming_mode;
   bool capture_cursor;
   const char* watermark_path;
   WatermarkLocation watermark_location_enum;
@@ -334,6 +335,7 @@ struct CaptureSettings {
       h264_crf(25),
       h264_fullcolor(false),
       h264_fullframe(false),
+      h264_streaming_mode(false),
       capture_cursor(false),
       watermark_path(nullptr),
       watermark_location_enum(WatermarkLocation::NONE),
@@ -362,7 +364,7 @@ struct CaptureSettings {
   CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
                   OutputMode om = OutputMode::JPEG, int crf = 25,
-                  bool h264_fc = false, bool h264_ff = false,
+                  bool h264_fc = false, bool h264_ff = false, bool h264_sm = false,
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
                   WatermarkLocation wm_loc = WatermarkLocation::NONE,
@@ -382,6 +384,7 @@ struct CaptureSettings {
       h264_crf(crf),
       h264_fullcolor(h264_fc),
       h264_fullframe(h264_ff),
+      h264_streaming_mode(h264_sm),
       capture_cursor(capture_cursor),
       watermark_path(wm_path),
       watermark_location_enum(wm_loc),
@@ -1636,7 +1639,8 @@ StripeEncodeResult encode_stripe_h264(
   int frame_counter,
   int current_crf_setting,
   int colorspace_setting,
-  bool use_full_range);
+  bool use_full_range,
+  bool h264_streaming_mode);
 
 /**
  * @brief Calculates a 64-bit XXH3 hash for a stripe of YUV data.
@@ -1695,6 +1699,7 @@ public:
   int h264_crf = 25;
   bool h264_fullcolor = false;
   bool h264_fullframe = false;
+  bool h264_streaming_mode = false;
   bool capture_cursor = false;
   OutputMode output_mode = OutputMode::H264;
   std::string watermark_path_internal;
@@ -1840,6 +1845,7 @@ public:
     h264_crf = new_settings.h264_crf;
     h264_fullcolor = new_settings.h264_fullcolor;
     h264_fullframe = new_settings.h264_fullframe;
+    h264_streaming_mode = new_settings.h264_streaming_mode;
     capture_cursor = new_settings.capture_cursor;
     vaapi_render_node_index = new_settings.vaapi_render_node_index;
     std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
@@ -1867,7 +1873,7 @@ public:
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
-      h264_fullcolor, h264_fullframe, capture_cursor,
+      h264_fullcolor, h264_fullframe, h264_streaming_mode, capture_cursor,
       watermark_path_internal.c_str(), watermark_location_internal,
       vaapi_render_node_index
       );
@@ -1995,6 +2001,7 @@ private:
     int local_current_h264_crf;
     bool local_current_h264_fullcolor;
     bool local_current_h264_fullframe;
+    bool local_current_h264_streaming_mode;
     OutputMode local_current_output_mode;
     bool local_current_capture_cursor;
     int local_vaapi_render_node_index;
@@ -2020,6 +2027,7 @@ private:
       local_current_h264_crf = h264_crf;
       local_current_h264_fullcolor = h264_fullcolor;
       local_current_h264_fullframe = h264_fullframe;
+      local_current_h264_streaming_mode = h264_streaming_mode;
       local_current_capture_cursor = capture_cursor;
       local_vaapi_render_node_index = vaapi_render_node_index;
       local_watermark_path_setting = watermark_path_internal;
@@ -2257,6 +2265,7 @@ private:
         local_current_h264_crf = h264_crf;
         local_current_h264_fullcolor = h264_fullcolor;
         local_current_h264_fullframe = h264_fullframe;
+        local_current_h264_streaming_mode = h264_streaming_mode;
         local_current_capture_cursor = capture_cursor;
         local_vaapi_render_node_index = vaapi_render_node_index;
         local_watermark_path_setting = watermark_path_internal;
@@ -2698,115 +2707,118 @@ private:
           bool send_this_stripe = false;
           bool is_h264_idr_paintover_this_stripe = false;
 
-          auto calculate_current_hash = [&]() {
-              if (local_current_output_mode == OutputMode::H264) {
-                  const uint8_t* y_plane_stripe_ptr = full_frame_y_plane_.data() +
-                      static_cast<size_t>(start_y) * full_frame_y_stride_;
-                  const uint8_t* u_plane_stripe_ptr = full_frame_u_plane_.data() +
-                      (static_cast<size_t>(this->yuv_planes_are_i444_ ?
-                       start_y : (start_y / 2)) * full_frame_u_stride_);
-                  
-                  bool use_nv12_path = this->nvenc_operational && !this->yuv_planes_are_i444_;
-                  
-                  const uint8_t* v_plane_stripe_ptr = use_nv12_path ? nullptr :
-                      (full_frame_v_plane_.empty() ? nullptr : full_frame_v_plane_.data() +
-                      (static_cast<size_t>(this->yuv_planes_are_i444_ ?
-                       start_y : (start_y / 2)) * full_frame_v_stride_));
-
-                  int v_stride = use_nv12_path ? 0 : full_frame_v_stride_;
-
-                  return calculate_yuv_stripe_hash(
-                      y_plane_stripe_ptr, full_frame_y_stride_,
-                      u_plane_stripe_ptr, full_frame_u_stride_,
-                      v_plane_stripe_ptr, v_stride,
-                      local_capture_width_actual, current_stripe_height,
-                      !this->yuv_planes_are_i444_);
-              } else {
-                  const unsigned char* shm_stripe_start_ptr = shm_data_ptr +
-                      static_cast<size_t>(start_y) * shm_stride_bytes;
-                  return calculate_bgr_stripe_hash_from_shm(
-                      shm_stripe_start_ptr, shm_stride_bytes,
-                      local_capture_width_actual, current_stripe_height,
-                      shm_bytes_per_pixel);
-              }
-          };
-
-          if (stripe_is_in_damage_block[i]) {
+          if (local_current_output_mode == OutputMode::H264 && local_current_h264_streaming_mode) {
               send_this_stripe = true;
-              stripe_damage_block_frames_remaining[i]--;
+          } else {
+              auto calculate_current_hash = [&]() {
+                  if (local_current_output_mode == OutputMode::H264) {
+                      const uint8_t* y_plane_stripe_ptr = full_frame_y_plane_.data() +
+                          static_cast<size_t>(start_y) * full_frame_y_stride_;
+                      const uint8_t* u_plane_stripe_ptr = full_frame_u_plane_.data() +
+                          (static_cast<size_t>(this->yuv_planes_are_i444_ ?
+                          start_y : (start_y / 2)) * full_frame_u_stride_);
 
-              if (stripe_damage_block_frames_remaining[i] == 0) {
+                      bool use_nv12_path = this->nvenc_operational && !this->yuv_planes_are_i444_;
+
+                      const uint8_t* v_plane_stripe_ptr = use_nv12_path ? nullptr :
+                          (full_frame_v_plane_.empty() ? nullptr : full_frame_v_plane_.data() +
+                          (static_cast<size_t>(this->yuv_planes_are_i444_ ?
+                          start_y : (start_y / 2)) * full_frame_v_stride_));
+
+                      int v_stride = use_nv12_path ? 0 : full_frame_v_stride_;
+
+                      return calculate_yuv_stripe_hash(
+                          y_plane_stripe_ptr, full_frame_y_stride_,
+                          u_plane_stripe_ptr, full_frame_u_stride_,
+                          v_plane_stripe_ptr, v_stride,
+                          local_capture_width_actual, current_stripe_height,
+                          !this->yuv_planes_are_i444_);
+                  } else {
+                      const unsigned char* shm_stripe_start_ptr = shm_data_ptr +
+                          static_cast<size_t>(start_y) * shm_stride_bytes;
+                      return calculate_bgr_stripe_hash_from_shm(
+                          shm_stripe_start_ptr, shm_stride_bytes,
+                          local_capture_width_actual, current_stripe_height,
+                          shm_bytes_per_pixel);
+                  }
+              };
+
+              if (stripe_is_in_damage_block[i]) {
+                  send_this_stripe = true;
+                  stripe_damage_block_frames_remaining[i]--;
+
+                  if (stripe_damage_block_frames_remaining[i] == 0) {
+                      current_hash = calculate_current_hash();
+                      hash_calculated_this_iteration = true;
+
+                      if (current_hash != stripe_hash_at_damage_block_start[i]) {
+                          stripe_damage_block_frames_remaining[i] =
+                              local_current_damage_block_duration;
+                          stripe_hash_at_damage_block_start[i] = current_hash;
+                      } else {
+                          stripe_is_in_damage_block[i] = false;
+                          consecutive_stripe_changes[i] = 0;
+
+                          if (current_hash == previous_hashes[i]) {
+                              send_this_stripe = false;
+                              no_motion_frame_counts[i]++;
+                              if (no_motion_frame_counts[i] >=
+                                      local_current_paint_over_trigger_frames &&
+                                  !paint_over_sent[i]) {
+                                  if (local_current_output_mode == OutputMode::JPEG &&
+                                      local_current_use_paint_over_quality) {
+                                      send_this_stripe = true;
+                                  } else if (local_current_output_mode == OutputMode::H264) {
+                                      send_this_stripe = true;
+                                      is_h264_idr_paintover_this_stripe = true;
+                                  }
+                                  if (send_this_stripe) paint_over_sent[i] = true;
+                              }
+                          } else {
+                              send_this_stripe = true;
+                              no_motion_frame_counts[i] = 0;
+                              paint_over_sent[i] = false;
+                          }
+                          if (local_current_output_mode == OutputMode::JPEG) {
+                              current_jpeg_qualities[i] = local_current_use_paint_over_quality ?
+                                                          local_current_paint_over_jpeg_quality :
+                                                          local_current_jpeg_quality;
+                          }
+                      }
+                  }
+              } else {
                   current_hash = calculate_current_hash();
                   hash_calculated_this_iteration = true;
 
-                  if (current_hash != stripe_hash_at_damage_block_start[i]) {
-                      stripe_damage_block_frames_remaining[i] =
-                          local_current_damage_block_duration;
-                      stripe_hash_at_damage_block_start[i] = current_hash;
+                  if (current_hash != previous_hashes[i]) {
+                      send_this_stripe = true;
+                      no_motion_frame_counts[i] = 0;
+                      paint_over_sent[i] = false;
+                      consecutive_stripe_changes[i]++;
                   } else {
-                      stripe_is_in_damage_block[i] = false;
+                      send_this_stripe = false;
                       consecutive_stripe_changes[i] = 0;
+                      no_motion_frame_counts[i]++;
 
-                      if (current_hash == previous_hashes[i]) {
-                          send_this_stripe = false;
-                          no_motion_frame_counts[i]++;
-                          if (no_motion_frame_counts[i] >=
-                                  local_current_paint_over_trigger_frames &&
-                              !paint_over_sent[i]) {
-                              if (local_current_output_mode == OutputMode::JPEG &&
-                                  local_current_use_paint_over_quality) {
-                                  send_this_stripe = true;
-                              } else if (local_current_output_mode == OutputMode::H264) {
-                                  send_this_stripe = true;
-                                  is_h264_idr_paintover_this_stripe = true;
-                              }
-                              if (send_this_stripe) paint_over_sent[i] = true;
+                      if (no_motion_frame_counts[i] >=
+                              local_current_paint_over_trigger_frames &&
+                          !paint_over_sent[i]) {
+                          if (local_current_output_mode == OutputMode::JPEG &&
+                              local_current_use_paint_over_quality) {
+                              send_this_stripe = true;
+                          } else if (local_current_output_mode == OutputMode::H264) {
+                              send_this_stripe = true;
+                              is_h264_idr_paintover_this_stripe = true;
                           }
-                      } else {
-                          send_this_stripe = true;
-                          no_motion_frame_counts[i] = 0;
-                          paint_over_sent[i] = false;
-                      }
-                      if (local_current_output_mode == OutputMode::JPEG) {
-                          current_jpeg_qualities[i] = local_current_use_paint_over_quality ?
-                                                      local_current_paint_over_jpeg_quality :
-                                                      local_current_jpeg_quality;
+                          if (send_this_stripe) paint_over_sent[i] = true;
                       }
                   }
               }
-          } else {
-              current_hash = calculate_current_hash();
-              hash_calculated_this_iteration = true;
 
-              if (current_hash != previous_hashes[i]) {
-                  send_this_stripe = true;
-                  no_motion_frame_counts[i] = 0;
-                  paint_over_sent[i] = false;
-                  consecutive_stripe_changes[i]++;
-              } else {
-                  send_this_stripe = false;
-                  consecutive_stripe_changes[i] = 0;
-                  no_motion_frame_counts[i]++;
-
-                  if (no_motion_frame_counts[i] >=
-                          local_current_paint_over_trigger_frames &&
-                      !paint_over_sent[i]) {
-                      if (local_current_output_mode == OutputMode::JPEG &&
-                          local_current_use_paint_over_quality) {
-                          send_this_stripe = true;
-                      } else if (local_current_output_mode == OutputMode::H264) {
-                          send_this_stripe = true;
-                          is_h264_idr_paintover_this_stripe = true;
-                      }
-                      if (send_this_stripe) paint_over_sent[i] = true;
-                  }
+              if (hash_calculated_this_iteration) {
+                  previous_hashes[i] = current_hash;
               }
           }
-
-          if (hash_calculated_this_iteration) {
-              previous_hashes[i] = current_hash;
-          }
-
           if (send_this_stripe) {
             any_stripe_encoded_this_frame = true;
             total_stripes_encoded_this_interval++;
@@ -2882,7 +2894,7 @@ private:
                 std::packaged_task<StripeEncodeResult(
                   int, int, int, int,
                   const uint8_t*, int, const uint8_t*, int, const uint8_t*, int,
-                  bool, int, int, int, bool)>
+                  bool, int, int, int, bool, bool)>
                   task(encode_stripe_h264);
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(
@@ -2895,7 +2907,8 @@ private:
                   this->frame_counter,
                   crf_for_encode,
                   derived_h264_colorspace_setting,
-                  derived_h264_use_full_range
+                  derived_h264_use_full_range,
+                  local_current_h264_streaming_mode
                   ));
               }
             }
@@ -3255,7 +3268,8 @@ StripeEncodeResult encode_stripe_h264(
   int frame_counter,
   int current_crf_setting,
   int colorspace_setting,
-  bool use_full_range) {
+  bool use_full_range,
+  bool h264_streaming_mode) {
 
   StripeEncodeResult result;
   result.type = StripeDataType::H264;
@@ -3349,7 +3363,7 @@ StripeEncodeResult encode_stripe_h264(
         param.b_annexb = 1;
         param.i_sync_lookahead = 0;
         param.i_bframe = 0;
-        param.i_threads = 1;
+        param.i_threads = h264_streaming_mode ? 0 : 1;
         param.i_log_level = X264_LOG_ERROR;
         param.vui.b_fullrange = use_full_range ? 1 : 0;
         param.vui.i_sar_width = 1;

@@ -18,6 +18,7 @@ class CaptureSettings(ctypes.Structure):
         ("h264_crf", ctypes.c_int),
         ("h264_fullcolor", ctypes.c_bool),
         ("h264_fullframe", ctypes.c_bool),
+        ("h264_streaming_mode", ctypes.c_bool),
         ("capture_cursor", ctypes.c_bool),
         ("watermark_path", ctypes.c_char_p),
         ("watermark_location_enum", ctypes.c_int),
