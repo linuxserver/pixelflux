@@ -9,11 +9,10 @@ configured in the 'CONFIGURATION SETTINGS' block below.
 
 # Standard library imports
 import asyncio
-import http.server
 import os
-import socketserver
-import threading
+import mimetypes
 import websockets
+import websockets.asyncio.server as ws_async
 
 # Third-party library imports
 from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
@@ -100,6 +99,7 @@ async def cleanup():
         except asyncio.CancelledError:
             pass
     g_active_client = None
+    g_is_shutting_down = False
     print("Cleanup complete.")
 
 async def send_h264_stripes():
@@ -166,18 +166,48 @@ def stripe_callback_handler(result_ptr, user_data_ptr):
             )
 
 
-def start_http_server(host, port):
-    """Starts a simple HTTP server in a separate thread to serve client files."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=script_dir, **kwargs)
-        def log_message(self, format, *args):
-            pass
-    with socketserver.TCPServer((host, port), QuietHTTPRequestHandler) as httpd:
-        print(f"HTTP server is serving files from '{script_dir}'")
-        print(f"-> Open http://{host}:{port}/index.html in your browser.")
-        httpd.serve_forever()
+async def handle_http_request(reader, writer):
+    """Handle HTTP requests by serving static files from the script directory."""
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            return
+
+        parts = request_line.split()
+        if len(parts) < 2 or parts[0] != b'GET':
+            writer.write(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+            return
+
+        path = parts[1].decode()
+        if path == '/':
+            path = '/index.html'
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        full_path = os.path.join(script_dir, path.lstrip('/'))
+
+        # Security check: prevent directory traversal
+        if not full_path.startswith(script_dir):
+            writer.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+            return
+
+        if os.path.isfile(full_path):
+            with open(full_path, 'rb') as f:
+                content = f.read()
+
+            content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
+
+            headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\n\r\n'
+            writer.write(headers.encode())
+            writer.write(content)
+        else:
+            writer.write(b'HTTP/1.1 404 Not Found\r\n\r\n')
+
+    except Exception as e:
+        print(f"[HTTP Error] {e}")
+        writer.write(b'HTTP/1.1 500 Internal Server Error\r\n\r\n')
+    finally:
+        await writer.drain()
+        writer.close()
 
 
 async def main():
@@ -192,14 +222,16 @@ async def main():
         return
     print("Pixelflux capture module initialized.")
 
-    http_thread = threading.Thread(
-        target=start_http_server, args=('localhost', HTTP_PORT), daemon=True
+    # Start HTTP server using asyncio
+    http_server = await asyncio.start_server(
+        handle_http_request, 'localhost', HTTP_PORT
     )
-    http_thread.start()
+    print(f"HTTP server is serving files from current directory")
+    print(f"-> Open http://localhost:{HTTP_PORT}/index.html in your browser.")
 
     ws_server = None
     try:
-        ws_server = await websockets.serve(
+        ws_server = await ws_async.serve(
             websocket_handler, 'localhost', WS_PORT, compression=None
         )
         print(f"WebSocket server started on ws://localhost:{WS_PORT}")
