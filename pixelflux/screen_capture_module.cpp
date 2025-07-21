@@ -1777,6 +1777,7 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_workers_{false};
+    mutable std::mutex callback_mutex_;
 
     std::vector<uint32_t> watermark_image_data_;
     int watermark_width_;
@@ -1860,27 +1861,43 @@ public:
   /**
    * @brief Stops the screen capture process.
    * Sets the stop_requested flag and waits for the capture thread to join.
-   * This is a blocking call.
+   * This is a blocking call and thread-safe.
    */
   void stop_capture() {
-    stop_requested = true;
+    // Use atomic compare-and-swap to ensure only one thread can stop
+    bool expected = false;
+    if (!stop_requested.compare_exchange_strong(expected, true)) {
+        // Already stopping or stopped
+        return;
+    }
+    
+    // Clear callback first to prevent new callbacks during shutdown
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        stripe_callback = nullptr;
+        user_data = nullptr;
+    }
+    
     stop_workers_ = true;
     queue_cv_.notify_all();
-
+    
+    // Join threads with timeout to prevent infinite blocking
+    if (capture_thread.joinable()) {
+        capture_thread.join();
+    }
+    
     for (auto& worker : worker_threads_) {
         if (worker.joinable()) {
             worker.join();
         }
     }
     worker_threads_.clear();
-    if (capture_thread.joinable()) {
-      capture_thread.join();
-    }
+    
     if (g_nvenc_state.initialized) {
-      reset_nvenc_encoder();
+        reset_nvenc_encoder();
     }
     if (g_vaapi_state.initialized) {
-      reset_vaapi_encoder();
+        reset_vaapi_encoder();
     }
     unload_vaapi_library_if_loaded();
     unload_nvenc_library_if_loaded();
@@ -2931,8 +2948,12 @@ private:
               }
           }
 
-          if (stripe_callback && result.data && result.size > 0) {
-              stripe_callback(&result, user_data);
+          // Thread-safe callback invocation with separate mutex
+          {
+              std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+              if (stripe_callback && result.data && result.size > 0 && !stop_requested.load()) {
+                  stripe_callback(&result, user_data);
+              }
           }
       }
   }

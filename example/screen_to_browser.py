@@ -9,14 +9,12 @@ configured in the 'CONFIGURATION SETTINGS' block below.
 
 # Standard library imports
 import asyncio
-import http.server
 import os
-import socketserver
-import threading
+import mimetypes
 import websockets
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeEncodeResult
+from pixelflux import CaptureSettings, ScreenCapture
 
 # ==============================================================================
 # --- CONFIGURATION SETTINGS ---
@@ -78,28 +76,59 @@ g_is_capturing = False          # Flag indicating if capture is active.
 g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes.
 g_send_task = None              # asyncio.Task for sending stripes.
 
+g_cleanup_lock = None
 g_is_shutting_down = False
+
 async def cleanup():
     """A single, race-proof function to shut down all capture resources."""
-    global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client
-    if g_is_shutting_down:
-        return
-    print("Cleanup initiated...")
-    if g_is_capturing:
-        g_is_capturing = False
-    g_is_shutting_down = True
-    if g_module:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, g_module.stop_capture)
-    if g_send_task and not g_send_task.done():
-        g_send_task.cancel()
-        try:
-            await g_send_task
-        except asyncio.CancelledError:
-            pass
-    g_active_client = None
-    g_is_shutting_down = False
-    print("Cleanup complete.")
+    global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client, g_h264_stripe_queue, g_cleanup_lock
+    
+    # Initialize lock if not already done
+    if g_cleanup_lock is None:
+        g_cleanup_lock = asyncio.Lock()
+    
+    async with g_cleanup_lock:
+        if g_is_shutting_down:
+            return
+        
+        print("Cleanup initiated...")
+        g_is_shutting_down = True
+        
+        # Stop capturing first
+        if g_is_capturing:
+            g_is_capturing = False
+        
+        # Cancel the send task
+        if g_send_task and not g_send_task.done():
+            g_send_task.cancel()
+            try:
+                await g_send_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Clear the queue to prevent memory buildup
+        if g_h264_stripe_queue:
+            while not g_h264_stripe_queue.empty():
+                try:
+                    g_h264_stripe_queue.get_nowait()
+                    g_h264_stripe_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        
+        # Stop the capture module
+        if g_module:
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(None, g_module.stop_capture)
+            except Exception as e:
+                print(f"[WARNING] Error stopping capture: {e}")
+        
+        # Clear references
+        g_active_client = None
+        g_send_task = None
+        g_h264_stripe_queue = None
+        g_is_shutting_down = False
+        print("Cleanup complete.")
 
 async def send_h264_stripes():
     """Retrieves H.264 stripes from the queue and sends them to the active client."""
@@ -125,58 +154,111 @@ async def websocket_handler(websocket, path=None):
     """Manages a single WebSocket connection and the screen capture lifecycle."""
     global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task
 
+    # Handle existing client - clean up first, then accept new connection
     if g_active_client is not None:
-        print("Rejecting new connection: A client is already active.")
-        await websocket.close(code=1013, reason="Server is busy with another client.")
-        return
+        print("New connection detected. Cleaning up previous connection...")
+        await cleanup()
+        # Small delay to ensure cleanup is complete
+        await asyncio.sleep(0.1)
 
     g_active_client = websocket
     print("Client connected. Starting screen capture...")
 
     try:
+        # Ensure we have a fresh queue
         g_h264_stripe_queue = asyncio.Queue(maxsize=120)
-        g_module.start_capture(capture_settings, stripe_callback_handler)
-        g_is_capturing = True
-        g_send_task = asyncio.create_task(send_h264_stripes())
-        print("Screen capture and stream started.")
+        
+        # Start capture with error handling
+        try:
+            g_module.start_capture(capture_settings, stripe_callback_handler)
+            g_is_capturing = True
+            g_send_task = asyncio.create_task(send_h264_stripes())
+            print("Screen capture and stream started.")
+        except Exception as e:
+            print(f"[ERROR] Failed to start capture: {e}")
+            await websocket.close(code=1011, reason="Failed to start capture")
+            return
 
-        async for _ in websocket:
-            pass
+        # Keep connection alive and handle messages
+        async for message in websocket:
+            # Echo back any messages (for debugging/keepalive)
+            if isinstance(message, str) and message == "ping":
+                await websocket.send("pong")
+                
     except websockets.exceptions.ConnectionClosed:
         print("Client disconnected normally.")
     except Exception as e:
         print(f"[ERROR] WebSocket handler error: {e}")
     finally:
+        # Only cleanup if this websocket is still the active client
         if websocket is g_active_client:
             await cleanup()
 
 def stripe_callback_handler(result):
     """Callback invoked by pixelflux when a new video stripe is ready."""
-    if g_is_capturing and result and g_h264_stripe_queue is not None:
-        data = result.data
-        if data and data.nbytes > 0:
-            # The result object contains the encoded video data
-            if g_loop and not g_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    g_h264_stripe_queue.put(bytes(data)), g_loop
-                )
+    try:
+        if g_is_capturing and result and g_h264_stripe_queue is not None:
+            data = result.data
+            if data and data.nbytes > 0:
+                # The result object contains the encoded video data
+                if g_loop and not g_loop.is_closed():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            g_h264_stripe_queue.put(bytes(data)), g_loop
+                        )
+                    except RuntimeError:
+                        # Loop might be closed, ignore
+                        pass
+    except Exception as e:
+        # Silently handle any callback errors to prevent crashes
+        print(f"[WARNING] Error in stripe callback: {e}")
 
-
-def start_http_server(host, port):
-    """Starts a simple HTTP server in a separate thread to serve client files."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=script_dir, **kwargs)
-        def log_message(self, format, *args):
-            pass
-    class ReuseAddressTCPServer(socketserver.TCPServer):
-        allow_reuse_address = True
-    with ReuseAddressTCPServer((host, port), QuietHTTPRequestHandler) as httpd:
-        print(f"HTTP server is serving files from '{script_dir}'")
-        print(f"-> Open http://{host}:{port}/index.html in your browser.")
-        httpd.serve_forever()
-
+async def handle_http_request(reader, writer):
+    """Handle HTTP requests by serving static files from the script directory."""
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            return
+            
+        parts = request_line.split()
+        if len(parts) < 2 or parts[0] != b'GET':
+            writer.write(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+            await writer.drain()
+            writer.close()
+            return
+            
+        path = parts[1].decode()
+        if path == '/':
+            path = '/index.html'
+            
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        full_path = os.path.join(script_dir, path.lstrip('/'))
+        
+        # Security check: prevent directory traversal
+        if not full_path.startswith(script_dir):
+            writer.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+            await writer.drain()
+            writer.close()
+            return
+            
+        if os.path.isfile(full_path):
+            with open(full_path, 'rb') as f:
+                content = f.read()
+                
+            content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
+            
+            headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\n\r\n'
+            writer.write(headers.encode())
+            writer.write(content)
+        else:
+            writer.write(b'HTTP/1.1 404 Not Found\r\n\r\n')
+            
+    except Exception as e:
+        print(f"[HTTP Error] {e}")
+        writer.write(b'HTTP/1.1 500 Internal Server Error\r\n\r\n')
+    finally:
+        await writer.drain()
+        writer.close()
 
 async def main():
     """Initializes resources and starts the WebSocket and HTTP servers."""
@@ -190,10 +272,12 @@ async def main():
         return
     print("Pixelflux capture module initialized.")
 
-    http_thread = threading.Thread(
-        target=start_http_server, args=('localhost', HTTP_PORT), daemon=True
+    # Start HTTP server using asyncio
+    http_server = await asyncio.start_server(
+        handle_http_request, 'localhost', HTTP_PORT
     )
-    http_thread.start()
+    print(f"HTTP server is serving files from current directory")
+    print(f"-> Open http://localhost:{HTTP_PORT}/index.html in your browser.")
 
     ws_server = None
     try:
@@ -212,6 +296,9 @@ async def main():
         if ws_server:
             ws_server.close()
             await ws_server.wait_closed()
+        if http_server:
+            http_server.close()
+            await http_server.wait_closed()
         print("Cleanup complete.")
 
 if __name__ == "__main__":

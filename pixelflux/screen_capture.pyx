@@ -204,19 +204,29 @@ cdef class StripeEncodeResult:
 
 # Callback handling
 cdef void _stripe_callback(StripeEncodeResultStruct* c_result, void* user_data) noexcept with gil:
+    # Early exit if no data to prevent unnecessary processing
+    if c_result == NULL or user_data == NULL:
+        if c_result != NULL:
+            free_stripe_encode_result_data(c_result)
+        return
+    
     cdef object capsule = <object>user_data
     cdef void* tuple_ptr = PyCapsule_GetPointer(capsule, NULL)
     if tuple_ptr == NULL:
+        free_stripe_encode_result_data(c_result)
         return
     
     cdef object callback_tuple = <object>tuple_ptr
     cdef object py_callback, py_user_data
     try:
         py_callback, py_user_data = callback_tuple
+        if py_callback is None:
+            free_stripe_encode_result_data(c_result)
+            return
     except (TypeError, ValueError):
+        free_stripe_encode_result_data(c_result)
         return
     
-    # Create Python object from C result
     # Create Python wrapper with ownership
     cdef StripeEncodeResult py_result = StripeEncodeResult()
     py_result._ptr = <StripeEncodeResultStruct*>malloc(sizeof(StripeEncodeResultStruct))
@@ -233,7 +243,11 @@ cdef void _stripe_callback(StripeEncodeResultStruct* c_result, void* user_data) 
     py_result._ptr.frame_id = c_result.frame_id
     
     try:
-        (<object>py_callback)(py_result)
+        # Call Python callback with proper exception handling
+        py_callback(py_result)
+    except Exception as e:
+        # Log the exception but don't let it propagate to C++
+        print(f"[ERROR] Exception in stripe callback: {e}")
     finally:
         # Prevent double-free - Python object now owns memory
         c_result.data = NULL
@@ -245,6 +259,7 @@ cdef class ScreenCapture:
     cdef object _python_stripe_callback
     cdef object _c_callback_capsule
     cdef object _py_capsule
+    cdef bint _is_capturing
     
     def __cinit__(self):
         self._module = create_screen_capture_module()
@@ -253,6 +268,7 @@ cdef class ScreenCapture:
         self._python_stripe_callback = None
         self._c_callback_capsule = None
         self._py_capsule = None
+        self._is_capturing = False
     
     def __dealloc__(self):
         if self._module:
@@ -260,8 +276,10 @@ cdef class ScreenCapture:
             destroy_screen_capture_module(self._module)
     
     def start_capture(self, CaptureSettings settings, stripe_callback, user_data=None):
-        if self._python_stripe_callback is not None:
-            raise ValueError("Capture already started")
+        if self._is_capturing:
+            print("[WARNING] Capture already in progress, stopping previous capture...")
+            self.stop_capture()
+        
         if not callable(stripe_callback):
             raise TypeError("stripe_callback must be callable")
         
@@ -274,20 +292,38 @@ cdef class ScreenCapture:
         )
         cdef void* callback_ptr = <void*>py_capsule
         
-        start_screen_capture(
-            self._module,
-            settings._c_obj,
-            <void (*)(StripeEncodeResultStruct*, void*) noexcept>_stripe_callback,
-            callback_ptr
-        )
+        # Set flag before starting to prevent race conditions
+        self._is_capturing = True
         
-        # Keep reference to prevent garbage collection
-        self._py_capsule = py_capsule
+        try:
+            start_screen_capture(
+                self._module,
+                settings._c_obj,
+                <void (*)(StripeEncodeResultStruct*, void*) noexcept>_stripe_callback,
+                callback_ptr
+            )
+            # Keep reference to prevent garbage collection
+            self._py_capsule = py_capsule
+        except Exception as e:
+            # Reset state if start failed
+            self._is_capturing = False
+            self._python_stripe_callback = None
+            self._c_callback_capsule = None
+            raise e
     
     def stop_capture(self):
-        if self._python_stripe_callback is None:
+        if not self._is_capturing:
             return
         
-        stop_screen_capture(self._module)
+        # Clear callback references first to prevent new callbacks
         self._python_stripe_callback = None
         self._c_callback_capsule = None
+        self._py_capsule = None
+        self._is_capturing = False
+        
+        # Now stop the C++ module
+        stop_screen_capture(self._module)
+    
+    @property
+    def is_capturing(self):
+        return self._is_capturing
