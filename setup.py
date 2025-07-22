@@ -23,11 +23,10 @@ class BuildCtypesExt(build_ext):
         ]
         include_dirs = ['pixelflux/include']
         libraries = ['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl', 'va', 'va-drm']
-        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-shared', '-O3']
+        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-O3', '-shared']
 
         command = [compiler]
         command.extend(extra_compile_args)
-        command.append('-shared')
         command.append('-o')
         command.append(str(output_path))
         
