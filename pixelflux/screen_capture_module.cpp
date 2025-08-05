@@ -3147,7 +3147,7 @@ StripeEncodeResult encode_stripe_jpeg(
   result.frame_id = frame_counter;
 
   if (!shm_data_base || stripe_height <= 0 || capture_width_actual <= 0 ||
-      shm_bytes_per_pixel <=0) {
+      shm_bytes_per_pixel <= 0) {
     std::cerr << "JPEG T" << thread_id
               << ": Invalid input for JPEG encoding from SHM." << std::endl;
     result.type = StripeDataType::UNKNOWN;
@@ -3161,8 +3161,14 @@ StripeEncodeResult encode_stripe_jpeg(
 
   cinfo.image_width = capture_width_actual;
   cinfo.image_height = stripe_height;
-  cinfo.input_components = 3;
-  cinfo.in_color_space = JCS_RGB;
+
+  if (shm_bytes_per_pixel == 4) {
+    cinfo.input_components = 4;
+    cinfo.in_color_space = JCS_EXT_BGRX;
+  } else {
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_EXT_BGR;
+  }
 
   jpeg_set_defaults(&cinfo);
   jpeg_set_quality(&cinfo, jpeg_quality, TRUE);
@@ -3173,28 +3179,18 @@ StripeEncodeResult encode_stripe_jpeg(
 
   jpeg_start_compress(&cinfo, TRUE);
 
-  std::vector<unsigned char> rgb_row_buffer(static_cast<size_t>(capture_width_actual) * 3);
   JSAMPROW row_pointer[1];
-  row_pointer[0] = rgb_row_buffer.data();
-
   for (int y_in_stripe = 0; y_in_stripe < stripe_height; ++y_in_stripe) {
     const unsigned char* shm_current_row_in_full_frame_ptr =
         shm_data_base + static_cast<size_t>(stripe_y_start + y_in_stripe) * shm_stride_bytes;
-
-    for (int x = 0; x < capture_width_actual; ++x) {
-      const unsigned char* shm_pixel =
-          shm_current_row_in_full_frame_ptr + static_cast<size_t>(x) * shm_bytes_per_pixel;
-      rgb_row_buffer[static_cast<size_t>(x) * 3 + 0] = shm_pixel[2];
-      rgb_row_buffer[static_cast<size_t>(x) * 3 + 1] = shm_pixel[1];
-      rgb_row_buffer[static_cast<size_t>(x) * 3 + 2] = shm_pixel[0];
-    }
+    row_pointer[0] = (JSAMPROW)shm_current_row_in_full_frame_ptr;
     jpeg_write_scanlines(&cinfo, row_pointer, 1);
   }
 
   jpeg_finish_compress(&cinfo);
 
   if (jpeg_size_temp > 0 && jpeg_buffer) {
-    int padding_size = 4; // For frame_counter and stripe_y_start
+    int padding_size = 4;
     result.data = new (std::nothrow) unsigned char[jpeg_size_temp + padding_size];
     if (!result.data) {
       std::cerr << "JPEG T" << thread_id
@@ -3220,7 +3216,7 @@ StripeEncodeResult encode_stripe_jpeg(
 
   jpeg_destroy_compress(&cinfo);
   if (jpeg_buffer) {
-    free(jpeg_buffer); // jpeg_mem_dest uses malloc
+    free(jpeg_buffer);
   }
   return result;
 }
