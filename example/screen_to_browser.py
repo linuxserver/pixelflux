@@ -36,7 +36,7 @@ capture_settings.capture_cursor = False
 
 # --- Encoding Mode ---
 # Sets the output codec. 0 for JPEG, 1 for H.264.
-capture_settings.output_mode = 1
+capture_settings.output_mode = 0
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
@@ -60,6 +60,12 @@ capture_settings.paint_over_trigger_frames = 15
 capture_settings.damage_block_threshold = 10
 # Number of frames a stripe stays "damaged" after being triggered.
 capture_settings.damage_block_duration = 30
+
+# --- JPEG Quality Settings ---
+# Quality of jpegs under motion
+capture_settings.jpeg_quality = 40
+# Quality of jpegs on static content paintovers
+capture_settings.paint_over_jpeg_quality = 90
 
 # --- Watermarking ---
 # The path MUST be a byte string (b"") and point to a valid PNG file.
@@ -157,14 +163,17 @@ def stripe_callback_handler(result_ptr, user_data_ptr):
         result = result_ptr.contents
         if result.size <= 0:
             return
+        raw_data_from_cpp = bytes(result.data[:result.size])
+        data_to_send = None
+        if capture_settings.output_mode == 1 and not capture_settings.h264_streaming_mode:
+            data_to_send = raw_data_from_cpp
+        else:
+            data_to_send = b"\x03\x00" + raw_data_from_cpp
 
-        data_copy = bytes(result.data[:result.size])
-
-        if g_loop and not g_loop.is_closed():
+        if data_to_send and g_loop and not g_loop.is_closed():
             asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(data_copy), g_loop
+                g_h264_stripe_queue.put(data_to_send), g_loop
             )
-
 
 async def handle_http_request(reader, writer):
     """Handle HTTP requests by serving static files from the script directory."""

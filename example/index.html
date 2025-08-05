@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>H.264 Stripe Demo</title>
+    <title>pixelflux demo</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #333; }
         canvas { display: block; } /* Ensures canvas is block-level, good practice */
@@ -22,8 +22,7 @@
         const canvas = document.getElementById("videoCanvas");
         const ctx = canvas.getContext('2d');
 
-        // Set the canvas dimensions.
-        // The internal resolution of the canvas.
+        // Set the canvas dimensions. This is the internal resolution of the canvas.
         canvas.width = DISPLAY_WIDTH;
         canvas.height = DISPLAY_HEIGHT;
 
@@ -33,10 +32,18 @@
         // canvas.style.height = "100vh";
         // canvas.style.objectFit = "contain"; // If scaling to window, maintain aspect ratio.
 
-        // This object will store VideoDecoder instances, one for each horizontal stripe.
+        // This object stores VideoDecoder instances, one for each horizontal H.264 stripe.
         // The key will be the stripe's Y-coordinate (stripe_y_start).
-        // The value will be an object: { decoder: VideoDecoder, pendingChunks: [] }
+        // The value will be an object: { decoder: VideoDecoder, pendingChunks: [], config: decoderConfig }
         const stripeDecoders = {};
+
+        // --- Render Queues ---
+        // This application uses queues to hold decoded data (frames/images) before painting.
+        // This design pattern decouples the asynchronous decoding process from the rendering
+        // (painting) process. This is crucial for handling multiple data types (H.264, JPEG)
+        // that may arrive and decode at different times, ensuring a smooth and organized paint cycle.
+        const h264RenderQueue = []; // For decoded H.264 VideoFrames
+        const jpegRenderQueue = []; // For decoded JPEG ImageBitmaps
 
         // Establish a WebSocket connection to the server.
         const websocket = new WebSocket(WEBSOCKET_URL);
@@ -50,159 +57,171 @@
         };
 
         websocket.onmessage = function(event) {
-            // `event.data` will be an ArrayBuffer containing the H.264 stripe data.
+            // `event.data` will be an ArrayBuffer containing the stripe data.
             const receivedBuffer = event.data;
-            const dataView = new DataView(receivedBuffer);
+            if (receivedBuffer.byteLength < 1) return;
 
-            // --- Parse the 10-byte Prefix ---
-            // Byte 0: DataType (should be 0x04 for H.264 stripe in this demo)
+            const dataView = new DataView(receivedBuffer);
+            // The first byte of the message indicates the data type.
             const dataType = dataView.getUint8(0);
 
-            if (dataType !== 0x04) {
-                console.warn(`Received unexpected data type: ${dataType}. Expected 0x04 for H.264 stripe.`);
-                return;
-            }
+            // The code branches based on the data type to use the correct parsing logic.
+            if (dataType === 0x04) {
+                // --- H.264 Stripe Processing ---
+                const EXPECTED_H264_HEADER_LENGTH = 10;
+                if (receivedBuffer.byteLength < EXPECTED_H264_HEADER_LENGTH) return;
 
-            // Byte 1: Frame Type (0x01 for Key frame, 0x00 for Delta/P-frame)
-            const frameTypeByte = dataView.getUint8(1);
-            const chunkType = (frameTypeByte === 0x01) ? 'key' : 'delta';
+                // --- Parse the 10-byte H.264 Prefix ---
+                // Byte 1: Frame Type (0x01 for Key frame, 0x00 for Delta/P-frame)
+                const frameTypeByte = dataView.getUint8(1);
+                const chunkType = (frameTypeByte === 0x01) ? 'key' : 'delta';
 
-            // Bytes 2-3: Frame ID (unique ID for the full frame this stripe belongs to)
-            // Not strictly used for rendering in this minimal demo, but good to know it's there.
-            const frameId = dataView.getUint16(2, false); // false for big-endian
+                // Bytes 2-3: Frame ID (unique ID for the full frame this stripe belongs to)
+                // Not strictly used for rendering in this demo, but good to know it's there.
+                const frameId = dataView.getUint16(2, false); // false for big-endian
 
-            // Bytes 4-5: Stripe Y Start (vertical offset of this stripe)
-            const stripeYStart = dataView.getUint16(4, false); // false for big-endian
+                // Bytes 4-5: Stripe Y Start (vertical offset of this stripe)
+                const stripeYStart = dataView.getUint16(4, false); // false for big-endian
 
-            // Bytes 6-7: Stripe Width
-            const stripeWidth = dataView.getUint16(6, false); // false for big-endian
+                // Bytes 6-7: Stripe Width
+                const stripeWidth = dataView.getUint16(6, false); // false for big-endian
 
-            // Bytes 8-9: Stripe Height
-            const stripeHeight = dataView.getUint16(8, false); // false for big-endian
+                // Bytes 8-9: Stripe Height
+                const stripeHeight = dataView.getUint16(8, false); // false for big-endian
 
-            // The actual H.264 NALU data starts after the 10-byte prefix.
-            const h264NaluData = receivedBuffer.slice(10);
+                // The actual H.264 NALU data starts after the 10-byte prefix.
+                const h264NaluData = receivedBuffer.slice(EXPECTED_H264_HEADER_LENGTH);
+                // --- End Prefix Parsing ---
 
-            if (h264NaluData.byteLength === 0) {
-                console.warn(`Received empty H.264 NALU data for stripe Y=${stripeYStart}.`);
-                return;
-            }
-            // --- End Prefix Parsing ---
+                if (h264NaluData.byteLength === 0) {
+                    console.warn(`Received empty H.264 NALU data for stripe Y=${stripeYStart}.`);
+                    return;
+                }
 
-            // Get or create the VideoDecoder for this specific stripe.
-            let decoderInfo = stripeDecoders[stripeYStart];
-
-            if (!decoderInfo) {
-                // If no decoder exists for this stripe's Y position, create one.
-                console.log(`Creating new VideoDecoder for stripe Y=${stripeYStart}, Width=${stripeWidth}, Height=${stripeHeight}`);
-
-                const newDecoder = new VideoDecoder({
-                    output: (videoFrame) => {
-                        // This is the output callback for the VideoDecoder.
-                        // It's called when a frame has been successfully decoded.
-                        try {
-                            // Draw the decoded frame directly onto the canvas at its correct Y position.
-                            ctx.drawImage(videoFrame, 0, stripeYStart);
-                        } catch (e) {
-                            console.error(`Error drawing decoded frame for stripe Y=${stripeYStart}:`, e);
-                        } finally {
-                            // IMPORTANT: Close the VideoFrame to release its resources.
-                            videoFrame.close();
-                        }
-                    },
-                    error: (e) => {
-                        console.error(`VideoDecoder error for stripe Y=${stripeYStart}:`, e.message, e);
-                        // More robust error handling might involve trying to reset or reconfigure the decoder.
-                        // For this demo, we just log the error. If a decoder becomes permanently broken,
-                        // its stripes might stop updating.
-                        // Consider removing the decoder from stripeDecoders so it can be recreated on next keyframe.
-                        if (stripeDecoders[stripeYStart] && stripeDecoders[stripeYStart].decoder === newDecoder) {
-                            try {
-                                if (newDecoder.state !== 'closed') newDecoder.close();
-                            } catch (closeError) { /* ignore */ }
-                            delete stripeDecoders[stripeYStart];
-                            console.warn(`Removed faulty decoder for stripe Y=${stripeYStart}. It might be recreated on the next keyframe.`);
-                        }
-                    }
-                });
-
-                // Configuration for the VideoDecoder.
-                const decoderConfig = {
-                    codec: 'avc1.42E01E', // Common H.264 baseline codec string.
-                    codedWidth: stripeWidth,  // Width of the NALU data.
-                    codedHeight: stripeHeight, // Height of the NALU data.
-                    optimizeForLatency: true, // Prioritize faster decoding.
-                };
-
-                // Store the new decoder and a place for pending chunks.
-                stripeDecoders[stripeYStart] = { decoder: newDecoder, pendingChunks: [], config: decoderConfig };
-                decoderInfo = stripeDecoders[stripeYStart];
-
-                // Asynchronously check if the configuration is supported and then configure.
-                VideoDecoder.isConfigSupported(decoderConfig)
-                    .then(support => {
-                        if (support.supported) {
-                            newDecoder.configure(decoderConfig);
-                            console.log(`VideoDecoder configured for stripe Y=${stripeYStart}. Processing ${decoderInfo.pendingChunks.length} pending chunks.`);
-                            // Process any chunks that arrived while the decoder was being set up.
-                            processPendingChunks(stripeYStart);
-                        } else {
-                            console.error(`VideoDecoder configuration not supported for stripe Y=${stripeYStart}:`, decoderConfig, support);
-                            // If config not supported, remove the placeholder.
+                // Get or create the VideoDecoder for this specific stripe.
+                let decoderInfo = stripeDecoders[stripeYStart];
+                if (!decoderInfo) {
+                    // If no decoder exists for this stripe's Y position, create one.
+                    console.log(`Creating new VideoDecoder for H.264 stripe Y=${stripeYStart}, Width=${stripeWidth}, Height=${stripeHeight}`);
+                    const newDecoder = new VideoDecoder({
+                        output: (videoFrame) => {
+                            // This is the output callback, called when a frame is successfully decoded.
+                            // The decoded frame and its position are pushed to a render queue.
+                            // The main renderLoop will handle drawing and resource cleanup.
+                            h264RenderQueue.push({ frame: videoFrame, y: stripeYStart });
+                        },
+                        error: (e) => {
+                            console.error(`VideoDecoder error for stripe Y=${stripeYStart}:`, e.message);
+                            // More robust error handling might involve trying to reset or reconfigure the decoder.
+                            // For this demo, we remove the faulty decoder so it can be recreated on the next keyframe.
                             if (stripeDecoders[stripeYStart] && stripeDecoders[stripeYStart].decoder === newDecoder) {
+                                try { if (newDecoder.state !== 'closed') newDecoder.close(); } catch (closeError) {}
                                 delete stripeDecoders[stripeYStart];
+                                console.warn(`Removed faulty decoder for stripe Y=${stripeYStart}. It might be recreated on the next keyframe.`);
                             }
                         }
-                    })
-                    .catch(e => {
-                        console.error(`Error during VideoDecoder support check or configure for stripe Y=${stripeYStart}:`, e);
-                        if (stripeDecoders[stripeYStart] && stripeDecoders[stripeYStart].decoder === newDecoder) {
-                            delete stripeDecoders[stripeYStart];
-                        }
                     });
-            }
 
-            // At this point, decoderInfo should refer to the entry in stripeDecoders.
-            // Create an EncodedVideoChunk from the NALU data.
-            const chunkTimestamp = performance.now() * 1000; // Timestamps in microseconds.
-                                                             // Must be monotonically increasing for a given decoder.
-            const encodedChunk = new EncodedVideoChunk({
-                type: chunkType,
-                timestamp: chunkTimestamp,
-                data: h264NaluData
-            });
+                    // Configuration for the VideoDecoder.
+                    const decoderConfig = {
+                        codec: 'avc1.42E01E',      // Common H.264 baseline codec string.
+                        codedWidth: stripeWidth,   // Width of the encoded data.
+                        codedHeight: stripeHeight, // Height of the encoded data.
+                        optimizeForLatency: true,  // Prioritize faster decoding.
+                    };
+                    stripeDecoders[stripeYStart] = { decoder: newDecoder, pendingChunks: [], config: decoderConfig };
+                    decoderInfo = stripeDecoders[stripeYStart];
 
-            // If the decoder is configured, decode immediately. Otherwise, queue the chunk.
-            if (decoderInfo.decoder.state === "configured") {
-                try {
-                    decoderInfo.decoder.decode(encodedChunk);
-                } catch (e) {
-                    console.error(`Error decoding chunk for stripe Y=${stripeYStart}:`, e, encodedChunk);
-                    // If decode fails, consider resetting/re-creating this specific decoder.
+                    // Asynchronously check if the configuration is supported and then configure.
+                    VideoDecoder.isConfigSupported(decoderConfig)
+                        .then(support => {
+                            if (support.supported) {
+                                newDecoder.configure(decoderConfig);
+                                // Process any chunks that arrived while the decoder was being set up.
+                                processPendingH264Chunks(stripeYStart);
+                            } else {
+                                console.error(`H.264 config not supported for Y=${stripeYStart}:`, decoderConfig);
+                                delete stripeDecoders[stripeYStart];
+                            }
+                        })
+                        .catch(e => {
+                            console.error(`Error configuring H.264 decoder for Y=${stripeYStart}:`, e);
+                            delete stripeDecoders[stripeYStart];
+                        });
                 }
-            } else if (decoderInfo.decoder.state === "unconfigured" || decoderInfo.decoder.state === "configuring") {
-                // console.log(`Decoder for stripe Y=${stripeYStart} is ${decoderInfo.decoder.state}. Queuing chunk.`);
-                decoderInfo.pendingChunks.push(encodedChunk);
-            } else { // 'closed'
-                console.warn(`Decoder for stripe Y=${stripeYStart} is closed. Chunk dropped. Frame ID: ${frameId}`);
-                // If it's closed, it might have errored. It could be recreated on the next keyframe.
+
+                // Create an EncodedVideoChunk from the NALU data.
+                const encodedChunk = new EncodedVideoChunk({
+                    type: chunkType,
+                    timestamp: performance.now() * 1000, // Timestamps in microseconds. Must be monotonically increasing for a given decoder.
+                    data: h264NaluData
+                });
+
+                // If the decoder is configured, decode immediately. Otherwise, queue the chunk.
+                if (decoderInfo.decoder.state === "configured") {
+                    try { decoderInfo.decoder.decode(encodedChunk); } catch (e) { console.error(`Error decoding H.264 chunk for Y=${stripeYStart}:`, e); }
+                } else if (decoderInfo.decoder.state === "unconfigured" || decoderInfo.decoder.state === "configuring") {
+                    // console.log(`Decoder for stripe Y=${stripeYStart} is ${decoderInfo.decoder.state}. Queuing chunk.`);
+                    decoderInfo.pendingChunks.push(encodedChunk);
+                }
+            } else if (dataType === 0x03) {
+                // --- JPEG Stripe Processing ---
+                const EXPECTED_JPEG_HEADER_LENGTH = 6;
+                if (receivedBuffer.byteLength < EXPECTED_JPEG_HEADER_LENGTH) return;
+
+                // --- Parse the 6-byte JPEG Prefix ---
+                // Bytes 2-3: Frame ID
+                const frameId = dataView.getUint16(2, false);
+                // Bytes 4-5: Stripe Y Start (vertical offset of this stripe)
+                const stripeYStart = dataView.getUint16(4, false);
+
+                // The rest of the buffer is the JPEG image data.
+                const jpegData = receivedBuffer.slice(EXPECTED_JPEG_HEADER_LENGTH);
+                // --- End Prefix Parsing ---
+
+                if (jpegData.byteLength > 0) {
+                    // Asynchronously decode the JPEG data and queue the result for rendering.
+                    decodeAndQueueJpeg(jpegData, stripeYStart);
+                }
+            } else {
+                console.warn(`Received unexpected data type: 0x${dataType.toString(16)}.`);
             }
         };
 
-        function processPendingChunks(stripeY) {
+        /**
+         * Asynchronously decodes a JPEG stripe and queues it for rendering.
+         * This uses the modern ImageDecoder API, which is more efficient than older methods.
+         * @param {ArrayBuffer} jpegData - The raw binary data for the JPEG image.
+         * @param {number} startY - The Y-coordinate where this stripe should be drawn.
+         */
+        async function decodeAndQueueJpeg(jpegData, startY) {
+            if (typeof ImageDecoder === 'undefined') {
+                console.warn('ImageDecoder API not supported in this browser. Cannot decode JPEG stripes.');
+                return;
+            }
+            try {
+                const imageDecoder = new ImageDecoder({ data: jpegData, type: 'image/jpeg' });
+                const result = await imageDecoder.decode();
+                // Push the decoded image and its Y position to the queue for the render loop.
+                jpegRenderQueue.push({ image: result.image, y: startY });
+                imageDecoder.close();
+            } catch (error) {
+                console.error(`Error decoding JPEG stripe for Y=${startY}:`, error);
+            }
+        }
+
+        /**
+         * Processes H.264 chunks that were received while a decoder was being initialized.
+         * @param {number} stripeY - The Y-coordinate of the stripe whose pending chunks should be processed.
+         */
+        function processPendingH264Chunks(stripeY) {
             const decoderInfo = stripeDecoders[stripeY];
             if (!decoderInfo || decoderInfo.decoder.state !== "configured" || !decoderInfo.pendingChunks) {
                 return;
             }
-            // console.log(`Processing ${decoderInfo.pendingChunks.length} pending chunks for stripe Y=${stripeY}`);
             while (decoderInfo.pendingChunks.length > 0) {
                 const chunkToDecode = decoderInfo.pendingChunks.shift();
-                try {
-                    decoderInfo.decoder.decode(chunkToDecode);
-                } catch (e) {
-                    console.error(`Error decoding pending chunk for stripe Y=${stripeY}:`, e, chunkToDecode);
-                    // If decode fails here, the decoder might be in a bad state.
-                }
+                try { decoderInfo.decoder.decode(chunkToDecode); } catch (e) { console.error(`Error decoding pending H.264 chunk for Y=${stripeY}:`, e); }
             }
         }
 
@@ -212,7 +231,7 @@
 
         websocket.onclose = function(event) {
             console.log("WebSocket connection closed. Code:", event.code, "Reason:", event.reason);
-            // Clean up all decoders when the WebSocket closes.
+            // Clean up all H.264 decoders when the WebSocket closes to free up resources.
             for (const yPos in stripeDecoders) {
                 if (stripeDecoders.hasOwnProperty(yPos)) {
                     const decoderInfo = stripeDecoders[yPos];
@@ -230,18 +249,58 @@
             for (let key in stripeDecoders) delete stripeDecoders[key];
         };
 
-        // No explicit requestAnimationFrame loop is needed for this version because
-        // VideoDecoder's `output` callback draws directly to the canvas when a frame is ready.
-        // This simplifies the rendering logic for a bare-minimum demo.
+        /**
+         * --- Main Render Loop ---
+         * This function runs on every animation frame, driven by `requestAnimationFrame`.
+         * Its job is to check the render queues for any new data (decoded H.264 frames
+         * or JPEG images) and draw it onto the canvas. This architecture separates the
+         * unpredictable timing of data arrival/decoding from the predictable, smooth
+         * timing of browser painting, preventing visual tearing and stuttering.
+         */
+        function renderLoop() {
+            // Process any decoded H.264 frames waiting in the queue.
+            while (h264RenderQueue.length > 0) {
+                const item = h264RenderQueue.shift();
+                try {
+                    ctx.drawImage(item.frame, 0, item.y);
+                } catch (e) {
+                    console.error("Error drawing H.264 frame:", e);
+                } finally {
+                    // IMPORTANT: Close the frame after drawing to release its underlying memory.
+                    // Failure to do this will result in a significant memory leak.
+                    item.frame.close();
+                }
+            }
 
-        // Graceful shutdown: Close decoders if the window is closed/reloaded.
+            // Process any decoded JPEG images waiting in the queue.
+            while (jpegRenderQueue.length > 0) {
+                const item = jpegRenderQueue.shift();
+                try {
+                    ctx.drawImage(item.image, 0, item.y);
+                } catch (e) {
+                    console.error("Error drawing JPEG image:", e);
+                } finally {
+                    // IMPORTANT: Close the ImageBitmap after drawing to release its memory.
+                    item.image.close();
+                }
+            }
+
+            // Request that the browser call this function again before the next repaint.
+            // This creates a continuous, efficient animation loop.
+            requestAnimationFrame(renderLoop);
+        }
+
+        // Start the render loop.
+        renderLoop();
+
+
+        // Graceful shutdown: Close the WebSocket if the window is closed/reloaded.
         window.addEventListener('beforeunload', () => {
-            console.log("Window is closing. Cleaning up decoders...");
+            console.log("Window is closing. Cleaning up...");
             if (websocket && websocket.readyState === WebSocket.OPEN) {
-                websocket.close(); // Attempt to close WebSocket cleanly.
+                websocket.close();
             }
             // The websocket.onclose handler will then take care of closing individual decoders.
-            // If onclose doesn't fire in time, the browser will clean up, but this is good practice.
         });
 
     </script>
