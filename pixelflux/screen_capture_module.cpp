@@ -761,7 +761,7 @@ bool initialize_nvenc_encoder(int width,
   memset(&g_nvenc_state.init_params, 0, sizeof(g_nvenc_state.init_params));
   g_nvenc_state.init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
   g_nvenc_state.init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
-  g_nvenc_state.init_params.presetGUID = NV_ENC_PRESET_P3_GUID;
+  g_nvenc_state.init_params.presetGUID = NV_ENC_PRESET_P1_GUID;
   g_nvenc_state.init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
   g_nvenc_state.init_params.encodeWidth = width;
   g_nvenc_state.init_params.encodeHeight = height;
