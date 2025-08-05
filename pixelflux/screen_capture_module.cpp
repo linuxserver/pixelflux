@@ -2795,6 +2795,7 @@ private:
                       no_motion_frame_counts[i] = 0;
                       paint_over_sent[i] = false;
                       consecutive_stripe_changes[i]++;
+                      current_jpeg_qualities[i] = local_current_jpeg_quality;
                   } else {
                       send_this_stripe = false;
                       consecutive_stripe_changes[i] = 0;
@@ -2806,6 +2807,7 @@ private:
                           if (local_current_output_mode == OutputMode::JPEG &&
                               local_current_use_paint_over_quality) {
                               send_this_stripe = true;
+                              current_jpeg_qualities[i] = local_current_paint_over_jpeg_quality;
                           } else if (local_current_output_mode == OutputMode::H264) {
                               send_this_stripe = true;
                               is_h264_idr_paintover_this_stripe = true;
