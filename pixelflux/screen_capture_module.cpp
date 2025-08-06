@@ -1394,8 +1394,7 @@ static unsigned int get_log2_val_minus4(unsigned int num) {
  */
 StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
                                           const uint8_t* y_plane, int y_stride,
-                                          const uint8_t* u_plane, int u_stride,
-                                          const uint8_t* v_plane, int v_stride,
+                                          const uint8_t* uv_plane, int uv_stride,
                                           int frame_counter,
                                           bool force_idr_frame) {
     StripeEncodeResult result;
@@ -1435,8 +1434,8 @@ StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
 
         uint8_t* y_dest = (uint8_t*)image_ptr + image.offsets[0];
         uint8_t* uv_dest = (uint8_t*)image_ptr + image.offsets[1];
-        libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
-                           y_dest, image.pitches[0], uv_dest, image.pitches[1], width, height);
+        libyuv::CopyPlane(y_plane, y_stride, y_dest, image.pitches[0], width, height);
+        libyuv::CopyPlane(uv_plane, uv_stride, uv_dest, image.pitches[1], width, height / 2);
         
         funcs.vaUnmapBuffer(g_vaapi_state.display, image.buf);
         status = funcs.vaPutImage(g_vaapi_state.display, current_surface, image.image_id,
@@ -2055,8 +2054,8 @@ private:
 
     this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
     if (local_current_output_mode == OutputMode::H264) {
-        bool use_nv12_planes = !local_use_cpu && this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor && local_vaapi_render_node_index < 0;
-        
+        bool use_nv12_planes = !local_use_cpu && local_current_h264_fullframe && !local_current_h264_fullcolor &&
+                       ((this->is_nvidia_system_detected && local_vaapi_render_node_index < 0) || (local_vaapi_render_node_index >= 0));
         size_t y_plane_size = static_cast<size_t>(local_capture_width_actual) *
                               local_capture_height_actual;
         full_frame_y_plane_.assign(y_plane_size, 0);
@@ -2541,7 +2540,7 @@ private:
               vaapi_444_warning_shown = true;
             }
 
-            bool use_nv12_direct_path = this->nvenc_operational && !this->yuv_planes_are_i444_;
+            bool use_nv12_direct_path = (this->nvenc_operational && !this->yuv_planes_are_i444_) || this->vaapi_operational;
 
             if (use_nv12_direct_path) {
                 libyuv::ARGBToNV12(shm_data_ptr, shm_stride_bytes,
@@ -2859,7 +2858,6 @@ private:
                         local_capture_width_actual, local_capture_height_actual, local_current_target_fps,
                         full_frame_y_plane_.data(), full_frame_y_stride_,
                         full_frame_u_plane_.data(), full_frame_u_stride_,
-                        full_frame_v_plane_.data(), full_frame_v_stride_,
                         this->frame_counter, force_idr
                     );
                 });
