@@ -70,6 +70,8 @@ settings.capture_cursor = True
 # --- Encoding Mode ---
 # 0 for JPEG, 1 for H.264
 settings.output_mode = 1
+# Force CPU encoding and ignore hardware encoders
+capture_settings.use_cpu = False
 
 # --- JPEG Settings ---
 settings.jpeg_quality = 75              # Quality for changed stripes (0-100)

@@ -314,6 +314,7 @@ struct CaptureSettings {
   const char* watermark_path;
   WatermarkLocation watermark_location_enum;
   int vaapi_render_node_index;
+  bool use_cpu;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -339,7 +340,8 @@ struct CaptureSettings {
       capture_cursor(false),
       watermark_path(nullptr),
       watermark_location_enum(WatermarkLocation::NONE),
-      vaapi_render_node_index(-1) {}
+      vaapi_render_node_index(-1),
+      use_cpu(false) {}
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -368,7 +370,7 @@ struct CaptureSettings {
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
                   WatermarkLocation wm_loc = WatermarkLocation::NONE,
-                  int vaapi_idx = -1)
+                  int vaapi_idx = -1, bool use_cpu_flag = false)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -388,7 +390,8 @@ struct CaptureSettings {
       capture_cursor(capture_cursor),
       watermark_path(wm_path),
       watermark_location_enum(wm_loc),
-      vaapi_render_node_index(vaapi_idx) {}
+      vaapi_render_node_index(vaapi_idx),
+      use_cpu(use_cpu_flag) {}
 };
 
 /**
@@ -1704,6 +1707,7 @@ public:
   OutputMode output_mode = OutputMode::H264;
   std::string watermark_path_internal;
   WatermarkLocation watermark_location_internal;
+  bool use_cpu = false;
 
   std::atomic<bool> stop_requested;
   std::thread capture_thread;
@@ -1848,6 +1852,7 @@ public:
     h264_streaming_mode = new_settings.h264_streaming_mode;
     capture_cursor = new_settings.capture_cursor;
     vaapi_render_node_index = new_settings.vaapi_render_node_index;
+    use_cpu = new_settings.use_cpu;
     std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
     bool path_actually_changed_in_settings = (watermark_path_internal != new_wm_path_str);
   
@@ -1875,7 +1880,7 @@ public:
       damage_block_duration, output_mode, h264_crf,
       h264_fullcolor, h264_fullframe, h264_streaming_mode, capture_cursor,
       watermark_path_internal.c_str(), watermark_location_internal,
-      vaapi_render_node_index
+      vaapi_render_node_index, use_cpu
       );
   }
 
@@ -2009,6 +2014,7 @@ private:
     int xfixes_error_base = 0;
     std::string local_watermark_path_setting;
     WatermarkLocation local_watermark_location_setting;
+    bool local_use_cpu;
 
     {
       std::lock_guard<std::mutex> lock(settings_mutex);
@@ -2030,6 +2036,7 @@ private:
       local_current_h264_streaming_mode = h264_streaming_mode;
       local_current_capture_cursor = capture_cursor;
       local_vaapi_render_node_index = vaapi_render_node_index;
+      local_use_cpu = use_cpu;
       local_watermark_path_setting = watermark_path_internal;
       local_watermark_location_setting = watermark_location_internal;
     }
@@ -2048,7 +2055,7 @@ private:
 
     this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
     if (local_current_output_mode == OutputMode::H264) {
-        bool use_nv12_planes = this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor && local_vaapi_render_node_index < 0;
+        bool use_nv12_planes = !local_use_cpu && this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor && local_vaapi_render_node_index < 0;
         
         size_t y_plane_size = static_cast<size_t>(local_capture_width_actual) *
                               local_capture_height_actual;
@@ -2169,7 +2176,7 @@ private:
     this->vaapi_operational = false;
     this->nvenc_operational = false;
 
-    if (local_vaapi_render_node_index >= 0 &&
+    if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
         local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
         if (initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
                                      local_capture_height_actual, local_current_h264_crf)) {
@@ -2180,7 +2187,7 @@ private:
             std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
         }
     } else {
-      if (this->is_nvidia_system_detected &&
+      if (!local_use_cpu && this->is_nvidia_system_detected &&
           local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
         if (initialize_nvenc_encoder(local_capture_width_actual,
                                      local_capture_height_actual,
@@ -2270,6 +2277,7 @@ private:
         local_vaapi_render_node_index = vaapi_render_node_index;
         local_watermark_path_setting = watermark_path_internal;
         local_watermark_location_setting = watermark_location_internal;
+        local_use_cpu = use_cpu;
       }
 
       bool current_watermark_is_actually_loaded_in_loop;
@@ -2363,7 +2371,7 @@ private:
 
         this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
         if (local_current_output_mode == OutputMode::H264) {
-            bool use_nv12_planes = this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor;
+            bool use_nv12_planes = !local_use_cpu && this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor;
             
             size_t y_plane_size = static_cast<size_t>(local_capture_width_actual) *
                                   local_capture_height_actual;

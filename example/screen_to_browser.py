@@ -37,6 +37,8 @@ capture_settings.capture_cursor = False
 # --- Encoding Mode ---
 # Sets the output codec. 0 for JPEG, 1 for H.264.
 capture_settings.output_mode = 1
+# Force CPU encoding and ignore hardware encoders
+capture_settings.use_cpu = False
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
