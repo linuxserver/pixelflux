@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
 
+# Add this new section
+[tool.cibuildwheel.environment]
+LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"
+
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
@@ -15,7 +19,6 @@ before-all = """
         dnf install -y \
             libX11-devel \
             libXext-devel \
-            libjpeg-turbo-devel \
             libev-devel \
             libXcomposite-devel \
             libva-devel \
@@ -45,6 +48,14 @@ before-all = """
                 make -j$(nproc) && \
                 make install); \
         fi && \
+        \
+        (cd /tmp && \
+            git clone --branch 3.1.1 --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git && \
+            cd libjpeg-turbo && \
+            mkdir build && cd build && \
+            cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release && \
+            make -j$(nproc) && \
+            make install) && \
         \
         ldconfig
 
