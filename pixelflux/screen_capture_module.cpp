@@ -2112,6 +2112,25 @@ private:
     }
     Window root_window = DefaultRootWindow(display);
     int screen = DefaultScreen(display);
+    XWindowAttributes attributes;
+    if (XGetWindowAttributes(display, root_window, &attributes)) {
+        if (local_capture_width_actual > attributes.width) {
+            local_capture_width_actual = attributes.width;
+            local_capture_x_offset = 0;
+        }
+        if (local_capture_height_actual > attributes.height) {
+            local_capture_height_actual = attributes.height;
+            local_capture_y_offset = 0;
+        }
+        if (local_capture_x_offset + local_capture_width_actual > attributes.width) {
+            local_capture_x_offset = attributes.width - local_capture_width_actual;
+        }
+        if (local_capture_y_offset + local_capture_height_actual > attributes.height) {
+            local_capture_y_offset = attributes.height - local_capture_height_actual;
+        }
+        if (local_capture_x_offset < 0) local_capture_x_offset = 0;
+        if (local_capture_y_offset < 0) local_capture_y_offset = 0;
+    }
 
     if (!XShmQueryExtension(display)) {
       std::cerr << "Error: X Shared Memory Extension not available!" << std::endl;
