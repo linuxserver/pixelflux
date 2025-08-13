@@ -16,6 +16,8 @@ class CaptureSettings(ctypes.Structure):
         ("damage_block_duration", ctypes.c_int),
         ("output_mode", ctypes.c_int),
         ("h264_crf", ctypes.c_int),
+        ("h264_paintover_crf", ctypes.c_int),
+        ("h264_paintover_burst_frames", ctypes.c_int),
         ("h264_fullcolor", ctypes.c_bool),
         ("h264_fullframe", ctypes.c_bool),
         ("h264_streaming_mode", ctypes.c_bool),

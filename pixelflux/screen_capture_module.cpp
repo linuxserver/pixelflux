@@ -288,12 +288,6 @@ enum class WatermarkLocation : int {
   NONE = 0, TL = 1, TR = 2, BL = 3, BR = 4, MI = 5, AN = 6
 };
 
-/** 
- * @brief Defines static paintover settings for CPU encoding
- */ 
-const int H264_PAINTOVER_BURST_FRAMES = 3;
-const int H264_PAINTOVER_CRF = 18;
-
 /**
  * @brief Holds settings for screen capture and encoding.
  * This struct aggregates all configurable parameters for the capture process,
@@ -313,6 +307,8 @@ struct CaptureSettings {
   int damage_block_duration;
   OutputMode output_mode;
   int h264_crf;
+  int h264_paintover_crf;
+  int h264_paintover_burst_frames;
   bool h264_fullcolor;
   bool h264_fullframe;
   bool h264_streaming_mode;
@@ -340,6 +336,8 @@ struct CaptureSettings {
       damage_block_duration(30),
       output_mode(OutputMode::JPEG),
       h264_crf(25),
+      h264_paintover_crf(18),
+      h264_paintover_burst_frames(5),
       h264_fullcolor(false),
       h264_fullframe(false),
       h264_streaming_mode(false),
@@ -371,7 +369,7 @@ struct CaptureSettings {
    */
   CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
-                  OutputMode om = OutputMode::JPEG, int crf = 25,
+                  OutputMode om = OutputMode::JPEG, int crf = 25, int h264_po_crf = 18, int h264_po_burst = 5,
                   bool h264_fc = false, bool h264_ff = false, bool h264_sm = false,
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
@@ -390,6 +388,8 @@ struct CaptureSettings {
       damage_block_duration(dbd),
       output_mode(om),
       h264_crf(crf),
+      h264_paintover_crf(h264_po_crf),
+      h264_paintover_burst_frames(h264_po_burst),
       h264_fullcolor(h264_fc),
       h264_fullframe(h264_ff),
       h264_streaming_mode(h264_sm),
@@ -706,6 +706,34 @@ bool initialize_nvenc_encoder(int width,
       g_nvenc_state.initialized_qp == target_qp &&
       g_nvenc_state.initialized_buffer_format == target_buffer_format) {
     return true;
+  }
+
+  if (g_nvenc_state.initialized && g_nvenc_state.initialized_width == width &&
+      g_nvenc_state.initialized_height == height &&
+      g_nvenc_state.initialized_buffer_format == target_buffer_format) {
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
+    NV_ENC_CONFIG new_config = g_nvenc_state.encode_config;
+
+    reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    reconfigure_params.reInitEncodeParams = g_nvenc_state.init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
+    
+    new_config.rcParams.constQP.qpInterP = target_qp;
+    new_config.rcParams.constQP.qpIntra = target_qp;
+    new_config.rcParams.constQP.qpInterB = target_qp;
+    
+    bool is_quality_increasing = (target_qp < g_nvenc_state.initialized_qp);
+    reconfigure_params.forceIDR = is_quality_increasing;
+
+    NVENCSTATUS status = g_nvenc_state.nvenc_funcs.nvEncReconfigureEncoder(
+        g_nvenc_state.encoder_session, &reconfigure_params);
+
+    if (status == NV_ENC_SUCCESS) {
+        g_nvenc_state.initialized_qp = target_qp;
+        g_nvenc_state.encode_config = new_config;
+        return true;
+    }
   }
 
   if (g_nvenc_state.initialized) {
@@ -1705,6 +1733,8 @@ public:
   int damage_block_threshold = 15;
   int damage_block_duration = 30;
   int h264_crf = 25;
+  int h264_paintover_crf = 18;
+  int h264_paintover_burst_frames = 5;
   bool h264_fullcolor = false;
   bool h264_fullframe = false;
   bool h264_streaming_mode = false;
@@ -1852,6 +1882,8 @@ public:
     damage_block_duration = new_settings.damage_block_duration;
     output_mode = new_settings.output_mode;
     h264_crf = new_settings.h264_crf;
+    h264_paintover_crf = new_settings.h264_paintover_crf;
+    h264_paintover_burst_frames = new_settings.h264_paintover_burst_frames;
     h264_fullcolor = new_settings.h264_fullcolor;
     h264_fullframe = new_settings.h264_fullframe;
     h264_streaming_mode = new_settings.h264_streaming_mode;
@@ -1883,6 +1915,7 @@ public:
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
       damage_block_duration, output_mode, h264_crf,
+      h264_paintover_crf, h264_paintover_burst_frames,
       h264_fullcolor, h264_fullframe, h264_streaming_mode, capture_cursor,
       watermark_path_internal.c_str(), watermark_location_internal,
       vaapi_render_node_index, use_cpu
@@ -2009,6 +2042,8 @@ private:
     int local_current_damage_block_threshold;
     int local_current_damage_block_duration;
     int local_current_h264_crf;
+    int local_current_h264_paintover_crf;
+    int local_current_h264_paintover_burst_frames;
     bool local_current_h264_fullcolor;
     bool local_current_h264_fullframe;
     bool local_current_h264_streaming_mode;
@@ -2036,6 +2071,8 @@ private:
       local_current_damage_block_duration = damage_block_duration;
       local_current_output_mode = output_mode;
       local_current_h264_crf = h264_crf;
+      local_current_h264_paintover_crf = h264_paintover_crf;
+      local_current_h264_paintover_burst_frames = h264_paintover_burst_frames;
       local_current_h264_fullcolor = h264_fullcolor;
       local_current_h264_fullframe = h264_fullframe;
       local_current_h264_streaming_mode = h264_streaming_mode;
@@ -2295,6 +2332,8 @@ private:
         }
         local_current_output_mode = output_mode;
         local_current_h264_crf = h264_crf;
+        local_current_h264_paintover_crf = h264_paintover_crf;
+        local_current_h264_paintover_burst_frames = h264_paintover_burst_frames;
         local_current_h264_fullcolor = h264_fullcolor;
         local_current_h264_fullframe = h264_fullframe;
         local_current_h264_streaming_mode = h264_streaming_mode;
@@ -2776,7 +2815,7 @@ private:
           int crf_for_encode = local_current_h264_crf;
           if (local_current_output_mode == OutputMode::H264 && h264_paintover_burst_frames_remaining[i] > 0) {
               send_this_stripe = true;
-              crf_for_encode = H264_PAINTOVER_CRF;
+              crf_for_encode = local_current_h264_paintover_crf;
               h264_paintover_burst_frames_remaining[i]--;
               current_hash = calculate_current_hash();
               hash_calculated_this_iteration = true;
@@ -2827,17 +2866,27 @@ private:
                   consecutive_stripe_changes[i] = 0;
                   no_motion_frame_counts[i]++;
                   if (no_motion_frame_counts[i] >= local_current_paint_over_trigger_frames && !paint_over_sent[i]) {
-                      if (local_current_output_mode == OutputMode::JPEG && local_current_use_paint_over_quality) {
+                      if (local_current_output_mode == OutputMode::JPEG && 
+                          local_current_use_paint_over_quality &&
+                          local_current_paint_over_jpeg_quality > local_current_jpeg_quality) {
                           send_this_stripe = true;
                           current_jpeg_qualities[i] = local_current_paint_over_jpeg_quality;
                           paint_over_sent[i] = true;
                       } else if (local_current_output_mode == OutputMode::H264) {
-                          if (H264_PAINTOVER_CRF < local_current_h264_crf) {
+                          if (local_current_use_paint_over_quality && local_current_h264_paintover_crf < local_current_h264_crf) {
                               send_this_stripe = true;
-                              force_idr_for_paintover = true;
-                              crf_for_encode = H264_PAINTOVER_CRF;
-                              h264_paintover_burst_frames_remaining[i] = H264_PAINTOVER_BURST_FRAMES - 1;
                               paint_over_sent[i] = true;
+                              if (this->nvenc_operational) {
+                                  g_nvenc_force_next_idr_global = true;
+                                  h264_paintover_burst_frames_remaining[i] = local_current_h264_paintover_burst_frames - 1;
+                              } else if (this->vaapi_operational) {
+                                  g_vaapi_force_next_idr_global = true;
+                                  h264_paintover_burst_frames_remaining[i] = 0;
+                              } else {
+                                  force_idr_for_paintover = true;
+                                  crf_for_encode = local_current_h264_paintover_crf;
+                                  h264_paintover_burst_frames_remaining[i] = local_current_h264_paintover_burst_frames - 1;
+                              }
                           }
                       }
                   }
@@ -2884,6 +2933,16 @@ private:
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(std::move(task)));
               } else if (this->nvenc_operational) {
+                int target_qp_for_frame = crf_for_encode;
+                if (local_current_use_paint_over_quality && g_nvenc_force_next_idr_global) {
+                    target_qp_for_frame = local_current_h264_paintover_crf;
+                }
+                if (!initialize_nvenc_encoder(local_capture_width_actual, local_capture_height_actual, target_qp_for_frame, local_current_target_fps, local_current_h264_fullcolor)) {
+                    std::cerr << "NVENC: Re-initialization for QP change failed. Disabling NVENC." << std::endl;
+                    this->nvenc_operational = false;
+                    reset_nvenc_encoder();
+                    continue;
+                }
                 std::packaged_task<StripeEncodeResult()> task([=]() {
                     bool force_idr = g_nvenc_force_next_idr_global.exchange(false);
                     return encode_fullframe_nvenc(
@@ -2896,7 +2955,7 @@ private:
                     );
                 });
                 futures.push_back(task.get_future());
-                threads.push_back(std::thread(std::move(task))); 
+                threads.push_back(std::thread(std::move(task)));
               } else {
                 if (force_idr_for_paintover) {
                   std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);

@@ -44,6 +44,10 @@ capture_settings.use_cpu = False
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
 # Good values are typically 18-28.
 capture_settings.h264_crf = 25
+# CRF for H.264 paintover on static content. Used if lower (better) than h264_crf.
+capture_settings.h264_paintover_crf = 18
+# Number of high-quality H.264 frames to send in a burst when a paintover is triggered.
+capture_settings.h264_paintover_burst_frames = 5
 # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
 capture_settings.h264_fullcolor = False
 # Encode full frames instead of just changed stripes.

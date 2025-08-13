@@ -78,10 +78,12 @@ settings.jpeg_quality = 75              # Quality for changed stripes (0-100)
 settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripes (0-100)
 
 # --- H.264 Settings ---
-settings.h264_crf = 23                  # CRF value (0-51, lower is better quality/higher bitrate)
-settings.h264_fullcolor = False         # Use I444 (full color) instead of I420 for software encoding
-settings.h264_fullframe = True          # Encode full frames (required for HW accel) instead of just changed stripes
-settings.h264_streaming_mode = False    # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
+settings.h264_crf = 25                   # CRF value (0-51, lower is better quality/higher bitrate)
+settings.h264_paintover_crf = 18         # CRF for H.264 paintover on static content. Must be lower than h264_crf to activate.
+settings.h264_paintover_burst_frames = 5 # Number of high-quality frames to send in a burst when a paintover is triggered.
+settings.h264_fullcolor = False          # Use I444 (full color) instead of I420 for software encoding
+settings.h264_fullframe = True           # Encode full frames (required for HW accel) instead of just changed stripes
+settings.h264_streaming_mode = False     # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 
 # --- Hardware Acceleration ---
 # Set to >= 0 to enable VA-API on a specific /dev/dri/renderD* node.
