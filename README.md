@@ -73,6 +73,9 @@ settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
 capture_settings.use_cpu = False
 
+# --- Debugging ---
+settings.debug_logging = False # Enable/disable the continuous FPS and settings log to the console.
+
 # --- JPEG Settings ---
 settings.jpeg_quality = 75              # Quality for changed stripes (0-100)
 settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripes (0-100)

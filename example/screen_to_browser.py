@@ -26,6 +26,10 @@ WS_PORT = 9000
 
 capture_settings = CaptureSettings()
 
+# --- Debugging ---
+# Enable/disable the continuous FPS and settings log printed to the console.
+capture_settings.debug_logging = True
+
 # --- Core Capture ---
 capture_settings.capture_width = 1920
 capture_settings.capture_height = 1080

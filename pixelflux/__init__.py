@@ -26,6 +26,7 @@ class CaptureSettings(ctypes.Structure):
         ("watermark_location_enum", ctypes.c_int),
         ("vaapi_render_node_index", ctypes.c_int),
         ("use_cpu", ctypes.c_bool),
+        ("debug_logging", ctypes.c_bool),
     ]
 
 WATERMARK_LOCATION_NONE = 0

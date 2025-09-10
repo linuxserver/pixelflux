@@ -317,6 +317,7 @@ struct CaptureSettings {
   WatermarkLocation watermark_location_enum;
   int vaapi_render_node_index;
   bool use_cpu;
+  bool debug_logging;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -345,7 +346,8 @@ struct CaptureSettings {
       watermark_path(nullptr),
       watermark_location_enum(WatermarkLocation::NONE),
       vaapi_render_node_index(-1),
-      use_cpu(false) {}
+      use_cpu(false),
+      debug_logging(false) {}
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -374,7 +376,7 @@ struct CaptureSettings {
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
                   WatermarkLocation wm_loc = WatermarkLocation::NONE,
-                  int vaapi_idx = -1, bool use_cpu_flag = false)
+                  int vaapi_idx = -1, bool use_cpu_flag = false, bool debug_log = false)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -397,7 +399,8 @@ struct CaptureSettings {
       watermark_path(wm_path),
       watermark_location_enum(wm_loc),
       vaapi_render_node_index(vaapi_idx),
-      use_cpu(use_cpu_flag) {}
+      use_cpu(use_cpu_flag),
+      debug_logging(debug_log) {}
 };
 
 /**
@@ -1743,6 +1746,7 @@ public:
   std::string watermark_path_internal;
   WatermarkLocation watermark_location_internal;
   bool use_cpu = false;
+  bool debug_logging = false;
 
   std::atomic<bool> stop_requested;
   std::thread capture_thread;
@@ -1890,6 +1894,7 @@ public:
     capture_cursor = new_settings.capture_cursor;
     vaapi_render_node_index = new_settings.vaapi_render_node_index;
     use_cpu = new_settings.use_cpu;
+    debug_logging = new_settings.debug_logging;
     std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
     bool path_actually_changed_in_settings = (watermark_path_internal != new_wm_path_str);
   
@@ -1918,7 +1923,7 @@ public:
       h264_paintover_crf, h264_paintover_burst_frames,
       h264_fullcolor, h264_fullframe, h264_streaming_mode, capture_cursor,
       watermark_path_internal.c_str(), watermark_location_internal,
-      vaapi_render_node_index, use_cpu
+      vaapi_render_node_index, use_cpu, debug_logging
       );
   }
 
@@ -2055,6 +2060,7 @@ private:
     std::string local_watermark_path_setting;
     WatermarkLocation local_watermark_location_setting;
     bool local_use_cpu;
+    bool local_debug_logging;
 
     {
       std::lock_guard<std::mutex> lock(settings_mutex);
@@ -2079,6 +2085,7 @@ private:
       local_current_capture_cursor = capture_cursor;
       local_vaapi_render_node_index = vaapi_render_node_index;
       local_use_cpu = use_cpu;
+      local_debug_logging = debug_logging;
       local_watermark_path_setting = watermark_path_internal;
       local_watermark_location_setting = watermark_location_internal;
     }
@@ -2271,6 +2278,66 @@ private:
     std::cout << "CPU cores available: " << num_cores << std::endl;
     int num_stripes_config = num_cores;
 
+    int N_processing_stripes;
+    if (local_capture_height_actual <= 0) {
+      N_processing_stripes = 0;
+    } else {
+      if (local_current_output_mode == OutputMode::H264) {
+        if (local_current_h264_fullframe) {
+          N_processing_stripes = 1;
+        } else {
+          const int MIN_H264_STRIPE_HEIGHT_PX = 64;
+          if (local_capture_height_actual < MIN_H264_STRIPE_HEIGHT_PX) {
+            N_processing_stripes = 1;
+          } else {
+            int max_stripes_by_min_height =
+              local_capture_height_actual / MIN_H264_STRIPE_HEIGHT_PX;
+            N_processing_stripes =
+              std::min(num_stripes_config, max_stripes_by_min_height);
+            if (N_processing_stripes == 0) N_processing_stripes = 1;
+          }
+        }
+      } else {
+        N_processing_stripes =
+          std::min(num_stripes_config, local_capture_height_actual);
+        if (N_processing_stripes == 0 && local_capture_height_actual > 0) {
+          N_processing_stripes = 1;
+        }
+      }
+    }
+    if (N_processing_stripes == 0 && local_capture_height_actual > 0) {
+       N_processing_stripes = 1;
+    }
+    std::stringstream settings_ss;
+    settings_ss << "Stream settings active -> Res: " << local_capture_width_actual << "x"
+                << local_capture_height_actual
+                << " | FPS: " << std::fixed << std::setprecision(1) << local_current_target_fps
+                << " | Stripes: " << N_processing_stripes;
+    if (local_current_output_mode == OutputMode::JPEG) {
+        settings_ss << " | Mode: JPEG";
+        settings_ss << " | Quality: " << local_current_jpeg_quality;
+        if (local_current_use_paint_over_quality) {
+            settings_ss << " | PaintOver Q: " << local_current_paint_over_jpeg_quality
+                        << " (Trigger: " << local_current_paint_over_trigger_frames << "f)";
+        }
+    } else {
+        std::string encoder_type = "CPU";
+        if (this->vaapi_operational) encoder_type = "VAAPI";
+        else if (this->nvenc_operational) encoder_type = "NVENC";
+        settings_ss << " | Mode: H264 (" << encoder_type << ")";
+        settings_ss << (local_current_h264_fullframe ? " FullFrame" : " Striped");
+        if (local_current_h264_streaming_mode) settings_ss << " Streaming";
+        settings_ss << " | CRF: " << local_current_h264_crf;
+        if (local_current_use_paint_over_quality) {
+            settings_ss << " | PaintOver CRF: " << local_current_h264_paintover_crf
+                        << " (Burst: " << local_current_h264_paintover_burst_frames << "f)";
+        }
+        settings_ss << " | Colorspace: " << (local_current_h264_fullcolor ? "I444 (Full Range)" : "I420 (Limited Range)");
+    }
+    settings_ss << " | Damage Thresh: " << local_current_damage_block_threshold << "f"
+                << " | Damage Dur: " << local_current_damage_block_duration << "f";
+    std::cout << settings_ss.str() << std::endl;
+
     std::vector<uint64_t> previous_hashes(num_stripes_config, 0);
     std::vector<int> no_motion_frame_counts(num_stripes_config, 0);
     std::vector<bool> paint_over_sent(num_stripes_config, false);
@@ -2342,6 +2409,7 @@ private:
         local_watermark_path_setting = watermark_path_internal;
         local_watermark_location_setting = watermark_location_internal;
         local_use_cpu = use_cpu;
+        local_debug_logging = debug_logging;
       }
 
       bool current_watermark_is_actually_loaded_in_loop;
@@ -3060,7 +3128,7 @@ private:
           std::chrono::duration_cast<std::chrono::seconds>(
             current_output_time_log - last_output_time);
 
-        if (output_elapsed_time_log.count() >= 1) {
+        if (local_debug_logging && output_elapsed_time_log.count() >= 1) {
           double actual_fps_val =
             (encoded_frame_count > 0 && output_elapsed_time_log.count() > 0)
             ? static_cast<double>(encoded_frame_count) / output_elapsed_time_log.count()
