@@ -91,8 +91,7 @@ static void* g_cuda_lib_handle = nullptr;
  * This struct encapsulates all the necessary handles, parameters, and buffer
  * pools for a single NVENC encoding pipeline. It maintains the CUDA context,
  * the encoder session, configuration details, and pools of input/output
- * buffers to facilitate asynchronous encoding. The state is protected by the
- * global `g_nvenc_mutex`.
+ * buffers to facilitate asynchronous encoding.
  */
 struct NvencEncoderState {
   NV_ENCODE_API_FUNCTION_LIST nvenc_funcs = {0};
@@ -116,9 +115,6 @@ struct NvencEncoderState {
     init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
   }
 };
-NvencEncoderState g_nvenc_state;
-std::mutex g_nvenc_mutex;
-std::atomic<bool> g_nvenc_force_next_idr_global{true};
 
 static void* g_nvenc_lib_handle = nullptr;
 typedef NVENCSTATUS(NVENCAPI* PFN_NvEncodeAPICreateInstance)(
@@ -159,16 +155,15 @@ struct VaapiFunctions {
     VAStatus (*vaPutImage)(VADisplay, VASurfaceID, VAImageID, int, int, unsigned int, unsigned int, int, int, unsigned int, unsigned int) = nullptr;
     VAStatus (*vaGetConfigAttributes)(VADisplay, VAProfile, VAEntrypoint, VAConfigAttrib*, int) = nullptr;
 };
+VaapiFunctions g_vaapi_funcs;
 
 /**
  * @brief Manages the state of a VA-API H.264 encoder session.
  * This struct encapsulates all the necessary handles and configuration for a
  * VA-API encoding pipeline, including the display connection, configuration and
  * context IDs, a pool of surfaces for video frames, and initialization status.
- * It is protected by the global `g_vaapi_mutex`.
  */
 struct VaapiEncoderState {
-    VaapiFunctions va_funcs = {0};
     VADisplay display = nullptr;
     VAConfigID config_id = VA_INVALID_ID;
     VAContextID context_id = VA_INVALID_ID;
@@ -182,10 +177,6 @@ struct VaapiEncoderState {
     unsigned int frame_count = 0;
     VAPictureH264 last_ref_pic;
 };
-
-VaapiEncoderState g_vaapi_state;
-std::mutex g_vaapi_mutex;
-std::atomic<bool> g_vaapi_force_next_idr_global{true};
 
 
 /**
@@ -261,8 +252,6 @@ struct MinimalEncoderStore {
     reset();
   }
 };
-
-MinimalEncoderStore g_h264_minimal_store;
 
 /**
  * @brief Enumerates the possible output modes for encoding.
@@ -554,507 +543,51 @@ void UnloadCudaApi() {
  * This function checks if the API is already loaded. If not, it attempts to load
  * `libnvidia-encode.so.1` or `libnvidia-encode.so` using `dlopen`. It then uses
  * `dlsym` to get the `NvEncodeAPICreateInstance` function and calls it to populate
- * the global `g_nvenc_state.nvenc_funcs` list, which contains pointers to all
- * other NVENC API functions.
+ * the provided function list struct.
  *
  * @return true if the library was loaded and the function list was successfully
  *         populated, false otherwise.
  */
-bool LoadNvencApi() {
-  if (g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx != nullptr) {
+bool LoadNvencApi(NV_ENCODE_API_FUNCTION_LIST& nvenc_funcs) {
+  if (nvenc_funcs.nvEncOpenEncodeSessionEx != nullptr) {
     return true;
   }
-  if (g_nvenc_lib_handle) {
-    dlclose(g_nvenc_lib_handle);
-    g_nvenc_lib_handle = nullptr;
-  }
-  memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-  g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-
-  const char* lib_names[] = {"libnvidia-encode.so.1", "libnvidia-encode.so"};
-  for (const char* name : lib_names) {
-    g_nvenc_lib_handle = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
-    if (g_nvenc_lib_handle) {
-      break;
-    }
+  if (!g_nvenc_lib_handle) {
+      const char* lib_names[] = {"libnvidia-encode.so.1", "libnvidia-encode.so"};
+      for (const char* name : lib_names) {
+        g_nvenc_lib_handle = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
+        if (g_nvenc_lib_handle) {
+          break;
+        }
+      }
   }
 
   if (!g_nvenc_lib_handle) {
     return false;
   }
 
+  memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+  nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+
   PFN_NvEncodeAPICreateInstance NvEncodeAPICreateInstance_func_ptr =
     (PFN_NvEncodeAPICreateInstance)dlsym(g_nvenc_lib_handle, "NvEncodeAPICreateInstance");
 
   if (!NvEncodeAPICreateInstance_func_ptr) {
-    dlclose(g_nvenc_lib_handle);
-    g_nvenc_lib_handle = nullptr;
     return false;
   }
 
-  NVENCSTATUS status = NvEncodeAPICreateInstance_func_ptr(&g_nvenc_state.nvenc_funcs);
+  NVENCSTATUS status = NvEncodeAPICreateInstance_func_ptr(&nvenc_funcs);
   if (status != NV_ENC_SUCCESS) {
-    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-    dlclose(g_nvenc_lib_handle);
-    g_nvenc_lib_handle = nullptr;
+    memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
     return false;
   }
-  if (!g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx) {
-    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-    dlclose(g_nvenc_lib_handle);
-    g_nvenc_lib_handle = nullptr;
+  if (!nvenc_funcs.nvEncOpenEncodeSessionEx) {
+    memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
     return false;
   }
   return true;
-}
-
-/**
- * @brief Resets the global NVENC encoder, releasing all associated resources.
- *
- * This function is thread-safe. If the encoder is initialized, it destroys all
- * allocated input and output buffers, destroys the encoder session, and destroys
- * the associated CUDA context. It then marks the encoder as uninitialized. This
- * is called when capture settings change (e.g., resolution) or when stopping.
- */
-void reset_nvenc_encoder() {
-  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
-
-  if (!g_nvenc_state.initialized) {
-    return;
-  }
-
-  if (g_nvenc_state.encoder_session && g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder) {
-    for (NV_ENC_INPUT_PTR& ptr : g_nvenc_state.input_buffers) {
-        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer)
-            g_nvenc_state.nvenc_funcs.nvEncDestroyInputBuffer(g_nvenc_state.encoder_session, ptr);
-        ptr = nullptr;
-    }
-    g_nvenc_state.input_buffers.clear();
-
-    for (NV_ENC_OUTPUT_PTR& ptr : g_nvenc_state.output_buffers) {
-        if (ptr && g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer)
-            g_nvenc_state.nvenc_funcs.nvEncDestroyBitstreamBuffer(g_nvenc_state.encoder_session, ptr);
-        ptr = nullptr;
-    }
-    g_nvenc_state.output_buffers.clear();
-
-    g_nvenc_state.nvenc_funcs.nvEncDestroyEncoder(g_nvenc_state.encoder_session);
-    g_nvenc_state.encoder_session = nullptr;
-  }
-
-  if (g_nvenc_state.cuda_context && g_cuda_funcs.pfn_cuCtxDestroy) {
-    g_cuda_funcs.pfn_cuCtxDestroy(g_nvenc_state.cuda_context);
-    g_nvenc_state.cuda_context = nullptr;
-  }
-
-  g_nvenc_state.initialized = false;
-}
-
-/**
- * @brief Completely unloads the NVENC library and resets the encoder state.
- *
- * This function is thread-safe. It first calls `reset_nvenc_encoder` to release
- * any active session resources. Then, it calls `dlclose` on the NVENC library
- * handle and clears the global NVENC function list struct.
- */
-void unload_nvenc_library_if_loaded() {
-  std::unique_lock<std::mutex> lock(g_nvenc_mutex); 
-  
-  if (g_nvenc_state.initialized) {
-    lock.unlock();
-    reset_nvenc_encoder();
-    lock.lock();
-  }
-
-  if (g_nvenc_lib_handle) {
-    dlclose(g_nvenc_lib_handle);
-    g_nvenc_lib_handle = nullptr;
-    memset(&g_nvenc_state.nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-    g_nvenc_state.nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-  }
-}
-
-/**
- * @brief Initializes or re-initializes the global NVENC encoder with the specified parameters.
- *
- * This function is thread-safe. It checks if an encoder is already initialized
- * with the exact same parameters. If so, it returns true immediately. Otherwise,
- * it resets any existing encoder and proceeds to create a new CUDA context and
- * NVENC session. It configures the encoder for ultra-low-latency H.264 encoding
- * with the given dimensions, QP, FPS, and colorspace, and allocates a pool of
- * input/output buffers.
- *
- * @param width The width of the video frames to be encoded.
- * @param height The height of the video frames to be encoded.
- * @param target_qp The target Quantization Parameter (QP) for constant quality encoding.
- * @param fps The target frames per second for the encoder.
- * @param use_yuv444 If true, configures the encoder for YUV 4:4:4 (full color);
- *                   if false, uses YUV 4:2:0 (NV12).
- * @return true if the encoder was successfully initialized, false on any failure.
- */
-bool initialize_nvenc_encoder(int width,
-                              int height,
-                              int target_qp,
-                              double fps,
-                              bool use_yuv444) {
-  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
-
-  NV_ENC_BUFFER_FORMAT target_buffer_format =
-    use_yuv444 ? NV_ENC_BUFFER_FORMAT_YUV444 : NV_ENC_BUFFER_FORMAT_NV12;
-
-  if (g_nvenc_state.initialized && g_nvenc_state.initialized_width == width &&
-      g_nvenc_state.initialized_height == height &&
-      g_nvenc_state.initialized_qp == target_qp &&
-      g_nvenc_state.initialized_buffer_format == target_buffer_format) {
-    return true;
-  }
-
-  if (g_nvenc_state.initialized && g_nvenc_state.initialized_width == width &&
-      g_nvenc_state.initialized_height == height &&
-      g_nvenc_state.initialized_buffer_format == target_buffer_format) {
-
-    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
-    NV_ENC_CONFIG new_config = g_nvenc_state.encode_config;
-
-    reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-    reconfigure_params.reInitEncodeParams = g_nvenc_state.init_params;
-    reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
-    
-    new_config.rcParams.constQP.qpInterP = target_qp;
-    new_config.rcParams.constQP.qpIntra = target_qp;
-    new_config.rcParams.constQP.qpInterB = target_qp;
-    
-    bool is_quality_increasing = (target_qp < g_nvenc_state.initialized_qp);
-    reconfigure_params.forceIDR = is_quality_increasing;
-
-    NVENCSTATUS status = g_nvenc_state.nvenc_funcs.nvEncReconfigureEncoder(
-        g_nvenc_state.encoder_session, &reconfigure_params);
-
-    if (status == NV_ENC_SUCCESS) {
-        g_nvenc_state.initialized_qp = target_qp;
-        g_nvenc_state.encode_config = new_config;
-        return true;
-    }
-  }
-
-  if (g_nvenc_state.initialized) {
-    g_nvenc_mutex.unlock();
-    reset_nvenc_encoder();
-    g_nvenc_mutex.lock();
-  }
-
-  if (!LoadCudaApi()) {
-    std::cerr << "NVENC_INIT_FATAL: Failed to load CUDA driver API." << std::endl;
-    return false;
-  }
-
-  if (!g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx) {
-    g_nvenc_state.initialized = false;
-    return false;
-  }
-
-  CUresult cu_status = g_cuda_funcs.pfn_cuInit(0);
-  if (cu_status != CUDA_SUCCESS) {
-      std::cerr << "NVENC_INIT_ERROR: cuInit failed with code " << cu_status << std::endl;
-      return false;
-  }
-  CUdevice cu_device;
-  cu_status = g_cuda_funcs.pfn_cuDeviceGet(&cu_device, 0);
-  if (cu_status != CUDA_SUCCESS) {
-      std::cerr << "NVENC_INIT_ERROR: cuDeviceGet failed with code " << cu_status << std::endl;
-      return false;
-  }
-  cu_status = g_cuda_funcs.pfn_cuCtxCreate(&g_nvenc_state.cuda_context, 0, cu_device);
-  if (cu_status != CUDA_SUCCESS) {
-      std::cerr << "NVENC_INIT_ERROR: cuCtxCreate failed with code " << cu_status << std::endl;
-      return false;
-  }
-
-  NVENCSTATUS status;
-  NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {0};
-  session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
-  session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
-  session_params.device = g_nvenc_state.cuda_context;
-  session_params.apiVersion = NVENCAPI_VERSION;
-
-  status = g_nvenc_state.nvenc_funcs.nvEncOpenEncodeSessionEx(
-    &session_params, &g_nvenc_state.encoder_session);
-
-  if (status != NV_ENC_SUCCESS) {
-    std::string error_str = "NVENC_INIT_ERROR: nvEncOpenEncodeSessionEx (CUDA Path) FAILED: " + std::to_string(status);
-    std::cerr << error_str << std::endl;
-    g_nvenc_state.encoder_session = nullptr;
-    g_nvenc_mutex.unlock();
-    reset_nvenc_encoder();
-    g_nvenc_mutex.lock();
-    return false;
-  }
-  if (!g_nvenc_state.encoder_session) {
-    g_nvenc_mutex.unlock();
-    reset_nvenc_encoder();
-    g_nvenc_mutex.lock();
-    return false;
-  }
-
-  memset(&g_nvenc_state.init_params, 0, sizeof(g_nvenc_state.init_params));
-  g_nvenc_state.init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
-  g_nvenc_state.init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
-  g_nvenc_state.init_params.presetGUID = NV_ENC_PRESET_P1_GUID;
-  g_nvenc_state.init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
-  g_nvenc_state.init_params.encodeWidth = width;
-  g_nvenc_state.init_params.encodeHeight = height;
-  g_nvenc_state.init_params.darWidth = width;
-  g_nvenc_state.init_params.darHeight = height;
-  g_nvenc_state.init_params.frameRateNum = static_cast<uint32_t>(fps < 1.0 ? 30 : fps);
-  g_nvenc_state.init_params.frameRateDen = 1;
-  g_nvenc_state.init_params.enablePTD = 1;
-
-  NV_ENC_PRESET_CONFIG preset_config = {0};
-  preset_config.version = NV_ENC_PRESET_CONFIG_VER;
-  preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
-
-  if (g_nvenc_state.nvenc_funcs.nvEncGetEncodePresetConfigEx) {
-    status = g_nvenc_state.nvenc_funcs.nvEncGetEncodePresetConfigEx(
-      g_nvenc_state.encoder_session,
-      g_nvenc_state.init_params.encodeGUID,
-      g_nvenc_state.init_params.presetGUID,
-      g_nvenc_state.init_params.tuningInfo,
-      &preset_config);
-
-    if (status != NV_ENC_SUCCESS) {
-      std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx FAILED: " << status
-                << ". Falling back to manual config." << std::endl;
-      memset(&g_nvenc_state.encode_config, 0, sizeof(g_nvenc_state.encode_config));
-      g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
-    } else {
-      g_nvenc_state.encode_config = preset_config.presetCfg;
-      g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
-    }
-  } else {
-    std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx not available. Using manual "
-                 "config."
-              << std::endl;
-    memset(&g_nvenc_state.encode_config, 0, sizeof(g_nvenc_state.encode_config));
-    g_nvenc_state.encode_config.version = NV_ENC_CONFIG_VER;
-  }
-
-  g_nvenc_state.encode_config.profileGUID =
-    use_yuv444 ? NV_ENC_H264_PROFILE_HIGH_444_GUID : NV_ENC_H264_PROFILE_HIGH_GUID;
-  g_nvenc_state.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-  g_nvenc_state.encode_config.rcParams.constQP.qpInterP = target_qp;
-  g_nvenc_state.encode_config.rcParams.constQP.qpIntra = target_qp;
-  g_nvenc_state.encode_config.rcParams.constQP.qpInterB = target_qp;
-  g_nvenc_state.encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
-  g_nvenc_state.encode_config.frameIntervalP = 1;
-
-  NV_ENC_CONFIG_H264* h264_cfg = &g_nvenc_state.encode_config.encodeCodecConfig.h264Config;
-  h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
-  h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
-  g_nvenc_state.init_params.encodeConfig = &g_nvenc_state.encode_config;
-
-  status = g_nvenc_state.nvenc_funcs.nvEncInitializeEncoder(g_nvenc_state.encoder_session,
-                                                            &g_nvenc_state.init_params);
-  if (status != NV_ENC_SUCCESS) {
-    std::string error_str =
-      "NVENC_INIT_ERROR: nvEncInitializeEncoder FAILED: " + std::to_string(status);
-    if (g_nvenc_state.nvenc_funcs.nvEncGetLastErrorString) {
-      const char* api_err =
-        g_nvenc_state.nvenc_funcs.nvEncGetLastErrorString(g_nvenc_state.encoder_session);
-      if (api_err)
-        error_str += " - API Error: " + std::string(api_err);
-    }
-    std::cerr << error_str << std::endl;
-
-    g_nvenc_mutex.unlock();
-    reset_nvenc_encoder();
-    g_nvenc_mutex.lock();
-    return false;
-  }
-
-  g_nvenc_state.input_buffers.resize(g_nvenc_state.buffer_pool_size);
-  g_nvenc_state.output_buffers.resize(g_nvenc_state.buffer_pool_size);
-  for (int i = 0; i < g_nvenc_state.buffer_pool_size; ++i) {
-    NV_ENC_CREATE_INPUT_BUFFER icp = {0};
-    icp.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    icp.width = width;
-    icp.height = height;
-    icp.bufferFmt = target_buffer_format;
-    status = g_nvenc_state.nvenc_funcs.nvEncCreateInputBuffer(g_nvenc_state.encoder_session,
-                                                              &icp);
-    if (status != NV_ENC_SUCCESS) {
-      g_nvenc_mutex.unlock();
-      reset_nvenc_encoder();
-      g_nvenc_mutex.lock();
-      return false;
-    }
-    g_nvenc_state.input_buffers[i] = icp.inputBuffer;
-    NV_ENC_CREATE_BITSTREAM_BUFFER ocp = {0};
-    ocp.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    status = g_nvenc_state.nvenc_funcs.nvEncCreateBitstreamBuffer(
-      g_nvenc_state.encoder_session, &ocp);
-    if (status != NV_ENC_SUCCESS) {
-      g_nvenc_mutex.unlock();
-      reset_nvenc_encoder();
-      g_nvenc_mutex.lock();
-      return false;
-    }
-    g_nvenc_state.output_buffers[i] = ocp.bitstreamBuffer;
-  }
-  g_nvenc_state.initialized_width = width;
-  g_nvenc_state.initialized_height = height;
-  g_nvenc_state.initialized_qp = target_qp;
-  g_nvenc_state.initialized_buffer_format = target_buffer_format;
-  g_nvenc_state.initialized = true;
-  return true;
-}
-
-/**
- * @brief Encodes a full frame of YUV data using the pre-initialized global NVENC encoder.
- *
- * This function is thread-safe. It locks an available input buffer from the pool,
- * copies the provided Y, U, and V plane data into it (converting to NV12 if the
- * input is I420), and then submits it to the encoder. After encoding, it locks the
- * corresponding output bitstream buffer, packages the H.264 data into a
- * `StripeEncodeResult` with a custom header, and returns it. It manages a circular
- * pool of input/output buffers to pipeline encoding operations.
- *
- * @param width The width of the input frame.
- * @param height The height of the input frame.
- * @param y_plane Pointer to the Y (luma) plane data.
- * @param y_stride Stride of the Y plane in bytes.
- * @param u_plane Pointer to the U (chroma) plane data (or the interleaved UV plane for NV12).
- * @param u_stride Stride of the U (or UV) plane in bytes.
- * @param v_plane Pointer to the V (chroma) plane data. This should be `nullptr` for NV12 input.
- * @param v_stride Stride of the V plane in bytes. This should be `0` for NV12 input.
- * @param is_i444 True if the input is YUV 4:4:4. For NV12 or I420 input, this is false.
- * @param frame_counter The current frame number, used for timestamping.
- * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame.
- * @return A `StripeEncodeResult` containing the encoded H.264 NAL units and a
- *         custom header. The result's data buffer is dynamically allocated and
- *         must be freed by the caller.
- * @throws std::runtime_error if any NVENC API call fails during the encoding process.
- */
-StripeEncodeResult encode_fullframe_nvenc(int width,
-                                          int height,
-                                          const uint8_t* y_plane, int y_stride,
-                                          const uint8_t* u_plane, int u_stride,
-                                          const uint8_t* v_plane, int v_stride,
-                                          bool is_i444,
-                                          int frame_counter,
-                                          bool force_idr_frame) {
-  StripeEncodeResult result;
-  result.type = StripeDataType::H264;
-  result.stripe_y_start = 0;
-  result.stripe_height = height;
-  result.frame_id = frame_counter;
-
-  std::lock_guard<std::mutex> lock(g_nvenc_mutex);
-
-  if (!g_nvenc_state.initialized) {
-    throw std::runtime_error("NVENC_ENCODE_FATAL: Not initialized.");
-  }
-
-  NV_ENC_INPUT_PTR in_ptr =
-    g_nvenc_state.input_buffers[g_nvenc_state.current_input_buffer_idx];
-  NV_ENC_OUTPUT_PTR out_ptr =
-    g_nvenc_state.output_buffers[g_nvenc_state.current_output_buffer_idx];
-
-  NV_ENC_LOCK_INPUT_BUFFER lip = {0};
-  lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-  lip.inputBuffer = in_ptr;
-  NVENCSTATUS status =
-    g_nvenc_state.nvenc_funcs.nvEncLockInputBuffer(g_nvenc_state.encoder_session, &lip);
-  if (status != NV_ENC_SUCCESS)
-    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockInputBuffer FAILED: " +
-                             std::to_string(status));
-
-  unsigned char* locked_buffer = static_cast<unsigned char*>(lip.bufferDataPtr);
-  int locked_pitch = lip.pitch;
-
-  uint8_t* y_dst = locked_buffer;
-  uint8_t* uv_or_u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
-
-  if (is_i444) {
-    uint8_t* v_dst = uv_or_u_dst + static_cast<size_t>(locked_pitch) * height;
-    libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
-    libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height);
-    libyuv::CopyPlane(v_plane, v_stride, v_dst, locked_pitch, width, height);
-  } else {
-    if (v_plane) {
-        libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
-                            y_dst, locked_pitch, uv_or_u_dst, locked_pitch, width, height);
-    } else {
-        libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
-        libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height / 2);
-    }
-  }
-
-  g_nvenc_state.nvenc_funcs.nvEncUnlockInputBuffer(g_nvenc_state.encoder_session, in_ptr);
-
-  NV_ENC_PIC_PARAMS pp = {0};
-  pp.version = NV_ENC_PIC_PARAMS_VER;
-  pp.inputBuffer = in_ptr;
-  pp.outputBitstream = out_ptr;
-  pp.bufferFmt = g_nvenc_state.initialized_buffer_format;
-  pp.inputWidth = width;
-  pp.inputHeight = height;
-  pp.inputPitch = locked_pitch;
-  pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-  pp.inputTimeStamp = frame_counter;
-  pp.frameIdx = frame_counter;
-  if (force_idr_frame) {
-    pp.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-  }
-
-  status =
-    g_nvenc_state.nvenc_funcs.nvEncEncodePicture(g_nvenc_state.encoder_session, &pp);
-  if (status != NV_ENC_SUCCESS) {
-    std::string err_msg = "NVENC_ENCODE_ERROR: nvEncEncodePicture FAILED: " + std::to_string(status);
-    throw std::runtime_error(err_msg);
-  }
-
-  NV_ENC_LOCK_BITSTREAM lbs = {0};
-  lbs.version = NV_ENC_LOCK_BITSTREAM_VER;
-  lbs.outputBitstream = out_ptr;
-  status =
-    g_nvenc_state.nvenc_funcs.nvEncLockBitstream(g_nvenc_state.encoder_session, &lbs);
-  if (status != NV_ENC_SUCCESS) {
-    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockBitstream FAILED: " + std::to_string(status));
-  }
-
-  if (lbs.bitstreamSizeInBytes > 0) {
-    const unsigned char TAG = 0x04;
-    unsigned char type_hdr = 0x00;
-    if (lbs.pictureType == NV_ENC_PIC_TYPE_IDR) type_hdr = 0x01;
-    else if (lbs.pictureType == NV_ENC_PIC_TYPE_I) type_hdr = 0x02;
-
-    int header_sz = 10;
-    result.data = new unsigned char[lbs.bitstreamSizeInBytes + header_sz];
-    result.size = lbs.bitstreamSizeInBytes + header_sz;
-    result.data[0] = TAG;
-    result.data[1] = type_hdr;
-    uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-    std::memcpy(result.data + 2, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-    std::memcpy(result.data + 4, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(width));
-    std::memcpy(result.data + 6, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(height));
-    std::memcpy(result.data + 8, &net_val, 2);
-    std::memcpy(result.data + header_sz, lbs.bitstreamBufferPtr, lbs.bitstreamSizeInBytes);
-  } else {
-    result.size = 0;
-    result.data = nullptr;
-  }
-
-  g_nvenc_state.nvenc_funcs.nvEncUnlockBitstream(g_nvenc_state.encoder_session, out_ptr);
-
-  g_nvenc_state.current_input_buffer_idx = (g_nvenc_state.current_input_buffer_idx + 1) % g_nvenc_state.buffer_pool_size;
-  g_nvenc_state.current_output_buffer_idx = (g_nvenc_state.current_output_buffer_idx + 1) % g_nvenc_state.buffer_pool_size;
-
-  return result;
 }
 
 /**
@@ -1063,157 +596,81 @@ StripeEncodeResult encode_fullframe_nvenc(int width,
  * This function uses `dlopen` to load `libva.so.2` (or `.1`) and its backend
  * libraries like `libva-drm.so.2`. It then uses `dlsym` to find the addresses
  * of all necessary VA-API functions and stores them in the global
- * `g_vaapi_state.va_funcs` struct. This must be called successfully before
+ * `g_vaapi_funcs` struct. This must be called successfully before
  * any other VA-API operations.
  *
  * @return true if all libraries were loaded and functions were resolved, false otherwise.
  */
 bool LoadVaapiApi() {
-    if (g_vaapi_state.va_funcs.vaInitialize) {
+    if (g_vaapi_funcs.vaInitialize) {
         return true;
     }
 
-    g_vaapi_state.va_funcs.va_lib_handle = dlopen("libva.so.2", RTLD_LAZY);
-    if (!g_vaapi_state.va_funcs.va_lib_handle) {
-        g_vaapi_state.va_funcs.va_lib_handle = dlopen("libva.so.1", RTLD_LAZY);
+    g_vaapi_funcs.va_lib_handle = dlopen("libva.so.2", RTLD_LAZY);
+    if (!g_vaapi_funcs.va_lib_handle) {
+        g_vaapi_funcs.va_lib_handle = dlopen("libva.so.1", RTLD_LAZY);
     }
-    if (!g_vaapi_state.va_funcs.va_lib_handle) {
+    if (!g_vaapi_funcs.va_lib_handle) {
         std::cerr << "VAAPI_API_LOAD: dlopen failed for libva.so" << std::endl;
         return false;
     }
 
-    g_vaapi_state.va_funcs.va_drm_lib_handle = dlopen("libva-drm.so.2", RTLD_LAZY);
-    if (!g_vaapi_state.va_funcs.va_drm_lib_handle) {
-        g_vaapi_state.va_funcs.va_drm_lib_handle = dlopen("libva-drm.so.1", RTLD_LAZY);
+    g_vaapi_funcs.va_drm_lib_handle = dlopen("libva-drm.so.2", RTLD_LAZY);
+    if (!g_vaapi_funcs.va_drm_lib_handle) {
+        g_vaapi_funcs.va_drm_lib_handle = dlopen("libva-drm.so.1", RTLD_LAZY);
     }
-    if (!g_vaapi_state.va_funcs.va_drm_lib_handle) {
+    if (!g_vaapi_funcs.va_drm_lib_handle) {
         std::cerr << "VAAPI_API_LOAD: dlopen failed for libva-drm.so" << std::endl;
-        dlclose(g_vaapi_state.va_funcs.va_lib_handle);
-        g_vaapi_state.va_funcs.va_lib_handle = nullptr;
+        dlclose(g_vaapi_funcs.va_lib_handle);
+        g_vaapi_funcs.va_lib_handle = nullptr;
         return false;
     }
 
-    g_vaapi_state.va_funcs.va_x11_lib_handle = dlopen("libva-x11.so.2", RTLD_LAZY);
-    if (!g_vaapi_state.va_funcs.va_x11_lib_handle) {
-        g_vaapi_state.va_funcs.va_x11_lib_handle = dlopen("libva-x11.so.1", RTLD_LAZY);
+    g_vaapi_funcs.va_x11_lib_handle = dlopen("libva-x11.so.2", RTLD_LAZY);
+    if (!g_vaapi_funcs.va_x11_lib_handle) {
+        g_vaapi_funcs.va_x11_lib_handle = dlopen("libva-x11.so.1", RTLD_LAZY);
     }
 
     auto unload_all_and_fail = [&]() {
         std::cerr << "VAAPI_API_LOAD: dlsym failed for one or more functions." << std::endl;
-        if (g_vaapi_state.va_funcs.va_lib_handle) dlclose(g_vaapi_state.va_funcs.va_lib_handle);
-        if (g_vaapi_state.va_funcs.va_x11_lib_handle) dlclose(g_vaapi_state.va_funcs.va_x11_lib_handle);
-        if (g_vaapi_state.va_funcs.va_drm_lib_handle) dlclose(g_vaapi_state.va_funcs.va_drm_lib_handle);
-        g_vaapi_state.va_funcs = {};
+        if (g_vaapi_funcs.va_lib_handle) dlclose(g_vaapi_funcs.va_lib_handle);
+        if (g_vaapi_funcs.va_x11_lib_handle) dlclose(g_vaapi_funcs.va_x11_lib_handle);
+        if (g_vaapi_funcs.va_drm_lib_handle) dlclose(g_vaapi_funcs.va_drm_lib_handle);
+        g_vaapi_funcs = {};
         return false;
     };
 
     #define LOAD_VA_FUNC(lib, name) \
-        g_vaapi_state.va_funcs.name = (decltype(g_vaapi_state.va_funcs.name))dlsym(lib, #name); \
-        if (!g_vaapi_state.va_funcs.name) return unload_all_and_fail()
+        g_vaapi_funcs.name = (decltype(g_vaapi_funcs.name))dlsym(lib, #name); \
+        if (!g_vaapi_funcs.name) return unload_all_and_fail()
 
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_drm_lib_handle, vaGetDisplayDRM);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaInitialize);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaTerminate);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaQueryVendorString);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateConfig);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyConfig);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateSurfaces);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroySurfaces);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateContext);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyContext);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateBuffer);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyBuffer);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaBeginPicture);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaRenderPicture);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaEndPicture);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaSyncSurface);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaMapBuffer);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaUnmapBuffer);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDeriveImage);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaDestroyImage);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaCreateImage);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaPutImage);
-    LOAD_VA_FUNC(g_vaapi_state.va_funcs.va_lib_handle, vaGetConfigAttributes);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_drm_lib_handle, vaGetDisplayDRM);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaInitialize);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaTerminate);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaQueryVendorString);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaCreateConfig);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDestroyConfig);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaCreateSurfaces);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDestroySurfaces);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaCreateContext);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDestroyContext);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaCreateBuffer);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDestroyBuffer);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaBeginPicture);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaRenderPicture);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaEndPicture);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaSyncSurface);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaMapBuffer);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaUnmapBuffer);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDeriveImage);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaDestroyImage);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaCreateImage);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaPutImage);
+    LOAD_VA_FUNC(g_vaapi_funcs.va_lib_handle, vaGetConfigAttributes);
 
     #undef LOAD_VA_FUNC
 
     return true;
-}
-
-/**
- * @brief Resets the global VA-API encoder, releasing all associated resources.
- *
- * This function is thread-safe. If the encoder is initialized, it destroys the
- * VA context, configuration, surfaces, and coded buffer. It also terminates
- * the display connection and closes the DRM device file descriptor. This is
- * called when capture settings change or when stopping the capture.
- */
-void UnloadVaapiApi() {
-    if (g_vaapi_state.va_funcs.va_lib_handle) {
-        dlclose(g_vaapi_state.va_funcs.va_lib_handle);
-    }
-    if (g_vaapi_state.va_funcs.va_x11_lib_handle) {
-        dlclose(g_vaapi_state.va_funcs.va_x11_lib_handle);
-    }
-    if (g_vaapi_state.va_funcs.va_drm_lib_handle) {
-        dlclose(g_vaapi_state.va_funcs.va_drm_lib_handle);
-    }
-    g_vaapi_state.va_funcs = {};
-}
-
-/**
- * @brief Resets the global VA-API encoder, releasing all associated resources.
- *
- * This function is thread-safe. If the encoder is initialized, it destroys the
- * VA context, configuration, surfaces, and coded buffer. It also terminates
- * the display connection and closes the DRM device file descriptor. This is
- * called when capture settings change or when stopping the capture.
- */
-void reset_vaapi_encoder() {
-    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
-    if (!g_vaapi_state.initialized) {
-        return;
-    }
-
-    auto& funcs = g_vaapi_state.va_funcs;
-    if (g_vaapi_state.context_id != VA_INVALID_ID) {
-        funcs.vaDestroyContext(g_vaapi_state.display, g_vaapi_state.context_id);
-    }
-    if (g_vaapi_state.config_id != VA_INVALID_ID) {
-        funcs.vaDestroyConfig(g_vaapi_state.display, g_vaapi_state.config_id);
-    }
-    if (!g_vaapi_state.surfaces.empty()) {
-        funcs.vaDestroySurfaces(g_vaapi_state.display, g_vaapi_state.surfaces.data(), g_vaapi_state.surfaces.size());
-    }
-    if (g_vaapi_state.coded_buffer_id != VA_INVALID_ID) {
-        funcs.vaDestroyBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id);
-    }
-    if (g_vaapi_state.display) {
-        funcs.vaTerminate(g_vaapi_state.display);
-    }
-    if (g_vaapi_state.fd >= 0) {
-        close(g_vaapi_state.fd);
-    }
-
-    g_vaapi_state = {};
-}
-
-/**
- * @brief Completely unloads the VA-API libraries and resets the encoder state.
- *
- * This function is thread-safe. It first calls `reset_vaapi_encoder` to release
- * any active session resources, then calls `UnloadVaapiApi` to `dlclose` the
- * library handles, ensuring a full cleanup.
- */
-void unload_vaapi_library_if_loaded() {
-    std::unique_lock<std::mutex> lock(g_vaapi_mutex);
-    
-    if (g_vaapi_state.initialized) {
-        lock.unlock();
-        reset_vaapi_encoder();
-        lock.lock();
-    }
-    UnloadVaapiApi();
 }
 
 /**
@@ -1247,142 +704,6 @@ std::vector<std::string> find_vaapi_render_nodes() {
 }
 
 /**
- * @brief Initializes or re-initializes the global VA-API encoder with specified parameters.
- *
- * This function is thread-safe. It checks if an encoder is already initialized with
- * the same parameters. If not, it resets any existing encoder and proceeds to
- * set up a new VA-API encoding session via the DRM backend. This involves:
- * 1. Finding and opening the specified DRM render node.
- * 2. Getting a `VADisplay` from the file descriptor.
- * 3. Initializing the VA-API library connection.
- * 4. Creating an encoder configuration for H.264 with appropriate attributes (e.g., CQP).
- * 5. Allocating a pool of `VASurfaceID`s to hold input video frames.
- * 6. Creating the main encoding `VAContextID`.
- *
- * @param render_node_idx The index of the DRM render node to use from the list
- *                        found by `find_vaapi_render_nodes`.
- * @param width The width of the video frames to be encoded.
- * @param height The height of the video frames to be encoded.
- * @param qp The target Quantization Parameter (QP) for constant quality encoding.
- * @return true if the encoder was successfully initialized, false on any failure.
- */
-bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp) {
-    std::unique_lock<std::mutex> lock(g_vaapi_mutex);
-
-    if (g_vaapi_state.initialized && g_vaapi_state.initialized_width == width &&
-        g_vaapi_state.initialized_height == height && g_vaapi_state.initialized_qp == qp) {
-        return true;
-    }
-
-    if (g_vaapi_state.initialized) {
-        lock.unlock();
-        reset_vaapi_encoder();
-        lock.lock();
-    }
-
-    if (!LoadVaapiApi()) {
-        std::cerr << "VAAPI_INIT: Failed to load VAAPI libraries." << std::endl;
-        return false;
-    }
-
-    auto& funcs = g_vaapi_state.va_funcs;
-    std::vector<std::string> nodes = find_vaapi_render_nodes();
-    if (nodes.empty()) {
-        std::cerr << "VAAPI_INIT: No /dev/dri/renderD nodes found." << std::endl;
-        return false;
-    }
-
-    std::string node_to_use = (render_node_idx >= 0 && render_node_idx < (int)nodes.size()) ? nodes[render_node_idx] : nodes[0];
-    std::cout << "VAAPI_INIT: Using render node: " << node_to_use << std::endl;
-
-    g_vaapi_state.fd = open(node_to_use.c_str(), O_RDWR);
-    if (g_vaapi_state.fd < 0) {
-        std::cerr << "VAAPI_INIT: Failed to open " << node_to_use << std::endl;
-        return false;
-    }
-
-    g_vaapi_state.display = funcs.vaGetDisplayDRM(g_vaapi_state.fd);
-    if (!g_vaapi_state.display) {
-        std::cerr << "VAAPI_INIT: vaGetDisplayDRM failed." << std::endl;
-        close(g_vaapi_state.fd);
-        g_vaapi_state.fd = -1;
-        return false;
-    }
-
-    int major_ver, minor_ver;
-    VAStatus status = funcs.vaInitialize(g_vaapi_state.display, &major_ver, &minor_ver);
-    if (status != VA_STATUS_SUCCESS) {
-        std::cerr << "VAAPI_INIT: vaInitialize failed: " << status << std::endl;
-        return false;
-    }
-    std::cout << "libva info: VA-API version " << major_ver << "." << minor_ver << ".0" << std::endl;
-
-    VAProfile va_profile = VAProfileH264ConstrainedBaseline;
-    VAEntrypoint entrypoint = VAEntrypointEncSlice;
-    std::vector<VAConfigAttrib> attribs;
-    attribs.push_back({VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420});
-
-    VAConfigAttrib query_attrib;
-    query_attrib.type = VAConfigAttribRateControl;
-    if (funcs.vaGetConfigAttributes(g_vaapi_state.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
-        (query_attrib.value & VA_RC_CQP)) {
-        std::cout << "VAAPI_INIT: Driver supports CQP rate control." << std::endl;
-        attribs.push_back({VAConfigAttribRateControl, VA_RC_CQP});
-    } else {
-        std::cout << "VAAPI_INIT: Driver does NOT support CQP. Skipping rate control attribute." << std::endl;
-    }
-
-    query_attrib.type = VAConfigAttribEncPackedHeaders;
-    if (funcs.vaGetConfigAttributes(g_vaapi_state.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
-        (query_attrib.value & VA_ENC_PACKED_HEADER_DATA)) {
-        std::cout << "VAAPI_INIT: Driver supports packed headers." << std::endl;
-        attribs.push_back({VAConfigAttribEncPackedHeaders, VA_ENC_PACKED_HEADER_DATA});
-    } else {
-        std::cout << "VAAPI_INIT: Driver does NOT support packed headers. Skipping attribute." << std::endl;
-    }
-
-    status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
-    if (status != VA_STATUS_SUCCESS) {
-        std::cerr << "VAAPI_INIT: vaCreateConfig failed with Baseline profile: " << status << ". Trying VAProfileH264Main..." << std::endl;
-        va_profile = VAProfileH264Main;
-        status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, attribs.data(), attribs.size(), &g_vaapi_state.config_id);
-        if (status != VA_STATUS_SUCCESS) {
-            std::cerr << "VAAPI_INIT: vaCreateConfig failed with Main profile too: " << status << std::endl;
-            std::cerr << "VAAPI_INIT: Retrying with ONLY VAConfigAttribRTFormat..." << std::endl;
-            VAConfigAttrib minimal_attrib = {VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420};
-            status = funcs.vaCreateConfig(g_vaapi_state.display, va_profile, entrypoint, &minimal_attrib, 1, &g_vaapi_state.config_id);
-            if (status != VA_STATUS_SUCCESS) {
-                std::cerr << "VAAPI_INIT: Failed even with minimal config. Error: " << status << std::endl;
-                return false;
-            }
-            std::cout << "VAAPI_INIT: Minimal config created successfully. Some features may be disabled." << std::endl;
-        }
-    }
-
-    const unsigned int num_surfaces = 4;
-    g_vaapi_state.surfaces.resize(num_surfaces);
-    status = funcs.vaCreateSurfaces(g_vaapi_state.display, VA_RT_FORMAT_YUV420, width, height, g_vaapi_state.surfaces.data(), num_surfaces, nullptr, 0);
-    if (status != VA_STATUS_SUCCESS) {
-        std::cerr << "VAAPI_INIT: vaCreateSurfaces failed: " << status << std::endl;
-        return false;
-    }
-
-    status = funcs.vaCreateContext(g_vaapi_state.display, g_vaapi_state.config_id, width, height, VA_PROGRESSIVE, nullptr, 0, &g_vaapi_state.context_id);
-    if (status != VA_STATUS_SUCCESS) {
-        std::cerr << "VAAPI_INIT: vaCreateContext failed: " << status << std::endl;
-        return false;
-    }
-
-    g_vaapi_state.initialized = true;
-    g_vaapi_state.initialized_width = width;
-    g_vaapi_state.initialized_height = height;
-    g_vaapi_state.initialized_qp = qp;
-    g_vaapi_state.frame_count = 0;
-    std::cout << "VAAPI encoder initialized successfully via DRM backend." << std::endl;
-    return true;
-}
-
-/**
  * @brief Helper function to calculate log2(N) - 4 for H.264 SPS header fields.
  *
  * The H.264 specification requires certain fields in the Sequence Parameter Set
@@ -1401,214 +722,6 @@ static unsigned int get_log2_val_minus4(unsigned int num) {
     if (ret < 4) ret = 4;
     if (ret > 16) ret = 16;
     return ret - 4;
-}
-
-/**
- * @brief Encodes a full frame of YUV data using the pre-initialized global VA-API encoder.
- *
- * This function is thread-safe. It takes raw I420 YUV data and performs one
- * full frame encoding cycle. The process includes:
- * 1. Uploading the I420 data to a hardware surface in NV12 format via `vaPutImage`.
- * 2. Setting up parameter buffers: SPS (on IDR frames), PPS, and Slice parameters.
- * 3. Executing the encoding pipeline with `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture`.
- * 4. Syncing the resulting surface and mapping the output coded buffer to get the bitstream.
- * 5. Packaging the H.264 bitstream into a `StripeEncodeResult` with a custom header.
- *
- * @param width The width of the input frame.
- * @param height The height of the input frame.
- * @param fps The target frames per second, used for SPS timing info.
- * @param y_plane Pointer to the Y (luma) plane data.
- * @param y_stride Stride of the Y plane.
- * @param u_plane Pointer to the U (chroma) plane data.
- * @param u_stride Stride of the U plane.
- * @param v_plane Pointer to the V (chroma) plane data.
- * @param v_stride Stride of the V plane.
- * @param frame_counter The current frame number.
- * @param force_idr_frame If true, forces the encoder to generate an IDR (key) frame
- *                        and include SPS/PPS headers in the bitstream.
- * @return A `StripeEncodeResult` containing the encoded H.264 data.
- * @throws std::runtime_error if any VA-API call fails during the encoding process.
- */
-StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps,
-                                          const uint8_t* y_plane, int y_stride,
-                                          const uint8_t* uv_plane, int uv_stride,
-                                          int frame_counter,
-                                          bool force_idr_frame) {
-    StripeEncodeResult result;
-    result.type = StripeDataType::H264;
-    result.stripe_y_start = 0;
-    result.stripe_height = height;
-    result.frame_id = frame_counter;
-
-    std::lock_guard<std::mutex> lock(g_vaapi_mutex);
-    if (!g_vaapi_state.initialized) {
-        throw std::runtime_error("VAAPI_ENCODE_FATAL: Not initialized.");
-    }
-
-    auto& funcs = g_vaapi_state.va_funcs;
-    VASurfaceID current_surface = g_vaapi_state.surfaces[g_vaapi_state.frame_count % g_vaapi_state.surfaces.size()];
-    VAStatus status;
-
-    if (g_vaapi_state.frame_count == 0) {
-        g_vaapi_state.last_ref_pic = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
-    }
-
-    {
-        VAImage image = {};
-        image.format.fourcc = VA_FOURCC_NV12;
-        image.width = width;
-        image.height = height;
-
-        status = funcs.vaCreateImage(g_vaapi_state.display, &image.format, width, height, &image);
-        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateImage failed: " + std::to_string(status));
-
-        void *image_ptr = nullptr;
-        status = funcs.vaMapBuffer(g_vaapi_state.display, image.buf, &image_ptr);
-        if (status != VA_STATUS_SUCCESS) {
-            funcs.vaDestroyImage(g_vaapi_state.display, image.image_id);
-            throw std::runtime_error("vaMapBuffer for VAImage failed: " + std::to_string(status));
-        }
-
-        uint8_t* y_dest = (uint8_t*)image_ptr + image.offsets[0];
-        uint8_t* uv_dest = (uint8_t*)image_ptr + image.offsets[1];
-        libyuv::CopyPlane(y_plane, y_stride, y_dest, image.pitches[0], width, height);
-        libyuv::CopyPlane(uv_plane, uv_stride, uv_dest, image.pitches[1], width, height / 2);
-        
-        funcs.vaUnmapBuffer(g_vaapi_state.display, image.buf);
-        status = funcs.vaPutImage(g_vaapi_state.display, current_surface, image.image_id,
-                                  0, 0, width, height, 0, 0, width, height);
-        funcs.vaDestroyImage(g_vaapi_state.display, image.image_id);
-        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaPutImage failed: " + std::to_string(status));
-    }
-
-    if (g_vaapi_state.coded_buffer_id == VA_INVALID_ID) {
-        status = funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncCodedBufferType,
-                                      width * height * 3 / 2, 1, nullptr, &g_vaapi_state.coded_buffer_id);
-        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for coded buffer failed.");
-    }
-
-    std::vector<VABufferID> param_buffers;
-    try {
-        if (force_idr_frame) {
-            VAEncSequenceParameterBufferH264 sps = {};
-            const unsigned int gop_size = 30;
-            const unsigned int max_ref_frames_in_gop = 1;
-
-            sps.seq_parameter_set_id = 0;
-            sps.level_idc = 41;
-            sps.intra_idr_period = gop_size;
-            sps.intra_period = gop_size;
-            sps.ip_period = 1;
-            sps.bits_per_second = 0;
-            sps.max_num_ref_frames = max_ref_frames_in_gop;
-            sps.picture_width_in_mbs = (width + 15) / 16;
-            sps.picture_height_in_mbs = (height + 15) / 16;
-            sps.seq_fields.bits.chroma_format_idc = 1;
-            sps.seq_fields.bits.frame_mbs_only_flag = 1;
-            sps.seq_fields.bits.direct_8x8_inference_flag = 1;
-            sps.seq_fields.bits.pic_order_cnt_type = 0;
-            unsigned int log2_max_frame_num_val = get_log2_val_minus4(gop_size);
-            sps.seq_fields.bits.log2_max_frame_num_minus4 = log2_max_frame_num_val;
-            unsigned int poc_val = 1 << (log2_max_frame_num_val + 4 + 1);
-            sps.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = get_log2_val_minus4(poc_val);
-            sps.vui_parameters_present_flag = 1;
-            sps.vui_fields.bits.timing_info_present_flag = 1;
-            sps.vui_fields.bits.fixed_frame_rate_flag = 1;
-            sps.vui_fields.bits.bitstream_restriction_flag = 1;
-            sps.vui_fields.bits.motion_vectors_over_pic_boundaries_flag = 1;
-            sps.vui_fields.bits.aspect_ratio_info_present_flag = 1;
-            sps.aspect_ratio_idc = 255;
-            sps.sar_width = 1;
-            sps.sar_height = 1;
-            sps.num_units_in_tick = 1;
-            sps.time_scale = static_cast<unsigned int>(fps * 2);
-
-            VABufferID buf_id;
-            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncSequenceParameterBufferType, sizeof(sps), 1, &sps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for SPS failed.");
-            param_buffers.push_back(buf_id);
-        }
-
-        {
-            VAEncPictureParameterBufferH264 pps = {};
-            pps.CurrPic = {current_surface, g_vaapi_state.frame_count, 0, static_cast<int32_t>(g_vaapi_state.frame_count * 2), static_cast<int32_t>(g_vaapi_state.frame_count * 2)};
-            for (int i = 0; i < 16; ++i) pps.ReferenceFrames[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
-            if (!force_idr_frame) pps.ReferenceFrames[0] = g_vaapi_state.last_ref_pic;
-            pps.coded_buf = g_vaapi_state.coded_buffer_id;
-            pps.frame_num = g_vaapi_state.frame_count;
-            pps.pic_init_qp = g_vaapi_state.initialized_qp;
-            pps.pic_fields.bits.idr_pic_flag = force_idr_frame ? 1 : 0;
-            pps.pic_fields.bits.reference_pic_flag = 1;
-            pps.pic_fields.bits.entropy_coding_mode_flag = 1;
-            pps.pic_fields.bits.deblocking_filter_control_present_flag = 1;
-            pps.pic_fields.bits.transform_8x8_mode_flag = 1;
-            VABufferID buf_id;
-            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncPictureParameterBufferType, sizeof(pps), 1, &pps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for PPS failed.");
-            param_buffers.push_back(buf_id);
-        }
-
-        {
-            VAEncSliceParameterBufferH264 slice = {};
-            slice.slice_type = force_idr_frame ? 2 : 0;
-            slice.num_macroblocks = ((width + 15) / 16) * ((height + 15) / 16);
-            slice.pic_order_cnt_lsb = (g_vaapi_state.frame_count * 2);
-            for (int i = 0; i < 32; ++i) slice.RefPicList0[i] = slice.RefPicList1[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
-            if (!force_idr_frame) slice.RefPicList0[0] = g_vaapi_state.last_ref_pic;
-            VABufferID buf_id;
-            if (funcs.vaCreateBuffer(g_vaapi_state.display, g_vaapi_state.context_id, VAEncSliceParameterBufferType, sizeof(slice), 1, &slice, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for Slice failed.");
-            param_buffers.push_back(buf_id);
-        }
-    } catch (const std::runtime_error& e) {
-        for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
-        throw;
-    }
-
-    status = funcs.vaBeginPicture(g_vaapi_state.display, g_vaapi_state.context_id, current_surface);
-    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaBeginPicture failed: " + std::to_string(status));
-
-    status = funcs.vaRenderPicture(g_vaapi_state.display, g_vaapi_state.context_id, param_buffers.data(), param_buffers.size());
-    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaRenderPicture failed: " + std::to_string(status));
-
-    status = funcs.vaEndPicture(g_vaapi_state.display, g_vaapi_state.context_id);
-    if (status != VA_STATUS_SUCCESS) {
-        for(VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
-        throw std::runtime_error("vaEndPicture failed: " + std::to_string(status));
-    }
-
-    for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(g_vaapi_state.display, buf_id);
-
-    status = funcs.vaSyncSurface(g_vaapi_state.display, current_surface);
-    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaSyncSurface failed: " + std::to_string(status));
-
-    VACodedBufferSegment* coded_segment = nullptr;
-    status = funcs.vaMapBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id, (void**)&coded_segment);
-    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaMapBuffer for coded data failed: " + std::to_string(status));
-
-    if (coded_segment && coded_segment->size > 0 && coded_segment->buf) {
-        const unsigned char TAG = 0x04;
-        unsigned char type_hdr = (force_idr_frame) ? 0x01 : 0x00;
-        int header_sz = 10;
-        result.data = new unsigned char[coded_segment->size + header_sz];
-        result.size = coded_segment->size + header_sz;
-
-        result.data[0] = TAG;
-        result.data[1] = type_hdr;
-        uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-        std::memcpy(result.data + 2, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-        std::memcpy(result.data + 4, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(width));
-        std::memcpy(result.data + 6, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(height));
-        std::memcpy(result.data + 8, &net_val, 2);
-        std::memcpy(result.data + header_sz, coded_segment->buf, coded_segment->size);
-    }
-
-    funcs.vaUnmapBuffer(g_vaapi_state.display, g_vaapi_state.coded_buffer_id);
-
-    g_vaapi_state.last_ref_pic = {current_surface, g_vaapi_state.frame_count, VA_PICTURE_H264_SHORT_TERM_REFERENCE, 0, 0};
-    g_vaapi_state.frame_count++;
-
-    return result;
 }
 
 /**
@@ -1667,6 +780,7 @@ StripeEncodeResult encode_stripe_jpeg(
  *         all multi-byte fields in network byte order.
  */
 StripeEncodeResult encode_stripe_h264(
+  MinimalEncoderStore& h264_minimal_store,
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -1762,6 +876,14 @@ public:
   bool vaapi_operational = false;
 
 private:
+    MinimalEncoderStore h264_minimal_store_;
+    NvencEncoderState nvenc_state_;
+    std::mutex nvenc_mutex_;
+    std::atomic<bool> nvenc_force_next_idr_{true};
+    VaapiEncoderState vaapi_state_;
+    std::mutex vaapi_mutex_;
+    std::atomic<bool> vaapi_force_next_idr_{true};
+
     std::vector<uint8_t> full_frame_y_plane_;
     std::vector<uint8_t> full_frame_u_plane_;
     std::vector<uint8_t> full_frame_v_plane_;
@@ -1778,6 +900,19 @@ private:
     int watermark_dx_;
     int watermark_dy_;
     mutable std::mutex watermark_data_mutex_;
+
+    void reset_nvenc_encoder();
+    bool initialize_nvenc_encoder(int width, int height, int target_qp, double fps, bool use_yuv444);
+    StripeEncodeResult encode_fullframe_nvenc(int width, int height, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
+    void reset_vaapi_encoder();
+    bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp);
+    StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps, const uint8_t* y_plane, int y_stride, const uint8_t* uv_plane, int uv_stride, int frame_counter, bool force_idr_frame);
+
+    void load_watermark_image();
+    void capture_loop();
+    void overlay_image(int image_height, int image_width, const uint32_t *image_ptr,
+                     int image_x, int image_y, int frame_height, int frame_width,
+                     unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel);
 
 public:
   /**
@@ -1814,55 +949,14 @@ public:
    * the capture loop are read from member variables which should be set
    * via modify_settings() before calling start_capture().
    */
-  void start_capture() {
-    if (capture_thread.joinable()) {
-      stop_capture();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_nvenc_mutex);
-        if (LoadNvencApi()) {
-            is_nvidia_system_detected = true;
-        } else {
-            is_nvidia_system_detected = false;
-        }
-    }
-
-    g_h264_minimal_store.reset();
-
-    nvenc_operational = false;
-    g_nvenc_force_next_idr_global = true;
-
-    stop_requested = false;
-    frame_counter = 0;
-    encoded_frame_count = 0;
-    total_stripes_encoded_this_interval = 0;
-    if (!watermark_path_internal.empty() && watermark_location_internal != WatermarkLocation::NONE) {
-        load_watermark_image();
-    }
-    capture_thread = std::thread(&ScreenCaptureModule::capture_loop, this);
-  }
+  void start_capture();
 
   /**
    * @brief Stops the screen capture process.
    * Sets the stop_requested flag and waits for the capture thread to join.
    * This is a blocking call.
    */
-  void stop_capture() {
-    stop_requested = true;
-    if (capture_thread.joinable()) {
-      capture_thread.join();
-    }
-    if (g_nvenc_state.initialized) {
-      reset_nvenc_encoder();
-    }
-    if (g_vaapi_state.initialized) {
-      reset_vaapi_encoder();
-    }
-    unload_vaapi_library_if_loaded();
-    unload_nvenc_library_if_loaded();
-    UnloadCudaApi();
-  }
+  void stop_capture();
 
   /**
    * @brief Modifies the capture and encoding settings.
@@ -1926,19 +1020,851 @@ public:
       vaapi_render_node_index, use_cpu, debug_logging
       );
   }
+};
 
-private:
+/**
+ * @brief Starts the screen capture process in a new thread.
+ * If a capture thread is already running, this function will stop it first.
+ * It resets all encoder states (CPU, NVENC, VAAPI) and frame counters to
+ * ensure a clean start. It also probes for hardware encoder availability and
+ * pre-loads any configured watermark image. The capture itself runs in the
+ * background. The settings for the capture must be set via `modify_settings`
+ * prior to calling this function.
+ */
+void ScreenCaptureModule::start_capture() {
+    if (capture_thread.joinable()) {
+      stop_capture();
+    }
+    if (LoadNvencApi(nvenc_state_.nvenc_funcs)) {
+      is_nvidia_system_detected = true;
+    } else {
+      is_nvidia_system_detected = false;
+    }
+    h264_minimal_store_.reset();
+    nvenc_operational = false;
+    nvenc_force_next_idr_ = true;
+    vaapi_operational = false;
+    vaapi_force_next_idr_ = true;
+    stop_requested = false;
+    frame_counter = 0;
+    encoded_frame_count = 0;
+    total_stripes_encoded_this_interval = 0;
+    if (!watermark_path_internal.empty() && watermark_location_internal != WatermarkLocation::NONE) {
+      load_watermark_image();
+    }
+    capture_thread = std::thread(&ScreenCaptureModule::capture_loop, this);
+}
 
-  /**
-   * @brief Loads or reloads the watermark image from the configured path.
-   * This function is thread-safe. It reads the watermark path and location
-   * settings under a mutex. If a valid path is provided, it attempts to load
-   * the image using stb_image, converts it to ARGB format, and stores it
-   * internally for overlaying. If the path is empty or loading fails,
-   * any existing watermark is cleared. For animated watermarks, it initializes
-   * or resets the animation parameters.
-   */
-  void load_watermark_image() {
+/**
+ * @brief Stops the screen capture process and releases resources.
+ * This function signals the background capture thread to stop. It is a
+ * blocking call that waits for the thread to finish its current work and
+ * join. After the thread has terminated, it cleans up any active hardware
+ * encoder sessions (NVENC, VAAPI) and unloads associated dynamic libraries.
+ */
+void ScreenCaptureModule::stop_capture() {
+    stop_requested = true;
+    if (capture_thread.joinable()) {
+      capture_thread.join();
+    }
+    if (nvenc_state_.initialized) {
+      reset_nvenc_encoder();
+    }
+    if (vaapi_state_.initialized) {
+      reset_vaapi_encoder();
+    }
+    UnloadCudaApi();
+}
+
+/**
+ * @brief Resets and tears down the current NVENC encoder session.
+ * This function is thread-safe. It destroys all allocated input and output
+ * buffers, destroys the encoder session, and releases the CUDA context.
+ * It ensures that all GPU resources associated with the encoder are freed.
+ */
+void ScreenCaptureModule::reset_nvenc_encoder() {
+  std::lock_guard<std::mutex> lock(nvenc_mutex_);
+
+  if (!nvenc_state_.initialized) {
+    return;
+  }
+
+  if (nvenc_state_.encoder_session && nvenc_state_.nvenc_funcs.nvEncDestroyEncoder) {
+    for (NV_ENC_INPUT_PTR& ptr : nvenc_state_.input_buffers) {
+        if (ptr && nvenc_state_.nvenc_funcs.nvEncDestroyInputBuffer)
+            nvenc_state_.nvenc_funcs.nvEncDestroyInputBuffer(nvenc_state_.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    nvenc_state_.input_buffers.clear();
+
+    for (NV_ENC_OUTPUT_PTR& ptr : nvenc_state_.output_buffers) {
+        if (ptr && nvenc_state_.nvenc_funcs.nvEncDestroyBitstreamBuffer)
+            nvenc_state_.nvenc_funcs.nvEncDestroyBitstreamBuffer(nvenc_state_.encoder_session, ptr);
+        ptr = nullptr;
+    }
+    nvenc_state_.output_buffers.clear();
+
+    nvenc_state_.nvenc_funcs.nvEncDestroyEncoder(nvenc_state_.encoder_session);
+    nvenc_state_.encoder_session = nullptr;
+  }
+
+  if (nvenc_state_.cuda_context && g_cuda_funcs.pfn_cuCtxDestroy) {
+    g_cuda_funcs.pfn_cuCtxDestroy(nvenc_state_.cuda_context);
+    nvenc_state_.cuda_context = nullptr;
+  }
+
+  nvenc_state_.initialized = false;
+}
+
+/**
+ * @brief Initializes or reconfigures the NVENC H.264 encoder.
+ * This function is thread-safe. It sets up a new encoder session if one
+ * is not already active. If an active session exists with the correct
+ * dimensions and color format, it attempts a lightweight reconfiguration for
+ * the target QP (quality). If dimensions or color format have changed, it
+ * performs a full teardown and re-initialization.
+ * @param width The target encoding width.
+ * @param height The target encoding height.
+ * @param target_qp The target Quantization Parameter (lower is higher quality).
+ * @param fps The target frames per second, used for rate control hints.
+ * @param use_yuv444 True to configure for YUV 4:4:4, false for NV12 (4:2:0).
+ * @return True if the encoder is successfully initialized or reconfigured, false otherwise.
+ */
+bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
+                              int height,
+                              int target_qp,
+                              double fps,
+                              bool use_yuv444) {
+  std::lock_guard<std::mutex> lock(nvenc_mutex_);
+
+  NV_ENC_BUFFER_FORMAT target_buffer_format =
+    use_yuv444 ? NV_ENC_BUFFER_FORMAT_YUV444 : NV_ENC_BUFFER_FORMAT_NV12;
+
+  if (nvenc_state_.initialized && nvenc_state_.initialized_width == width &&
+      nvenc_state_.initialized_height == height &&
+      nvenc_state_.initialized_qp == target_qp &&
+      nvenc_state_.initialized_buffer_format == target_buffer_format) {
+    return true;
+  }
+
+  if (nvenc_state_.initialized && nvenc_state_.initialized_width == width &&
+      nvenc_state_.initialized_height == height &&
+      nvenc_state_.initialized_buffer_format == target_buffer_format) {
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
+    NV_ENC_CONFIG new_config = nvenc_state_.encode_config;
+
+    reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    reconfigure_params.reInitEncodeParams = nvenc_state_.init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
+    
+    new_config.rcParams.constQP.qpInterP = target_qp;
+    new_config.rcParams.constQP.qpIntra = target_qp;
+    new_config.rcParams.constQP.qpInterB = target_qp;
+    
+    bool is_quality_increasing = (target_qp < nvenc_state_.initialized_qp);
+    reconfigure_params.forceIDR = is_quality_increasing;
+
+    NVENCSTATUS status = nvenc_state_.nvenc_funcs.nvEncReconfigureEncoder(
+        nvenc_state_.encoder_session, &reconfigure_params);
+
+    if (status == NV_ENC_SUCCESS) {
+        nvenc_state_.initialized_qp = target_qp;
+        nvenc_state_.encode_config = new_config;
+        return true;
+    }
+  }
+
+  if (nvenc_state_.initialized) {
+    // Manually unlock before recursive call to reset, then re-lock.
+    nvenc_mutex_.unlock();
+    reset_nvenc_encoder();
+    nvenc_mutex_.lock();
+  }
+
+  if (!LoadCudaApi()) {
+    std::cerr << "NVENC_INIT_FATAL: Failed to load CUDA driver API." << std::endl;
+    return false;
+  }
+  
+  if (!LoadNvencApi(nvenc_state_.nvenc_funcs)) {
+      nvenc_state_.initialized = false;
+      return false;
+  }
+
+  if (!nvenc_state_.nvenc_funcs.nvEncOpenEncodeSessionEx) {
+    nvenc_state_.initialized = false;
+    return false;
+  }
+
+  CUresult cu_status = g_cuda_funcs.pfn_cuInit(0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuInit failed with code " << cu_status << std::endl;
+      return false;
+  }
+  CUdevice cu_device;
+  cu_status = g_cuda_funcs.pfn_cuDeviceGet(&cu_device, 0);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuDeviceGet failed with code " << cu_status << std::endl;
+      return false;
+  }
+  cu_status = g_cuda_funcs.pfn_cuCtxCreate(&nvenc_state_.cuda_context, 0, cu_device);
+  if (cu_status != CUDA_SUCCESS) {
+      std::cerr << "NVENC_INIT_ERROR: cuCtxCreate failed with code " << cu_status << std::endl;
+      return false;
+  }
+
+  NVENCSTATUS status;
+  NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {0};
+  session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+  session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+  session_params.device = nvenc_state_.cuda_context;
+  session_params.apiVersion = NVENCAPI_VERSION;
+
+  status = nvenc_state_.nvenc_funcs.nvEncOpenEncodeSessionEx(
+    &session_params, &nvenc_state_.encoder_session);
+
+  if (status != NV_ENC_SUCCESS) {
+    std::string error_str = "NVENC_INIT_ERROR: nvEncOpenEncodeSessionEx (CUDA Path) FAILED: " + std::to_string(status);
+    std::cerr << error_str << std::endl;
+    nvenc_state_.encoder_session = nullptr;
+    nvenc_mutex_.unlock();
+    reset_nvenc_encoder();
+    nvenc_mutex_.lock();
+    return false;
+  }
+  if (!nvenc_state_.encoder_session) {
+    nvenc_mutex_.unlock();
+    reset_nvenc_encoder();
+    nvenc_mutex_.lock();
+    return false;
+  }
+
+  memset(&nvenc_state_.init_params, 0, sizeof(nvenc_state_.init_params));
+  nvenc_state_.init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+  nvenc_state_.init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+  nvenc_state_.init_params.presetGUID = NV_ENC_PRESET_P1_GUID;
+  nvenc_state_.init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+  nvenc_state_.init_params.encodeWidth = width;
+  nvenc_state_.init_params.encodeHeight = height;
+  nvenc_state_.init_params.darWidth = width;
+  nvenc_state_.init_params.darHeight = height;
+  nvenc_state_.init_params.frameRateNum = static_cast<uint32_t>(fps < 1.0 ? 30 : fps);
+  nvenc_state_.init_params.frameRateDen = 1;
+  nvenc_state_.init_params.enablePTD = 1;
+
+  NV_ENC_PRESET_CONFIG preset_config = {0};
+  preset_config.version = NV_ENC_PRESET_CONFIG_VER;
+  preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
+
+  if (nvenc_state_.nvenc_funcs.nvEncGetEncodePresetConfigEx) {
+    status = nvenc_state_.nvenc_funcs.nvEncGetEncodePresetConfigEx(
+      nvenc_state_.encoder_session,
+      nvenc_state_.init_params.encodeGUID,
+      nvenc_state_.init_params.presetGUID,
+      nvenc_state_.init_params.tuningInfo,
+      &preset_config);
+
+    if (status != NV_ENC_SUCCESS) {
+      std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx FAILED: " << status
+                << ". Falling back to manual config." << std::endl;
+      memset(&nvenc_state_.encode_config, 0, sizeof(nvenc_state_.encode_config));
+      nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+    } else {
+      nvenc_state_.encode_config = preset_config.presetCfg;
+      nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+    }
+  } else {
+    std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx not available. Using manual "
+                 "config."
+              << std::endl;
+    memset(&nvenc_state_.encode_config, 0, sizeof(nvenc_state_.encode_config));
+    nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+  }
+
+  nvenc_state_.encode_config.profileGUID =
+    use_yuv444 ? NV_ENC_H264_PROFILE_HIGH_444_GUID : NV_ENC_H264_PROFILE_HIGH_GUID;
+  nvenc_state_.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+  nvenc_state_.encode_config.rcParams.constQP.qpInterP = target_qp;
+  nvenc_state_.encode_config.rcParams.constQP.qpIntra = target_qp;
+  nvenc_state_.encode_config.rcParams.constQP.qpInterB = target_qp;
+  nvenc_state_.encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
+  nvenc_state_.encode_config.frameIntervalP = 1;
+
+  NV_ENC_CONFIG_H264* h264_cfg = &nvenc_state_.encode_config.encodeCodecConfig.h264Config;
+  h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
+  h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
+  nvenc_state_.init_params.encodeConfig = &nvenc_state_.encode_config;
+
+  status = nvenc_state_.nvenc_funcs.nvEncInitializeEncoder(nvenc_state_.encoder_session,
+                                                            &nvenc_state_.init_params);
+  if (status != NV_ENC_SUCCESS) {
+    std::string error_str =
+      "NVENC_INIT_ERROR: nvEncInitializeEncoder FAILED: " + std::to_string(status);
+    if (nvenc_state_.nvenc_funcs.nvEncGetLastErrorString) {
+      const char* api_err =
+        nvenc_state_.nvenc_funcs.nvEncGetLastErrorString(nvenc_state_.encoder_session);
+      if (api_err)
+        error_str += " - API Error: " + std::string(api_err);
+    }
+    std::cerr << error_str << std::endl;
+
+    nvenc_mutex_.unlock();
+    reset_nvenc_encoder();
+    nvenc_mutex_.lock();
+    return false;
+  }
+
+  nvenc_state_.input_buffers.resize(nvenc_state_.buffer_pool_size);
+  nvenc_state_.output_buffers.resize(nvenc_state_.buffer_pool_size);
+  for (int i = 0; i < nvenc_state_.buffer_pool_size; ++i) {
+    NV_ENC_CREATE_INPUT_BUFFER icp = {0};
+    icp.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+    icp.width = width;
+    icp.height = height;
+    icp.bufferFmt = target_buffer_format;
+    status = nvenc_state_.nvenc_funcs.nvEncCreateInputBuffer(nvenc_state_.encoder_session,
+                                                              &icp);
+    if (status != NV_ENC_SUCCESS) {
+      nvenc_mutex_.unlock();
+      reset_nvenc_encoder();
+      nvenc_mutex_.lock();
+      return false;
+    }
+    nvenc_state_.input_buffers[i] = icp.inputBuffer;
+    NV_ENC_CREATE_BITSTREAM_BUFFER ocp = {0};
+    ocp.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    status = nvenc_state_.nvenc_funcs.nvEncCreateBitstreamBuffer(
+      nvenc_state_.encoder_session, &ocp);
+    if (status != NV_ENC_SUCCESS) {
+      nvenc_mutex_.unlock();
+      reset_nvenc_encoder();
+      nvenc_mutex_.lock();
+      return false;
+    }
+    nvenc_state_.output_buffers[i] = ocp.bitstreamBuffer;
+  }
+  nvenc_state_.initialized_width = width;
+  nvenc_state_.initialized_height = height;
+  nvenc_state_.initialized_qp = target_qp;
+  nvenc_state_.initialized_buffer_format = target_buffer_format;
+  nvenc_state_.initialized = true;
+  return true;
+}
+
+/**
+ * @brief Encodes a full YUV frame using the initialized NVENC session.
+ * This function is thread-safe. It takes YUV plane data, copies it into a
+ * locked NVENC input buffer, and submits it for encoding. It then retrieves
+ * the resulting H.264 bitstream, prepends a custom 10-byte header, and
+ * returns it.
+ * @param width The width of the frame.
+ * @param height The height of the frame.
+ * @param y_plane Pointer to the Y plane data.
+ * @param y_stride Stride of the Y plane.
+ * @param u_plane Pointer to the U plane (or interleaved UV plane for NV12).
+ * @param u_stride Stride of the U/UV plane.
+ * @param v_plane Pointer to the V plane (used for I444, null for NV12).
+ * @param v_stride Stride of the V plane.
+ * @param is_i444 True if the input is YUV 4:4:4, false if NV12.
+ * @param frame_counter The current frame ID.
+ * @param force_idr_frame True to force the encoder to generate an IDR (key) frame.
+ * @return A StripeEncodeResult containing the encoded H.264 data.
+ * @throws std::runtime_error if any NVENC API call fails during the process.
+ */
+StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
+                                          int height,
+                                          const uint8_t* y_plane, int y_stride,
+                                          const uint8_t* u_plane, int u_stride,
+                                          const uint8_t* v_plane, int v_stride,
+                                          bool is_i444,
+                                          int frame_counter,
+                                          bool force_idr_frame) {
+  StripeEncodeResult result;
+  result.type = StripeDataType::H264;
+  result.stripe_y_start = 0;
+  result.stripe_height = height;
+  result.frame_id = frame_counter;
+
+  std::lock_guard<std::mutex> lock(nvenc_mutex_);
+
+  if (!nvenc_state_.initialized) {
+    throw std::runtime_error("NVENC_ENCODE_FATAL: Not initialized.");
+  }
+
+  NV_ENC_INPUT_PTR in_ptr =
+    nvenc_state_.input_buffers[nvenc_state_.current_input_buffer_idx];
+  NV_ENC_OUTPUT_PTR out_ptr =
+    nvenc_state_.output_buffers[nvenc_state_.current_output_buffer_idx];
+
+  NV_ENC_LOCK_INPUT_BUFFER lip = {0};
+  lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+  lip.inputBuffer = in_ptr;
+  NVENCSTATUS status =
+    nvenc_state_.nvenc_funcs.nvEncLockInputBuffer(nvenc_state_.encoder_session, &lip);
+  if (status != NV_ENC_SUCCESS)
+    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockInputBuffer FAILED: " +
+                             std::to_string(status));
+
+  unsigned char* locked_buffer = static_cast<unsigned char*>(lip.bufferDataPtr);
+  int locked_pitch = lip.pitch;
+
+  uint8_t* y_dst = locked_buffer;
+  uint8_t* uv_or_u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
+
+  if (is_i444) {
+    uint8_t* v_dst = uv_or_u_dst + static_cast<size_t>(locked_pitch) * height;
+    libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
+    libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height);
+    libyuv::CopyPlane(v_plane, v_stride, v_dst, locked_pitch, width, height);
+  } else {
+    if (v_plane) {
+        libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+                            y_dst, locked_pitch, uv_or_u_dst, locked_pitch, width, height);
+    } else {
+        libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
+        libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height / 2);
+    }
+  }
+
+  nvenc_state_.nvenc_funcs.nvEncUnlockInputBuffer(nvenc_state_.encoder_session, in_ptr);
+
+  NV_ENC_PIC_PARAMS pp = {0};
+  pp.version = NV_ENC_PIC_PARAMS_VER;
+  pp.inputBuffer = in_ptr;
+  pp.outputBitstream = out_ptr;
+  pp.bufferFmt = nvenc_state_.initialized_buffer_format;
+  pp.inputWidth = width;
+  pp.inputHeight = height;
+  pp.inputPitch = locked_pitch;
+  pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+  pp.inputTimeStamp = frame_counter;
+  pp.frameIdx = frame_counter;
+  if (force_idr_frame) {
+    pp.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+  }
+
+  status =
+    nvenc_state_.nvenc_funcs.nvEncEncodePicture(nvenc_state_.encoder_session, &pp);
+  if (status != NV_ENC_SUCCESS) {
+    std::string err_msg = "NVENC_ENCODE_ERROR: nvEncEncodePicture FAILED: " + std::to_string(status);
+    throw std::runtime_error(err_msg);
+  }
+
+  NV_ENC_LOCK_BITSTREAM lbs = {0};
+  lbs.version = NV_ENC_LOCK_BITSTREAM_VER;
+  lbs.outputBitstream = out_ptr;
+  status =
+    nvenc_state_.nvenc_funcs.nvEncLockBitstream(nvenc_state_.encoder_session, &lbs);
+  if (status != NV_ENC_SUCCESS) {
+    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockBitstream FAILED: " + std::to_string(status));
+  }
+
+  if (lbs.bitstreamSizeInBytes > 0) {
+    const unsigned char TAG = 0x04;
+    unsigned char type_hdr = 0x00;
+    if (lbs.pictureType == NV_ENC_PIC_TYPE_IDR) type_hdr = 0x01;
+    else if (lbs.pictureType == NV_ENC_PIC_TYPE_I) type_hdr = 0x02;
+
+    int header_sz = 10;
+    result.data = new unsigned char[lbs.bitstreamSizeInBytes + header_sz];
+    result.size = lbs.bitstreamSizeInBytes + header_sz;
+    result.data[0] = TAG;
+    result.data[1] = type_hdr;
+    uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+    std::memcpy(result.data + 2, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+    std::memcpy(result.data + 4, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(width));
+    std::memcpy(result.data + 6, &net_val, 2);
+    net_val = htons(static_cast<uint16_t>(height));
+    std::memcpy(result.data + 8, &net_val, 2);
+    std::memcpy(result.data + header_sz, lbs.bitstreamBufferPtr, lbs.bitstreamSizeInBytes);
+  } else {
+    result.size = 0;
+    result.data = nullptr;
+  }
+
+  nvenc_state_.nvenc_funcs.nvEncUnlockBitstream(nvenc_state_.encoder_session, out_ptr);
+
+  nvenc_state_.current_input_buffer_idx = (nvenc_state_.current_input_buffer_idx + 1) % nvenc_state_.buffer_pool_size;
+  nvenc_state_.current_output_buffer_idx = (nvenc_state_.current_output_buffer_idx + 1) % nvenc_state_.buffer_pool_size;
+
+  return result;
+}
+
+/**
+ * @brief Resets and tears down the current VA-API encoder session.
+ * This function is thread-safe. It destroys the VA context, config, surfaces,
+ * and buffers. It then terminates the VADisplay connection and closes the
+ * underlying DRM render node file descriptor, releasing all associated resources.
+ */
+void ScreenCaptureModule::reset_vaapi_encoder() {
+    std::lock_guard<std::mutex> lock(vaapi_mutex_);
+    if (!vaapi_state_.initialized) {
+        return;
+    }
+
+    auto& funcs = g_vaapi_funcs;
+    if (vaapi_state_.context_id != VA_INVALID_ID) {
+        funcs.vaDestroyContext(vaapi_state_.display, vaapi_state_.context_id);
+    }
+    if (vaapi_state_.config_id != VA_INVALID_ID) {
+        funcs.vaDestroyConfig(vaapi_state_.display, vaapi_state_.config_id);
+    }
+    if (!vaapi_state_.surfaces.empty()) {
+        funcs.vaDestroySurfaces(vaapi_state_.display, vaapi_state_.surfaces.data(), vaapi_state_.surfaces.size());
+    }
+    if (vaapi_state_.coded_buffer_id != VA_INVALID_ID) {
+        funcs.vaDestroyBuffer(vaapi_state_.display, vaapi_state_.coded_buffer_id);
+    }
+    if (vaapi_state_.display) {
+        funcs.vaTerminate(vaapi_state_.display);
+    }
+    if (vaapi_state_.fd >= 0) {
+        close(vaapi_state_.fd);
+    }
+
+    vaapi_state_ = {};
+}
+
+/**
+ * @brief Initializes the VA-API H.264 encoder.
+ * This function is thread-safe. It finds a suitable DRM render node, opens it,
+ * and initializes a VA-API session. It creates the necessary configuration,
+ * context, and a pool of surfaces for encoding. If an encoder is already
+ * initialized with different parameters, it resets it first.
+ * @param render_node_idx The index of the /dev/dri/renderD node to use.
+ * @param width The target encoding width.
+ * @param height The target encoding height.
+ * @param qp The target Quantization Parameter for CQP rate control.
+ * @return True if the encoder is successfully initialized, false otherwise.
+ */
+bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp) {
+    std::unique_lock<std::mutex> lock(vaapi_mutex_);
+
+    if (vaapi_state_.initialized && vaapi_state_.initialized_width == width &&
+        vaapi_state_.initialized_height == height && vaapi_state_.initialized_qp == qp) {
+        return true;
+    }
+
+    if (vaapi_state_.initialized) {
+        lock.unlock();
+        reset_vaapi_encoder();
+        lock.lock();
+    }
+
+    if (!LoadVaapiApi()) {
+        std::cerr << "VAAPI_INIT: Failed to load VAAPI libraries." << std::endl;
+        return false;
+    }
+
+    auto& funcs = g_vaapi_funcs;
+    std::vector<std::string> nodes = find_vaapi_render_nodes();
+    if (nodes.empty()) {
+        std::cerr << "VAAPI_INIT: No /dev/dri/renderD nodes found." << std::endl;
+        return false;
+    }
+
+    std::string node_to_use = (render_node_idx >= 0 && render_node_idx < (int)nodes.size()) ? nodes[render_node_idx] : nodes[0];
+    std::cout << "VAAPI_INIT: Using render node: " << node_to_use << std::endl;
+
+    vaapi_state_.fd = open(node_to_use.c_str(), O_RDWR);
+    if (vaapi_state_.fd < 0) {
+        std::cerr << "VAAPI_INIT: Failed to open " << node_to_use << std::endl;
+        return false;
+    }
+
+    vaapi_state_.display = funcs.vaGetDisplayDRM(vaapi_state_.fd);
+    if (!vaapi_state_.display) {
+        std::cerr << "VAAPI_INIT: vaGetDisplayDRM failed." << std::endl;
+        close(vaapi_state_.fd);
+        vaapi_state_.fd = -1;
+        return false;
+    }
+
+    int major_ver, minor_ver;
+    VAStatus status = funcs.vaInitialize(vaapi_state_.display, &major_ver, &minor_ver);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaInitialize failed: " << status << std::endl;
+        return false;
+    }
+    std::cout << "libva info: VA-API version " << major_ver << "." << minor_ver << ".0" << std::endl;
+
+    VAProfile va_profile = VAProfileH264ConstrainedBaseline;
+    VAEntrypoint entrypoint = VAEntrypointEncSlice;
+    std::vector<VAConfigAttrib> attribs;
+    attribs.push_back({VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420});
+
+    VAConfigAttrib query_attrib;
+    query_attrib.type = VAConfigAttribRateControl;
+    if (funcs.vaGetConfigAttributes(vaapi_state_.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
+        (query_attrib.value & VA_RC_CQP)) {
+        std::cout << "VAAPI_INIT: Driver supports CQP rate control." << std::endl;
+        attribs.push_back({VAConfigAttribRateControl, VA_RC_CQP});
+    } else {
+        std::cout << "VAAPI_INIT: Driver does NOT support CQP. Skipping rate control attribute." << std::endl;
+    }
+
+    query_attrib.type = VAConfigAttribEncPackedHeaders;
+    if (funcs.vaGetConfigAttributes(vaapi_state_.display, va_profile, entrypoint, &query_attrib, 1) == VA_STATUS_SUCCESS &&
+        (query_attrib.value & VA_ENC_PACKED_HEADER_DATA)) {
+        std::cout << "VAAPI_INIT: Driver supports packed headers." << std::endl;
+        attribs.push_back({VAConfigAttribEncPackedHeaders, VA_ENC_PACKED_HEADER_DATA});
+    } else {
+        std::cout << "VAAPI_INIT: Driver does NOT support packed headers. Skipping attribute." << std::endl;
+    }
+
+    status = funcs.vaCreateConfig(vaapi_state_.display, va_profile, entrypoint, attribs.data(), attribs.size(), &vaapi_state_.config_id);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateConfig failed with Baseline profile: " << status << ". Trying VAProfileH264Main..." << std::endl;
+        va_profile = VAProfileH264Main;
+        status = funcs.vaCreateConfig(vaapi_state_.display, va_profile, entrypoint, attribs.data(), attribs.size(), &vaapi_state_.config_id);
+        if (status != VA_STATUS_SUCCESS) {
+            std::cerr << "VAAPI_INIT: vaCreateConfig failed with Main profile too: " << status << std::endl;
+            std::cerr << "VAAPI_INIT: Retrying with ONLY VAConfigAttribRTFormat..." << std::endl;
+            VAConfigAttrib minimal_attrib = {VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420};
+            status = funcs.vaCreateConfig(vaapi_state_.display, va_profile, entrypoint, &minimal_attrib, 1, &vaapi_state_.config_id);
+            if (status != VA_STATUS_SUCCESS) {
+                std::cerr << "VAAPI_INIT: Failed even with minimal config. Error: " << status << std::endl;
+                return false;
+            }
+            std::cout << "VAAPI_INIT: Minimal config created successfully. Some features may be disabled." << std::endl;
+        }
+    }
+
+    const unsigned int num_surfaces = 4;
+    vaapi_state_.surfaces.resize(num_surfaces);
+    status = funcs.vaCreateSurfaces(vaapi_state_.display, VA_RT_FORMAT_YUV420, width, height, vaapi_state_.surfaces.data(), num_surfaces, nullptr, 0);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateSurfaces failed: " << status << std::endl;
+        return false;
+    }
+
+    status = funcs.vaCreateContext(vaapi_state_.display, vaapi_state_.config_id, width, height, VA_PROGRESSIVE, nullptr, 0, &vaapi_state_.context_id);
+    if (status != VA_STATUS_SUCCESS) {
+        std::cerr << "VAAPI_INIT: vaCreateContext failed: " << status << std::endl;
+        return false;
+    }
+
+    vaapi_state_.initialized = true;
+    vaapi_state_.initialized_width = width;
+    vaapi_state_.initialized_height = height;
+    vaapi_state_.initialized_qp = qp;
+    vaapi_state_.frame_count = 0;
+    std::cout << "VAAPI encoder initialized successfully via DRM backend." << std::endl;
+    return true;
+}
+
+/**
+ * @brief Encodes a full NV12 frame using the initialized VA-API session.
+ * This function is thread-safe. It copies the provided YUV data into a VA
+ * surface, sets up the required sequence, picture, and slice parameter buffers,
+ * and submits them to the hardware encoder. It then retrieves the resulting
+ * bitstream, prepends a custom 10-byte header, and returns it.
+ * @param width The width of the frame.
+ * @param height The height of the frame.
+ * @param fps The target frames per second, used for SPS/VUI timing info.
+ * @param y_plane Pointer to the Y plane data.
+ * @param y_stride Stride of the Y plane.
+ * @param uv_plane Pointer to the interleaved UV plane data.
+ * @param uv_stride Stride of the UV plane.
+ * @param frame_counter The current frame ID.
+ * @param force_idr_frame True to force the encoder to generate an IDR (key) frame.
+ * @return A StripeEncodeResult containing the encoded H.264 data.
+ * @throws std::runtime_error if any VA-API call fails during the process.
+ */
+StripeEncodeResult ScreenCaptureModule::encode_fullframe_vaapi(int width, int height, double fps,
+                                          const uint8_t* y_plane, int y_stride,
+                                          const uint8_t* uv_plane, int uv_stride,
+                                          int frame_counter,
+                                          bool force_idr_frame) {
+    StripeEncodeResult result;
+    result.type = StripeDataType::H264;
+    result.stripe_y_start = 0;
+    result.stripe_height = height;
+    result.frame_id = frame_counter;
+
+    std::lock_guard<std::mutex> lock(vaapi_mutex_);
+    if (!vaapi_state_.initialized) {
+        throw std::runtime_error("VAAPI_ENCODE_FATAL: Not initialized.");
+    }
+
+    auto& funcs = g_vaapi_funcs;
+    VASurfaceID current_surface = vaapi_state_.surfaces[vaapi_state_.frame_count % vaapi_state_.surfaces.size()];
+    VAStatus status;
+
+    if (vaapi_state_.frame_count == 0) {
+        vaapi_state_.last_ref_pic = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+    }
+
+    {
+        VAImage image = {};
+        image.format.fourcc = VA_FOURCC_NV12;
+        image.width = width;
+        image.height = height;
+
+        status = funcs.vaCreateImage(vaapi_state_.display, &image.format, width, height, &image);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateImage failed: " + std::to_string(status));
+
+        void *image_ptr = nullptr;
+        status = funcs.vaMapBuffer(vaapi_state_.display, image.buf, &image_ptr);
+        if (status != VA_STATUS_SUCCESS) {
+            funcs.vaDestroyImage(vaapi_state_.display, image.image_id);
+            throw std::runtime_error("vaMapBuffer for VAImage failed: " + std::to_string(status));
+        }
+
+        uint8_t* y_dest = (uint8_t*)image_ptr + image.offsets[0];
+        uint8_t* uv_dest = (uint8_t*)image_ptr + image.offsets[1];
+        libyuv::CopyPlane(y_plane, y_stride, y_dest, image.pitches[0], width, height);
+        libyuv::CopyPlane(uv_plane, uv_stride, uv_dest, image.pitches[1], width, height / 2);
+        
+        funcs.vaUnmapBuffer(vaapi_state_.display, image.buf);
+        status = funcs.vaPutImage(vaapi_state_.display, current_surface, image.image_id,
+                                  0, 0, width, height, 0, 0, width, height);
+        funcs.vaDestroyImage(vaapi_state_.display, image.image_id);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaPutImage failed: " + std::to_string(status));
+    }
+
+    if (vaapi_state_.coded_buffer_id == VA_INVALID_ID) {
+        status = funcs.vaCreateBuffer(vaapi_state_.display, vaapi_state_.context_id, VAEncCodedBufferType,
+                                      width * height * 3 / 2, 1, nullptr, &vaapi_state_.coded_buffer_id);
+        if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for coded buffer failed.");
+    }
+
+    std::vector<VABufferID> param_buffers;
+    try {
+        if (force_idr_frame) {
+            VAEncSequenceParameterBufferH264 sps = {};
+            const unsigned int gop_size = 30;
+            const unsigned int max_ref_frames_in_gop = 1;
+
+            sps.seq_parameter_set_id = 0;
+            sps.level_idc = 41;
+            sps.intra_idr_period = gop_size;
+            sps.intra_period = gop_size;
+            sps.ip_period = 1;
+            sps.bits_per_second = 0;
+            sps.max_num_ref_frames = max_ref_frames_in_gop;
+            sps.picture_width_in_mbs = (width + 15) / 16;
+            sps.picture_height_in_mbs = (height + 15) / 16;
+            sps.seq_fields.bits.chroma_format_idc = 1;
+            sps.seq_fields.bits.frame_mbs_only_flag = 1;
+            sps.seq_fields.bits.direct_8x8_inference_flag = 1;
+            sps.seq_fields.bits.pic_order_cnt_type = 0;
+            unsigned int log2_max_frame_num_val = get_log2_val_minus4(gop_size);
+            sps.seq_fields.bits.log2_max_frame_num_minus4 = log2_max_frame_num_val;
+            unsigned int poc_val = 1 << (log2_max_frame_num_val + 4 + 1);
+            sps.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = get_log2_val_minus4(poc_val);
+            sps.vui_parameters_present_flag = 1;
+            sps.vui_fields.bits.timing_info_present_flag = 1;
+            sps.vui_fields.bits.fixed_frame_rate_flag = 1;
+            sps.vui_fields.bits.bitstream_restriction_flag = 1;
+            sps.vui_fields.bits.motion_vectors_over_pic_boundaries_flag = 1;
+            sps.vui_fields.bits.aspect_ratio_info_present_flag = 1;
+            sps.aspect_ratio_idc = 255;
+            sps.sar_width = 1;
+            sps.sar_height = 1;
+            sps.num_units_in_tick = 1;
+            sps.time_scale = static_cast<unsigned int>(fps * 2);
+
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(vaapi_state_.display, vaapi_state_.context_id, VAEncSequenceParameterBufferType, sizeof(sps), 1, &sps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for SPS failed.");
+            param_buffers.push_back(buf_id);
+        }
+
+        {
+            VAEncPictureParameterBufferH264 pps = {};
+            VAPictureH264 current_va_picture = {current_surface, vaapi_state_.frame_count, 0, static_cast<int32_t>(vaapi_state_.frame_count * 2), static_cast<int32_t>(vaapi_state_.frame_count * 2)};
+            pps.CurrPic = current_va_picture;
+            for (int i = 0; i < 16; ++i) pps.ReferenceFrames[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+            if (!force_idr_frame) pps.ReferenceFrames[0] = vaapi_state_.last_ref_pic;
+            pps.coded_buf = vaapi_state_.coded_buffer_id;
+            pps.frame_num = vaapi_state_.frame_count;
+            pps.pic_init_qp = vaapi_state_.initialized_qp;
+            pps.pic_fields.bits.idr_pic_flag = force_idr_frame ? 1 : 0;
+            pps.pic_fields.bits.reference_pic_flag = 1;
+            pps.pic_fields.bits.entropy_coding_mode_flag = 1;
+            pps.pic_fields.bits.deblocking_filter_control_present_flag = 1;
+            pps.pic_fields.bits.transform_8x8_mode_flag = 1;
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(vaapi_state_.display, vaapi_state_.context_id, VAEncPictureParameterBufferType, sizeof(pps), 1, &pps, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for PPS failed.");
+            param_buffers.push_back(buf_id);
+        }
+
+        {
+            VAEncSliceParameterBufferH264 slice = {};
+            slice.slice_type = force_idr_frame ? 2 : 0;
+            slice.num_macroblocks = ((width + 15) / 16) * ((height + 15) / 16);
+            slice.pic_order_cnt_lsb = (vaapi_state_.frame_count * 2);
+            for (int i = 0; i < 32; ++i) slice.RefPicList0[i] = slice.RefPicList1[i] = {VA_INVALID_ID, VA_PICTURE_H264_INVALID, 0, 0, 0};
+            if (!force_idr_frame) slice.RefPicList0[0] = vaapi_state_.last_ref_pic;
+            VABufferID buf_id;
+            if (funcs.vaCreateBuffer(vaapi_state_.display, vaapi_state_.context_id, VAEncSliceParameterBufferType, sizeof(slice), 1, &slice, &buf_id) != VA_STATUS_SUCCESS) throw std::runtime_error("vaCreateBuffer for Slice failed.");
+            param_buffers.push_back(buf_id);
+        }
+    } catch (const std::runtime_error& e) {
+        for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(vaapi_state_.display, buf_id);
+        throw;
+    }
+
+    status = funcs.vaBeginPicture(vaapi_state_.display, vaapi_state_.context_id, current_surface);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaBeginPicture failed: " + std::to_string(status));
+
+    status = funcs.vaRenderPicture(vaapi_state_.display, vaapi_state_.context_id, param_buffers.data(), param_buffers.size());
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaRenderPicture failed: " + std::to_string(status));
+
+    status = funcs.vaEndPicture(vaapi_state_.display, vaapi_state_.context_id);
+    if (status != VA_STATUS_SUCCESS) {
+        for(VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(vaapi_state_.display, buf_id);
+        throw std::runtime_error("vaEndPicture failed: " + std::to_string(status));
+    }
+
+    for (VABufferID buf_id : param_buffers) funcs.vaDestroyBuffer(vaapi_state_.display, buf_id);
+
+    status = funcs.vaSyncSurface(vaapi_state_.display, current_surface);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaSyncSurface failed: " + std::to_string(status));
+
+    VACodedBufferSegment* coded_segment = nullptr;
+    status = funcs.vaMapBuffer(vaapi_state_.display, vaapi_state_.coded_buffer_id, (void**)&coded_segment);
+    if (status != VA_STATUS_SUCCESS) throw std::runtime_error("vaMapBuffer for coded data failed: " + std::to_string(status));
+
+    if (coded_segment && coded_segment->size > 0 && coded_segment->buf) {
+        const unsigned char TAG = 0x04;
+        unsigned char type_hdr = (force_idr_frame) ? 0x01 : 0x00;
+        int header_sz = 10;
+        result.data = new unsigned char[coded_segment->size + header_sz];
+        result.size = coded_segment->size + header_sz;
+
+        result.data[0] = TAG;
+        result.data[1] = type_hdr;
+        uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+        std::memcpy(result.data + 2, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+        std::memcpy(result.data + 4, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(width));
+        std::memcpy(result.data + 6, &net_val, 2);
+        net_val = htons(static_cast<uint16_t>(height));
+        std::memcpy(result.data + 8, &net_val, 2);
+        std::memcpy(result.data + header_sz, coded_segment->buf, coded_segment->size);
+    }
+
+    funcs.vaUnmapBuffer(vaapi_state_.display, vaapi_state_.coded_buffer_id);
+
+    vaapi_state_.last_ref_pic = {current_surface, vaapi_state_.frame_count, VA_PICTURE_H264_SHORT_TERM_REFERENCE, 0, 0};
+    vaapi_state_.frame_count++;
+
+    return result;
+}
+
+/**
+ * @brief Loads a watermark image from disk into memory.
+ * This function is thread-safe. It reads the image file specified by the
+ * internal watermark path setting using the stb_image library. It then
+ * converts the pixel data to a 32-bit ARGB format suitable for fast
+ * alpha blending in the `overlay_image` function.
+ */
+void ScreenCaptureModule::load_watermark_image() {
     std::string path_for_this_load;
     WatermarkLocation location_for_this_load;
 
@@ -2012,25 +1938,71 @@ private:
       watermark_width_ = 0;
       watermark_height_ = 0;
     }
-  }
+}
 
-  /**
-   * @brief Main loop for the screen capture thread.
-   * This loop continuously captures frames from the screen using XShm, processes them,
-   * and dispatches encoding tasks. It handles:
-   * - X11 and XShm initialization and re-initialization on settings changes.
-   * - Frame pacing to achieve the target FPS.
-   * - Conversion of captured BGRX frames to YUV if H.264 encoding is active.
-   * - Division of the frame into horizontal stripes for parallel processing.
-   * - Damage detection per stripe using hash comparison to identify changed regions.
-   * - Heuristics for paint-over (sending higher quality for static content) and
-   *   damage blocks (sustained encoding for rapidly changing areas).
-   * - Asynchronous encoding of stripes (JPEG or H.264) using a thread pool pattern.
-   * - Invoking a user-provided callback with the encoded stripe data.
-   * - Logging of performance metrics (FPS, encoded stripes/sec).
-   * The loop runs until stop_requested is set to true.
-   */
-  void capture_loop() {
+/**
+ * @brief Overlays a source image onto a destination frame with alpha blending.
+ * This function iterates through the pixels of the source image and blends
+ * them onto the destination frame buffer at the specified coordinates. It
+ * handles transparency based on the alpha channel of the source image.
+ * @param image_height Height of the source image to overlay.
+ * @param image_width Width of the source image to overlay.
+ * @param image_ptr Pointer to the source image data (32-bit ARGB format).
+ * @param image_x The X-coordinate on the destination frame to place the top-left of the source image.
+ * @param image_y The Y-coordinate on the destination frame to place the top-left of the source image.
+ * @param frame_height Height of the destination frame buffer.
+ * @param frame_width Width of the destination frame buffer.
+ * @param frame_ptr Pointer to the destination frame buffer data (BGR or BGRX format).
+ * @param frame_stride_bytes The stride (bytes per row) of the destination frame.
+ * @param frame_bytes_per_pixel The bytes per pixel of the destination frame.
+ */
+void ScreenCaptureModule::overlay_image(int image_height, int image_width, const uint32_t *image_ptr,
+                     int image_x, int image_y, int frame_height, int frame_width,
+                     unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel) {
+    for (int y = 0; y < image_height; ++y) {
+      for (int x = 0; x < image_width; ++x) {
+        uint32_t src_pixel = image_ptr[y * image_width + x];
+        uint8_t alpha = (src_pixel >> 24) & 0xFF;
+        uint8_t red = (src_pixel >> 16) & 0xFF;
+        uint8_t green = (src_pixel >> 8) & 0xFF;
+        uint8_t blue = src_pixel & 0xFF;
+
+        int target_x = image_x + x;
+        int target_y = image_y + y;
+
+        if (target_y >= 0 && target_y < frame_height &&
+            target_x >= 0 && target_x < frame_width) {
+
+          unsigned char *dst_pixel = frame_ptr +
+                                      target_y * frame_stride_bytes +
+                                      target_x * frame_bytes_per_pixel;
+
+          if (alpha == 255)
+          {
+            dst_pixel[0] = blue;
+            dst_pixel[1] = green;
+            dst_pixel[2] = red;
+          }
+          else if (alpha > 0)
+          {
+            dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255;
+            dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255;
+            dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255;
+          }
+        }
+      }
+    }
+}
+
+/**
+ * @brief The main function for the screen capture thread.
+ * This loop continuously captures the screen at the target FPS. It handles
+ * settings changes, screen capture via XShm, optional cursor and watermark
+ * overlaying, color space conversion (BGRX to YUV), damage detection via
+ * hashing, and dispatching encoding tasks to a thread pool. It then collects
+ * the encoded results and invokes the user-provided callback.
+ */
+void ScreenCaptureModule::capture_loop() {
     static bool vaapi_444_warning_shown = false;
     auto start_time_loop = std::chrono::high_resolution_clock::now();
     int frame_count_loop = 0;
@@ -2246,10 +2218,10 @@ private:
 
     if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
         local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
+        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
                                      local_capture_height_actual, local_current_h264_crf)) {
             this->vaapi_operational = true;
-            g_vaapi_force_next_idr_global = true;
+            this->vaapi_force_next_idr_ = true;
             std::cout << "VAAPI Encoder Initialized successfully." << std::endl;
         } else {
             std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
@@ -2257,20 +2229,20 @@ private:
     } else {
       if (!local_use_cpu && this->is_nvidia_system_detected &&
           local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (initialize_nvenc_encoder(local_capture_width_actual,
+        if (this->initialize_nvenc_encoder(local_capture_width_actual,
                                      local_capture_height_actual,
                                      local_current_h264_crf,
                                      local_current_target_fps,
                                      local_current_h264_fullcolor)) {
           this->nvenc_operational = true;
-          g_nvenc_force_next_idr_global = true;
+          this->nvenc_force_next_idr_ = true;
           std::cout << "NVENC Encoder Initialized successfully." << std::endl;
         } else {
           std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
         }
       } else {
-          if (!this->nvenc_operational && g_nvenc_state.initialized) {
-            reset_nvenc_encoder();
+          if (!this->nvenc_operational && this->nvenc_state_.initialized) {
+            this->reset_nvenc_encoder();
           }
       }
     }
@@ -2537,7 +2509,7 @@ private:
         }
 
         std::cout << "XShm and YUV planes re-initialization complete." << std::endl;
-        g_h264_minimal_store.reset();
+        h264_minimal_store_.reset();
       }
 
       if (XShmGetImage(display, root_window, shm_image, local_capture_x_offset, local_capture_y_offset, AllPlanes)) {
@@ -2945,10 +2917,10 @@ private:
                               send_this_stripe = true;
                               paint_over_sent[i] = true;
                               if (this->nvenc_operational) {
-                                  g_nvenc_force_next_idr_global = true;
+                                  this->nvenc_force_next_idr_ = true;
                                   h264_paintover_burst_frames_remaining[i] = local_current_h264_paintover_burst_frames - 1;
                               } else if (this->vaapi_operational) {
-                                  g_vaapi_force_next_idr_global = true;
+                                  this->vaapi_force_next_idr_ = true;
                                   h264_paintover_burst_frames_remaining[i] = 0;
                               } else {
                                   force_idr_for_paintover = true;
@@ -2989,9 +2961,9 @@ private:
                 this->frame_counter));
             } else {
               if (this->vaapi_operational) {
-                std::packaged_task<StripeEncodeResult()> task([=]() {
-                    bool force_idr = g_vaapi_force_next_idr_global.exchange(false);
-                    return encode_fullframe_vaapi(
+                std::packaged_task<StripeEncodeResult()> task([=, this]() {
+                    bool force_idr = this->vaapi_force_next_idr_.exchange(false);
+                    return this->encode_fullframe_vaapi(
                         local_capture_width_actual, local_capture_height_actual, local_current_target_fps,
                         full_frame_y_plane_.data(), full_frame_y_stride_,
                         full_frame_u_plane_.data(), full_frame_u_stride_,
@@ -3002,18 +2974,18 @@ private:
                 threads.push_back(std::thread(std::move(task)));
               } else if (this->nvenc_operational) {
                 int target_qp_for_frame = crf_for_encode;
-                if (local_current_use_paint_over_quality && g_nvenc_force_next_idr_global) {
+                if (local_current_use_paint_over_quality && this->nvenc_force_next_idr_) {
                     target_qp_for_frame = local_current_h264_paintover_crf;
                 }
-                if (!initialize_nvenc_encoder(local_capture_width_actual, local_capture_height_actual, target_qp_for_frame, local_current_target_fps, local_current_h264_fullcolor)) {
+                if (!this->initialize_nvenc_encoder(local_capture_width_actual, local_capture_height_actual, target_qp_for_frame, local_current_target_fps, local_current_h264_fullcolor)) {
                     std::cerr << "NVENC: Re-initialization for QP change failed. Disabling NVENC." << std::endl;
                     this->nvenc_operational = false;
-                    reset_nvenc_encoder();
+                    this->reset_nvenc_encoder();
                     continue;
                 }
-                std::packaged_task<StripeEncodeResult()> task([=]() {
-                    bool force_idr = g_nvenc_force_next_idr_global.exchange(false);
-                    return encode_fullframe_nvenc(
+                std::packaged_task<StripeEncodeResult()> task([=, this]() {
+                    bool force_idr = this->nvenc_force_next_idr_.exchange(false);
+                    return this->encode_fullframe_nvenc(
                         local_capture_width_actual, local_capture_height_actual,
                         full_frame_y_plane_.data(), full_frame_y_stride_,
                         full_frame_u_plane_.data(), full_frame_u_stride_,
@@ -3026,10 +2998,10 @@ private:
                 threads.push_back(std::thread(std::move(task)));
               } else {
                 if (force_idr_for_paintover) {
-                  std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-                  g_h264_minimal_store.ensure_size(i);
-                  if (i < static_cast<int>(g_h264_minimal_store.force_idr_flags.size())) {
-                      g_h264_minimal_store.force_idr_flags[i] = true;
+                  std::lock_guard<std::mutex> lock(h264_minimal_store_.store_mutex);
+                  h264_minimal_store_.ensure_size(i);
+                  if (i < static_cast<int>(h264_minimal_store_.force_idr_flags.size())) {
+                      h264_minimal_store_.force_idr_flags[i] = true;
                   }
                 }
 
@@ -3043,13 +3015,13 @@ private:
                      start_y : (start_y / 2)) * full_frame_v_stride_);
 
                 std::packaged_task<StripeEncodeResult(
-                  int, int, int, int,
-                  const uint8_t*, int, const uint8_t*, int, const uint8_t*, int,
-                  bool, int, int, int, bool, bool)>
+                  MinimalEncoderStore&, int, int, int, int, const uint8_t*, int,
+                  const uint8_t*, int, const uint8_t*, int, bool, int, int, int, bool,
+                  bool)>
                   task(encode_stripe_h264);
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(
-                  std::move(task), i, start_y, current_stripe_height,
+                  std::move(task), std::ref(h264_minimal_store_), i, start_y, current_stripe_height,
                   local_capture_width_actual,
                   y_plane_for_thread, full_frame_y_stride_,
                   u_plane_for_thread, full_frame_u_stride_,
@@ -3077,14 +3049,14 @@ private:
                 std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
                 std::cerr << "Disabling NVENC for this session due to runtime error." << std::endl;
                 this->nvenc_operational = false;
-                reset_nvenc_encoder();
-                g_nvenc_force_next_idr_global = true;
+                this->reset_nvenc_encoder();
+                this->nvenc_force_next_idr_ = true;
             } else if (std::string(e.what()).find("VAAPI_") != std::string::npos) {
                 std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
                 std::cerr << "Disabling VAAPI for this session due to runtime error." << std::endl;
                 this->vaapi_operational = false;
-                reset_vaapi_encoder();
-                g_vaapi_force_next_idr_global = true;
+                this->reset_vaapi_encoder();
+                this->vaapi_force_next_idr_ = true;
             } else {
                 std::cerr << "ENCODE_THREAD_ERROR: " << e.what() << std::endl;
             }
@@ -3187,70 +3159,7 @@ private:
         display = nullptr;
     }
     std::cout << "Capture loop stopped. X resources released." << std::endl;
-  }
-
-  /**
-   * @brief Overlays a 32-bit ARGB image onto a BGR(X) frame buffer with alpha blending support.
-   *
-   * This function takes a source image in 32-bit ARGB format and overlays it at a specified
-   * position (image_x, image_y) onto a destination frame buffer that is assumed to be in
-   * BGR or BGRX format. It supports transparency via the alpha channel:
-   * - Fully opaque pixels are copied directly.
-   * - Partially transparent pixels are blended with the existing pixel color.
-   * - Fully transparent pixels are skipped.
-   *
-   * @param image_height Height of the source image in pixels.
-   * @param image_width Width of the source image in pixels.
-   * @param image_ptr Pointer to the source image data in 32-bit ARGB format.
-   *                  Pixels are stored as uint32_t values: (A << 24) | (R << 16) | (G << 8) | B
-   * @param image_x X-coordinate (left) where the image should be placed on the frame.
-   * @param image_y Y-coordinate (top) where the image should be placed on the frame.
-   * @param frame_height Total height of the destination frame buffer in pixels.
-   * @param frame_width Total width of the destination frame buffer in pixels.
-   * @param frame_ptr Pointer to the destination frame buffer in BGR or BGRX format.
-   *                  Each pixel is represented by 3 or 4 bytes per pixel respectively.
-   * @param frame_stride_bytes Number of bytes per row in the destination frame buffer.
-   * @param frame_bytes_per_pixel Number of bytes used to represent a single pixel in the frame buffer.
-   *                              Expected value is 3 (BGR) or 4 (BGRX).
-   */
-  void overlay_image(int image_height, int image_width, const uint32_t *image_ptr,
-                     int image_x, int image_y, int frame_height, int frame_width,
-                     unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel) {
-    for (int y = 0; y < image_height; ++y) {
-      for (int x = 0; x < image_width; ++x) {
-        uint32_t src_pixel = image_ptr[y * image_width + x];
-        uint8_t alpha = (src_pixel >> 24) & 0xFF;
-        uint8_t red = (src_pixel >> 16) & 0xFF;
-        uint8_t green = (src_pixel >> 8) & 0xFF;
-        uint8_t blue = src_pixel & 0xFF;
-
-        int target_x = image_x + x;
-        int target_y = image_y + y;
-
-        if (target_y >= 0 && target_y < frame_height &&
-            target_x >= 0 && target_x < frame_width) {
-
-          unsigned char *dst_pixel = frame_ptr +
-                                      target_y * frame_stride_bytes +
-                                      target_x * frame_bytes_per_pixel;
-
-          if (alpha == 255)
-          {
-            dst_pixel[0] = blue;
-            dst_pixel[1] = green;
-            dst_pixel[2] = red;
-          }
-          else if (alpha > 0)
-          {
-            dst_pixel[0] = (blue * alpha + dst_pixel[0] * (255 - alpha)) / 255;
-            dst_pixel[1] = (green * alpha + dst_pixel[1] * (255 - alpha)) / 255;
-            dst_pixel[2] = (red * alpha + dst_pixel[2] * (255 - alpha)) / 255;
-          }
-        }
-      }
-    }
-  }
-};
+}
 
 /**
  * @brief Encodes a horizontal stripe of an image from shared memory into JPEG format.
@@ -3375,14 +3284,15 @@ StripeEncodeResult encode_stripe_jpeg(
 /**
  * @brief Encodes a horizontal YUV stripe into an H.264 bitstream using x264.
  *
- * Manages a thread-specific x264 encoder instance from the global store,
- * `g_h264_minimal_store`. The encoder is re-initialized if input parameters
+ * Manages a thread-specific x264 encoder instance from the provided encoder store.
+ * The encoder is re-initialized if input parameters
  * such as resolution or colorspace change. The CRF can be reconfigured
  * between frames without a full re-initialization.
  *
  * The output NAL units are packaged into a StripeEncodeResult with a custom
  * 10-byte header.
  *
+ * @param h264_minimal_store A reference to the encoder store for this instance.
  * @param thread_id         Identifier for the calling thread, used to select a
  *                          dedicated encoder instance.
  * @param stripe_y_start    The Y-coordinate of the stripe's top edge.
@@ -3404,6 +3314,7 @@ StripeEncodeResult encode_stripe_jpeg(
  *                          freed by the caller.
  */
 StripeEncodeResult encode_stripe_h264(
+  MinimalEncoderStore& h264_minimal_store,
   int thread_id,
   int stripe_y_start,
   int stripe_height,
@@ -3459,37 +3370,37 @@ StripeEncodeResult encode_stripe_h264(
   }
 
   {
-    std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-    g_h264_minimal_store.ensure_size(thread_id);
+    std::lock_guard<std::mutex> lock(h264_minimal_store.store_mutex);
+    h264_minimal_store.ensure_size(thread_id);
 
-    bool is_first_init = !g_h264_minimal_store.initialized_flags[thread_id];
+    bool is_first_init = !h264_minimal_store.initialized_flags[thread_id];
     bool dims_changed = !is_first_init &&
-                        (g_h264_minimal_store.initialized_widths[thread_id] !=
+                        (h264_minimal_store.initialized_widths[thread_id] !=
                             capture_width_actual ||
-                         g_h264_minimal_store.initialized_heights[thread_id] !=
+                         h264_minimal_store.initialized_heights[thread_id] !=
                             stripe_height);
     bool cs_or_fr_changed = !is_first_init &&
-                            (g_h264_minimal_store.initialized_csps[thread_id] !=
+                            (h264_minimal_store.initialized_csps[thread_id] !=
                                 target_x264_csp ||
-                             g_h264_minimal_store.initialized_colorspaces[thread_id] !=
+                             h264_minimal_store.initialized_colorspaces[thread_id] !=
                                 colorspace_setting ||
-                             g_h264_minimal_store.initialized_full_range_flags[thread_id] !=
+                             h264_minimal_store.initialized_full_range_flags[thread_id] !=
                                 use_full_range);
 
     bool needs_crf_reinit = false;
     if (!is_first_init &&
-        g_h264_minimal_store.initialized_crfs[thread_id] != current_crf_setting) {
+        h264_minimal_store.initialized_crfs[thread_id] != current_crf_setting) {
         needs_crf_reinit = true;
     }
 
     bool perform_full_reinit = is_first_init || dims_changed || cs_or_fr_changed;
 
     if (perform_full_reinit) {
-      if (g_h264_minimal_store.encoders[thread_id]) {
-        x264_encoder_close(g_h264_minimal_store.encoders[thread_id]);
-        g_h264_minimal_store.encoders[thread_id] = nullptr;
+      if (h264_minimal_store.encoders[thread_id]) {
+        x264_encoder_close(h264_minimal_store.encoders[thread_id]);
+        h264_minimal_store.encoders[thread_id] = nullptr;
       }
-      g_h264_minimal_store.initialized_flags[thread_id] = false;
+      h264_minimal_store.initialized_flags[thread_id] = false;
 
       x264_param_t param;
       if (x264_param_default_preset(&param, "ultrafast", "zerolatency") < 0) {
@@ -3528,41 +3439,41 @@ StripeEncodeResult encode_stripe_h264(
         }
         param.b_aud = 0;
 
-        g_h264_minimal_store.encoders[thread_id] = x264_encoder_open(&param);
-        if (!g_h264_minimal_store.encoders[thread_id]) {
+        h264_minimal_store.encoders[thread_id] = x264_encoder_open(&param);
+        if (!h264_minimal_store.encoders[thread_id]) {
           std::cerr << "H264 T" << thread_id << ": x264_encoder_open FAILED." << std::endl;
           result.type = StripeDataType::UNKNOWN;
         } else {
-          g_h264_minimal_store.initialized_flags[thread_id] = true;
-          g_h264_minimal_store.initialized_widths[thread_id] = param.i_width;
-          g_h264_minimal_store.initialized_heights[thread_id] = param.i_height;
-          g_h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
-          g_h264_minimal_store.initialized_csps[thread_id] = param.i_csp;
-          g_h264_minimal_store.initialized_colorspaces[thread_id] = colorspace_setting;
-          g_h264_minimal_store.initialized_full_range_flags[thread_id] = use_full_range;
-          g_h264_minimal_store.force_idr_flags[thread_id] = true;
+          h264_minimal_store.initialized_flags[thread_id] = true;
+          h264_minimal_store.initialized_widths[thread_id] = param.i_width;
+          h264_minimal_store.initialized_heights[thread_id] = param.i_height;
+          h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
+          h264_minimal_store.initialized_csps[thread_id] = param.i_csp;
+          h264_minimal_store.initialized_colorspaces[thread_id] = colorspace_setting;
+          h264_minimal_store.initialized_full_range_flags[thread_id] = use_full_range;
+          h264_minimal_store.force_idr_flags[thread_id] = true;
         }
       }
     } else if (needs_crf_reinit) {
-      x264_t* encoder_to_reconfig = g_h264_minimal_store.encoders[thread_id];
+      x264_t* encoder_to_reconfig = h264_minimal_store.encoders[thread_id];
       if (encoder_to_reconfig) {
         x264_param_t params_for_reconfig;
         x264_encoder_parameters(encoder_to_reconfig, &params_for_reconfig);
         params_for_reconfig.rc.f_rf_constant =
           static_cast<float>(std::max(0, std::min(51, current_crf_setting)));
         if (x264_encoder_reconfig(encoder_to_reconfig, &params_for_reconfig) == 0) {
-          g_h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
+          h264_minimal_store.initialized_crfs[thread_id] = current_crf_setting;
         } else {
           std::cerr << "H264 T" << thread_id
                     << ": x264_encoder_reconfig for CRF FAILED. Old CRF "
-                    << g_h264_minimal_store.initialized_crfs[thread_id]
+                    << h264_minimal_store.initialized_crfs[thread_id]
                     << " may persist." << std::endl;
         }
       }
     }
 
-    if (g_h264_minimal_store.initialized_flags[thread_id]) {
-      current_encoder = g_h264_minimal_store.encoders[thread_id];
+    if (h264_minimal_store.initialized_flags[thread_id]) {
+      current_encoder = h264_minimal_store.encoders[thread_id];
     }
   }
 
@@ -3587,11 +3498,11 @@ StripeEncodeResult encode_stripe_h264(
 
   bool force_idr_now = false;
   {
-    std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-    g_h264_minimal_store.ensure_size(thread_id);
-    if (g_h264_minimal_store.initialized_flags[thread_id] &&
-        thread_id < static_cast<int>(g_h264_minimal_store.force_idr_flags.size()) &&
-        g_h264_minimal_store.force_idr_flags[thread_id]) {
+    std::lock_guard<std::mutex> lock(h264_minimal_store.store_mutex);
+    h264_minimal_store.ensure_size(thread_id);
+    if (h264_minimal_store.initialized_flags[thread_id] &&
+        thread_id < static_cast<int>(h264_minimal_store.force_idr_flags.size()) &&
+        h264_minimal_store.force_idr_flags[thread_id]) {
       force_idr_now = true;
     }
   }
@@ -3614,9 +3525,9 @@ StripeEncodeResult encode_stripe_h264(
   if (frame_size > 0) {
     if (force_idr_now && pic_out.b_keyframe &&
         (pic_out.i_type == X264_TYPE_IDR || pic_out.i_type == X264_TYPE_I)) {
-      std::lock_guard<std::mutex> lock(g_h264_minimal_store.store_mutex);
-      if (thread_id < static_cast<int>(g_h264_minimal_store.force_idr_flags.size())) {
-        g_h264_minimal_store.force_idr_flags[thread_id] = false;
+      std::lock_guard<std::mutex> lock(h264_minimal_store.store_mutex);
+      if (thread_id < static_cast<int>(h264_minimal_store.force_idr_flags.size())) {
+        h264_minimal_store.force_idr_flags[thread_id] = false;
       }
     }
 

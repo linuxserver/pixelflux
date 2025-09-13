@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-A single-client WebSocket and HTTP server for streaming screen captures.
+A multi-client WebSocket and HTTP server for streaming screen captures.
 
-This script is a demonstration of the pixelflux library. It captures the screen
-and sends it to a single connected WebSocket client. All capture settings can be
-configured in the 'CONFIGURATION SETTINGS' block below.
+This script demonstrates the pixelflux library's instance-safe capabilities.
+It can handle multiple WebSocket clients, each with its own independent
+screen capture session. The capture region can be controlled via the URL hash.
 """
 
 # Standard library imports
@@ -13,177 +13,203 @@ import os
 import mimetypes
 import websockets
 import websockets.asyncio.server as ws_async
+import threading
 
 # Third-party library imports
 from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
 
 # ==============================================================================
-# --- CONFIGURATION SETTINGS ---
+# --- BASE CONFIGURATION SETTINGS ---
+# These settings will be used as a template for each new connection.
 # Modify the parameters below to test different capture and encoding options.
 # ==============================================================================
 HTTP_PORT = 9001
 WS_PORT = 9000
 
-capture_settings = CaptureSettings()
+# Create a default template for capture settings.
+base_capture_settings = CaptureSettings()
 
 # --- Debugging ---
 # Enable/disable the continuous FPS and settings log printed to the console.
-capture_settings.debug_logging = True
+base_capture_settings.debug_logging = True
 
 # --- Core Capture ---
-capture_settings.capture_width = 1920
-capture_settings.capture_height = 1080
-capture_settings.capture_x = 0
-capture_settings.capture_y = 0
-capture_settings.target_fps = 60.0
-capture_settings.capture_cursor = False
+base_capture_settings.capture_width = 1920
+base_capture_settings.capture_height = 1080
+base_capture_settings.capture_x = 0  # This can be overridden by the URL
+base_capture_settings.capture_y = 0
+base_capture_settings.target_fps = 60.0
+base_capture_settings.capture_cursor = False
 
 # --- Encoding Mode ---
 # Sets the output codec. 0 for JPEG, 1 for H.264.
-capture_settings.output_mode = 1
+base_capture_settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
-capture_settings.use_cpu = False
+base_capture_settings.use_cpu = False
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
 # Good values are typically 18-28.
-capture_settings.h264_crf = 25
+base_capture_settings.h264_crf = 25
 # CRF for H.264 paintover on static content. Used if lower (better) than h264_crf.
-capture_settings.h264_paintover_crf = 18
+base_capture_settings.h264_paintover_crf = 18
 # Number of high-quality H.264 frames to send in a burst when a paintover is triggered.
-capture_settings.h264_paintover_burst_frames = 5
+base_capture_settings.h264_paintover_burst_frames = 5
 # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
-capture_settings.h264_fullcolor = False
+base_capture_settings.h264_fullcolor = False
 # Encode full frames instead of just changed stripes.
-capture_settings.h264_fullframe = False
+base_capture_settings.h264_fullframe = False
 # Flag the stream to be in streaming mode to bypass all vnc logic
-capture_settings.h264_streaming_mode = False
+base_capture_settings.h264_streaming_mode = False
 # Pass a vaapi node index 0 = renderD128, -1 to disable
-capture_settings.vaapi_render_node_index = -1
+base_capture_settings.vaapi_render_node_index = 0
 
 # --- Change Detection & Optimization ---
 # Use a higher quality setting for static regions that haven't changed for a while.
-capture_settings.use_paint_over_quality = True
+base_capture_settings.use_paint_over_quality = True
 # Number of frames of no motion in a stripe to trigger a high-quality "paint-over".
-capture_settings.paint_over_trigger_frames = 15
+base_capture_settings.paint_over_trigger_frames = 15
 # Consecutive changes to a stripe to trigger a "damaged" state (uses base quality).
-capture_settings.damage_block_threshold = 10
+base_capture_settings.damage_block_threshold = 10
 # Number of frames a stripe stays "damaged" after being triggered.
-capture_settings.damage_block_duration = 30
+base_capture_settings.damage_block_duration = 30
 
 # --- JPEG Quality Settings ---
 # Quality of jpegs under motion
-capture_settings.jpeg_quality = 40
+base_capture_settings.jpeg_quality = 40
 # Quality of jpegs on static content paintovers
-capture_settings.paint_over_jpeg_quality = 90
+base_capture_settings.paint_over_jpeg_quality = 90
 
 # --- Watermarking ---
 # The path MUST be a byte string (b"") and point to a valid PNG file.
-#capture_settings.watermark_path = b"/path/to/image.png"
-
+#base_capture_settings.watermark_path = b"/path/to/image.png"
 # Sets the watermark location on the screen. Default is 0 (disabled).
 # Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle, 6:Animated
-capture_settings.watermark_location_enum = 0
+base_capture_settings.watermark_location_enum = 0
 
 # ==============================================================================
-# --- Global State ---
+# --- Multi-Client State Management ---
 # ==============================================================================
-g_loop = None                   # The main asyncio event loop.
-g_module = None                 # The ScreenCapture instance.
-g_active_client = None          # Holds the single active WebSocket client.
-g_is_capturing = False          # Flag indicating if capture is active.
-g_h264_stripe_queue = None      # asyncio.Queue for H.264 stripes.
-g_send_task = None              # asyncio.Task for sending stripes.
+g_loop = None  # The main asyncio event loop.
 
-g_is_shutting_down = False 
-async def cleanup():
-    """A single, race-proof function to shut down all capture resources."""
-    global g_is_shutting_down, g_is_capturing, g_module, g_send_task, g_active_client
-    if g_is_shutting_down:
-        return
-    g_is_shutting_down = True
-    print("Cleanup initiated...")
-    if g_is_capturing:
-        g_is_capturing = False
-    if g_module:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, g_module.stop_capture)
-    if g_send_task and not g_send_task.done():
-        g_send_task.cancel()
-        try:
-            await g_send_task
-        except asyncio.CancelledError:
-            pass
-    g_active_client = None
-    g_is_shutting_down = False
-    print("Cleanup complete.")
+# This dictionary holds the state for each active client.
+# The key is the WebSocket connection object.
+# The value is another dictionary containing the client's capture module, queue, and task.
+ACTIVE_CLIENTS = {}
+CLIENT_LOCK = threading.Lock() # Lock for thread-safe modifications to ACTIVE_CLIENTS.
 
-async def send_h264_stripes():
-    """Retrieves H.264 stripes from the queue and sends them to the active client."""
-    global g_h264_stripe_queue, g_active_client
+async def send_stripes_task(websocket, queue):
+    """
+    Pulls video stripes from a client-specific queue and sends them.
+    This task is cancelled when the client disconnects.
+    """
+    print(f"Send task started for client {websocket.remote_address}.")
     try:
+        # This loop will run until the connection is closed,
+        # which will raise a ConnectionClosed exception.
         while True:
-            h264_bytes = await g_h264_stripe_queue.get()
-            if g_active_client:
-                try:
-                    await g_active_client.send(h264_bytes)
-                except websockets.exceptions.ConnectionClosed:
-                    pass  # Client disconnected, main handler will clean up.
-            g_h264_stripe_queue.task_done()
+            data_to_send = await queue.get()
+            await websocket.send(data_to_send)
+            queue.task_done()
+
+    except websockets.exceptions.ConnectionClosed:
+        # This is the expected, clean way to exit the loop when a client disconnects.
+        print(f"Connection closed for {websocket.remote_address}. Send task stopping.")
+    
     except asyncio.CancelledError:
-        pass  # Expected way for the task to be stopped.
+        # This happens when the main handler cancels us during cleanup.
+        print(f"Send task was cancelled for {websocket.remote_address}.")
+
     except Exception as e:
-        print(f"[ERROR] An unexpected error occurred in the send task: {e}")
+        # Catch any other unexpected errors.
+        print(f"[ERROR] Send task for client {websocket.remote_address} failed unexpectedly: {e}")
+    
     finally:
-        print("Stripe sending task has stopped.")
+        print(f"Send task for {websocket.remote_address} has finished.")
 
+async def websocket_handler(websocket):
+    """
+    Manages a single WebSocket connection and its dedicated screen capture lifecycle.
+    """
+    path = websocket.request.path
+    client_id = id(websocket)
+    print(f"New client connected from {websocket.remote_address} with path '{path}' (ID: {client_id}).")
 
-async def websocket_handler(websocket, path=None):
-    """Manages a single WebSocket connection and the screen capture lifecycle."""
-    global g_active_client, g_is_capturing, g_h264_stripe_queue, g_module, g_send_task, g_stripe_callback
-
-    if g_active_client is not None:
-        print("Rejecting new connection: A client is already active.")
-        await websocket.close(code=1013, reason="Server is busy with another client.")
-        return
-
-    g_active_client = websocket
-    print("Client connected. Starting screen capture...")
+    client_module = None
+    send_task = None
+    # Keep a reference to the callback object to prevent it from being garbage collected
+    c_callback = None
 
     try:
-        g_h264_stripe_queue = asyncio.Queue(maxsize=120)
-        g_module.start_capture(capture_settings, stripe_callback_handler)
-        g_is_capturing = True
-        g_send_task = asyncio.create_task(send_h264_stripes())
-        print("Screen capture and stream started.")
+        # --- 1. Configure Capture for this Specific Client ---
+        client_settings = base_capture_settings
+        try:
+            x_offset = int(path.strip('/'))
+            client_settings.capture_x = x_offset
+            print(f"Client {client_id} requested custom capture at x={x_offset}.")
+        except (ValueError, TypeError):
+            print(f"Client {client_id} using default capture at x=0.")
+            client_settings.capture_x = 0
 
+        # --- 2. Create Resources for this Client ---
+        client_module = ScreenCapture()
+        client_queue = asyncio.Queue(maxsize=120)
+
+        # --- 3. Create a unique callback (closure) for this client ---
+        # This function "closes over" client_queue and g_loop, giving it access
+        # without needing global lookups or user_data.
+        def client_specific_callback(result_ptr, user_data_ptr):
+            """Callback invoked by pixelflux when a new video stripe is ready."""
+            if result_ptr:
+                result = result_ptr.contents
+                if result.size > 0 and g_loop and not g_loop.is_closed():
+                    raw_data_from_cpp = bytes(result.data[:result.size])
+                    asyncio.run_coroutine_threadsafe(
+                        client_queue.put(raw_data_from_cpp), g_loop
+                    )
+        
+        # Convert the Python closure into a C-compatible function pointer
+        c_callback = StripeCallback(client_specific_callback)
+
+        # --- 4. Register and Start Resources for this Client ---
+        send_task = asyncio.create_task(send_stripes_task(websocket, client_queue))
+        ACTIVE_CLIENTS[websocket] = {
+            "module": client_module,
+            "queue": client_queue,
+            "task": send_task,
+            "callback": c_callback # Store reference to prevent GC
+        }
+
+        # --- 5. Start the Capture with the correct 3 arguments ---
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, client_module.start_capture, client_settings, c_callback
+        )
+        print(f"Capture started for client {client_id}.")
+
+        # --- 6. Wait for the Client to Disconnect ---
         async for _ in websocket:
-            pass
+            pass # Keep the connection alive
+
     except websockets.exceptions.ConnectionClosed:
-        print("Client disconnected normally.")
+        print(f"Client {client_id} disconnected normally.")
     except Exception as e:
-        print(f"[ERROR] WebSocket handler error: {e}")
+        print(f"[ERROR] WebSocket handler for client {client_id} error: {e}")
     finally:
-        if websocket is g_active_client:
-            await cleanup()
+        # --- 7. Clean Up Resources for this Specific Client ---
+        print(f"Cleaning up resources for client {client_id}...")
+        
+        if send_task and not send_task.done():
+            send_task.cancel()
+            try: await send_task
+            except asyncio.CancelledError: pass
+        
+        if client_module:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, client_module.stop_capture)
 
-def stripe_callback_handler(result_ptr, user_data_ptr):
-    """Callback invoked by pixelflux when a new video stripe is ready."""
-    if g_is_capturing and result_ptr and g_h264_stripe_queue is not None:
-        result = result_ptr.contents
-        if result.size <= 0:
-            return
-        raw_data_from_cpp = bytes(result.data[:result.size])
-        data_to_send = None
-        if capture_settings.output_mode == 1 and not capture_settings.h264_streaming_mode:
-            data_to_send = raw_data_from_cpp
-        else:
-            data_to_send = b"\x03\x00" + raw_data_from_cpp
-
-        if data_to_send and g_loop and not g_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                g_h264_stripe_queue.put(data_to_send), g_loop
-            )
+        ACTIVE_CLIENTS.pop(websocket, None)
+        print(f"Cleanup complete for client {client_id}. Active clients: {len(ACTIVE_CLIENTS)}")
 
 async def handle_http_request(reader, writer):
     """Handle HTTP requests by serving static files from the script directory."""
@@ -197,24 +223,22 @@ async def handle_http_request(reader, writer):
             writer.write(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
             return
 
-        path = parts[1].decode()
+        path = parts[1].decode().split('#')[0] # Ignore hash part
         if path == '/':
             path = '/index.html'
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(script_dir, path.lstrip('/'))
-
-        # Security check: prevent directory traversal
-        if not full_path.startswith(script_dir):
+        
+        # Security check to prevent directory traversal attacks
+        if not os.path.realpath(full_path).startswith(os.path.realpath(script_dir)):
             writer.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
             return
 
         if os.path.isfile(full_path):
             with open(full_path, 'rb') as f:
                 content = f.read()
-
             content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
-
             headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\n\r\n'
             writer.write(headers.encode())
             writer.write(content)
@@ -223,49 +247,57 @@ async def handle_http_request(reader, writer):
 
     except Exception as e:
         print(f"[HTTP Error] {e}")
-        writer.write(b'HTTP/1.1 500 Internal Server Error\r\n\r\n')
     finally:
-        await writer.drain()
-        writer.close()
+        if not writer.is_closing():
+            try:
+                await writer.drain()
+            except ConnectionResetError:
+                pass # Client closed connection before we could finish.
+            finally:
+                writer.close()
 
 
 async def main():
-    """Initializes resources and starts the WebSocket and HTTP servers."""
-    global g_loop, g_module, g_is_capturing, g_send_task
-
+    """Initializes and starts the WebSocket and HTTP servers."""
+    global g_loop
     g_loop = asyncio.get_running_loop()
 
-    g_module = ScreenCapture()
-    if not g_module:
-        print("[FATAL] Failed to initialize pixelflux ScreenCapture module.")
-        return
-    print("Pixelflux capture module initialized.")
-
-    # Start HTTP server using asyncio
-    http_server = await asyncio.start_server(
-        handle_http_request, 'localhost', HTTP_PORT
-    )
-    print(f"HTTP server is serving files from current directory")
-    print(f"-> Open http://localhost:{HTTP_PORT}/index.html in your browser.")
+    http_server = await asyncio.start_server(handle_http_request, 'localhost', HTTP_PORT)
+    print(f"HTTP server serving on http://localhost:{HTTP_PORT}/")
+    print(f"-> Open http://localhost:{HTTP_PORT}/ to start a capture at (0,0).")
+    print(f"-> Open http://localhost:{HTTP_PORT}/#10 to start a capture at (10,0).")
 
     ws_server = None
     try:
-        ws_server = await ws_async.serve(
-            websocket_handler, 'localhost', WS_PORT, compression=None
-        )
+        ws_server = await ws_async.serve(websocket_handler, 'localhost', WS_PORT, compression=None)
         print(f"WebSocket server started on ws://localhost:{WS_PORT}")
-        print("Waiting for a client connection... Press Ctrl+C to stop.")
+        print("Waiting for client connections... Press Ctrl+C to stop.")
         await asyncio.Event().wait()
     except OSError as e:
         print(f"[FATAL] Could not start server (is port {WS_PORT} in use?): {e}")
     except KeyboardInterrupt:
         print("\nShutdown signal received.")
     finally:
-        await cleanup()
+        print("Shutting down all client connections...")
+        # Create a list of cleanup tasks for all active clients
+        cleanup_tasks = []
+        with CLIENT_LOCK:
+            clients_to_clean = list(ACTIVE_CLIENTS.keys())
+        
+        for ws in clients_to_clean:
+            # Closing the websocket connection will trigger its handler's finally block
+            cleanup_tasks.append(ws.close(code=1001, reason='Server shutting down'))
+        
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
         if ws_server:
             ws_server.close()
             await ws_server.wait_closed()
-        print("Cleanup complete.")
+        
+        http_server.close()
+        await http_server.wait_closed()
+        print("All servers and connections closed. Goodbye.")
 
 if __name__ == "__main__":
     try:

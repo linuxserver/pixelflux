@@ -148,6 +148,7 @@ A comprehensive example, `screen_to_browser.py`, is located in the `example` dir
 *   An `asyncio`-based WebSocket server to stream encoded H.264 frames.
 *   An HTTP server to serve a client-side HTML page for viewing the stream.
 *   The `pixelflux` module to perform the screen capture and encoding.
+*   Dynamic capture region selection via the URL hash.
 
 **To run this example:**
 
@@ -166,7 +167,10 @@ A comprehensive example, `screen_to_browser.py`, is located in the `example` dir
     ```bash
     python3 screen_to_browser.py
     ```
-4.  Open your web browser and go to the URL indicated by the script's output (usually `http://localhost:9001`) to view the live stream.
+4.  Open your web browser to view the live stream. You can control the capture area:
+    *   **`http://localhost:9001`**: Captures from the screen's top-left corner (x=0).
+    *   **`http://localhost:9001/#50`**: Captures a region starting at x=50.
+    *   You can open multiple browser tabs with different hash values to see multiple, independent capture sessions running from the single server instance.
 
 ## License
 
