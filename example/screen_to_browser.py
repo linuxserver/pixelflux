@@ -62,7 +62,7 @@ base_capture_settings.h264_fullframe = False
 # Flag the stream to be in streaming mode to bypass all vnc logic
 base_capture_settings.h264_streaming_mode = False
 # Pass a vaapi node index 0 = renderD128, -1 to disable
-base_capture_settings.vaapi_render_node_index = 0
+base_capture_settings.vaapi_render_node_index = -1
 
 # --- Change Detection & Optimization ---
 # Use a higher quality setting for static regions that haven't changed for a while.
