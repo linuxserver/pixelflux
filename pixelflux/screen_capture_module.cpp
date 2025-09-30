@@ -3155,6 +3155,7 @@ void ScreenCaptureModule::capture_loop() {
             XDestroyImage(shm_image);
             shm_image = nullptr;
         }
+        XSync(display, False);
         XCloseDisplay(display);
         display = nullptr;
     }
