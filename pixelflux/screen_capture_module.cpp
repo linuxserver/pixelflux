@@ -3424,18 +3424,18 @@ StripeEncodeResult encode_stripe_h264(
         param.i_bframe = 0;
         param.i_threads = h264_streaming_mode ? 0 : 1;
         param.i_log_level = X264_LOG_ERROR;
-        param.vui.b_fullrange = use_full_range ? 1 : 0;
+        param.vui.b_fullrange = 0;
         param.vui.i_sar_width = 1;
         param.vui.i_sar_height = 1;
         if (param.i_csp == X264_CSP_I444) {
              param.vui.i_colorprim = 1;
              param.vui.i_transfer = 1;
-             param.vui.i_colmatrix = 1;
+             param.vui.i_colmatrix = 6;
              x264_param_apply_profile(&param, "high444");
         } else {
            param.vui.i_colorprim = 1;
            param.vui.i_transfer  = 1;
-           param.vui.i_colmatrix = 1;
+           param.vui.i_colmatrix = 6;
            x264_param_apply_profile(&param, "baseline");
         }
         param.b_aud = 0;
