@@ -5,7 +5,6 @@ build-backend = "setuptools.build_meta"
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
 
-# Add this new section
 [tool.cibuildwheel.environment]
 LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"
 
@@ -57,8 +56,22 @@ before-all = """
             make -j$(nproc) && \
             make install) && \
         \
+        (cd /tmp && \
+            git clone --branch n8.0 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
+            cd ffmpeg && \
+            ./configure \
+                --prefix=/usr/local \
+                --enable-shared \
+                --disable-static \
+                --disable-programs \
+                --enable-gpl \
+                --enable-libx264 \
+                --extra-cflags="-I/usr/local/include" \
+                --extra-ldflags="-L/usr/local/lib" && \
+            make -j$(nproc) && \
+            make install) && \
+        \
         ldconfig
-
     elif command -v apk; then
         apk add --no-cache \
             libx11-dev \
@@ -72,9 +85,17 @@ before-all = """
             libxcomposite-dev \
             libva-dev \
             libdrm-dev \
-            musl-dev 
+            musl-dev \
+            ffmpeg-dev
     else
         echo "Unsupported package manager"
         exit 1
     fi
+"""
+repair-wheel-command = """
+    auditwheel repair -w {dest_dir} {wheel} \
+    --exclude libva.so.2 \
+    --exclude libva-drm.so.2 \
+    --exclude libva-x11.so.2 \
+    --exclude libdrm.so.2
 """
