@@ -18,6 +18,7 @@ This module relies on a native C++ extension that is compiled during installatio
     sudo apt-get update && \
     sudo apt-get install -y \
       g++ \
+      libavcodec-dev \
       libdrm-dev \
       libjpeg-turbo8-dev \
       libva-dev \
