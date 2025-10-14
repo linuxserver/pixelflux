@@ -1453,9 +1453,9 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "tune", "zerolatency", 0);
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "preset", "ultrafast", 0);
     if (use_yuv444) {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
     } else {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH, 0);
     }
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CQP", 0);
     av_opt_set_int(vaapi_state_.codec_ctx->priv_data, "qp", qp, 0);
@@ -1577,37 +1577,39 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_vaapi(int width, int he
     if (ret < 0) {
         throw std::runtime_error("VAAPI_ENCODE_ERROR: Failed to send frame to encoder: " + std::to_string(ret));
     }
-    ret = avcodec_receive_packet(vaapi_state_.codec_ctx, vaapi_state_.packet);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        return {}; 
-    } else if (ret < 0) {
-        throw std::runtime_error("VAAPI_ENCODE_ERROR: Failed to receive packet from encoder: " + std::to_string(ret));
+    while (true) {
+        ret = avcodec_receive_packet(vaapi_state_.codec_ctx, vaapi_state_.packet);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            return {};
+        } else if (ret < 0) {
+            throw std::runtime_error("VAAPI_ENCODE_ERROR: Failed to receive packet from encoder: " + std::to_string(ret));
+        }
+        StripeEncodeResult result;
+        result.type = StripeDataType::H264;
+        result.stripe_y_start = 0;
+        result.stripe_height = height;
+        result.frame_id = frame_counter;
+        if (vaapi_state_.packet->size > 0) {
+            const unsigned char TAG = 0x04;
+            unsigned char type_hdr = (vaapi_state_.packet->flags & AV_PKT_FLAG_KEY) ? 0x01 : 0x00;
+            int header_sz = 10;
+            result.data = new unsigned char[vaapi_state_.packet->size + header_sz];
+            result.size = vaapi_state_.packet->size + header_sz;
+            result.data[0] = TAG;
+            result.data[1] = type_hdr;
+            uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+            std::memcpy(result.data + 2, &net_val, 2);
+            net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+            std::memcpy(result.data + 4, &net_val, 2);
+            net_val = htons(static_cast<uint16_t>(width));
+            std::memcpy(result.data + 6, &net_val, 2);
+            net_val = htons(static_cast<uint16_t>(height));
+            std::memcpy(result.data + 8, &net_val, 2);
+            std::memcpy(result.data + header_sz, vaapi_state_.packet->data, vaapi_state_.packet->size);
+        }
+        av_packet_unref(vaapi_state_.packet);
+        return result;
     }
-    StripeEncodeResult result;
-    result.type = StripeDataType::H264;
-    result.stripe_y_start = 0;
-    result.stripe_height = height;
-    result.frame_id = frame_counter;
-    if (vaapi_state_.packet->size > 0) {
-        const unsigned char TAG = 0x04;
-        unsigned char type_hdr = (vaapi_state_.packet->flags & AV_PKT_FLAG_KEY) ? 0x01 : 0x00;
-        int header_sz = 10;
-        result.data = new unsigned char[vaapi_state_.packet->size + header_sz];
-        result.size = vaapi_state_.packet->size + header_sz;
-        result.data[0] = TAG;
-        result.data[1] = type_hdr;
-        uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-        std::memcpy(result.data + 2, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-        std::memcpy(result.data + 4, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(width));
-        std::memcpy(result.data + 6, &net_val, 2);
-        net_val = htons(static_cast<uint16_t>(height));
-        std::memcpy(result.data + 8, &net_val, 2);
-        std::memcpy(result.data + header_sz, vaapi_state_.packet->data, vaapi_state_.packet->size);
-    }
-    av_packet_unref(vaapi_state_.packet);
-    return result;
 }
 
 /**
