@@ -1453,9 +1453,9 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "tune", "zerolatency", 0);
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "preset", "ultrafast", 0);
     if (use_yuv444) {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
     } else {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH, 0);
     }
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CQP", 0);
     av_opt_set_int(vaapi_state_.codec_ctx->priv_data, "qp", qp, 0);
