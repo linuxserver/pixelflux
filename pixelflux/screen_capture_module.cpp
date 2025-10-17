@@ -148,6 +148,19 @@ struct VaapiEncoderState {
     unsigned int frame_count = 0;
 };
 
+
+/**
+ * @brief Custom X11 error handler specifically for the XShmAttach call.
+ * This function is temporarily installed as the X11 error handler. It catches
+ * any error, sets the g_shm_attach_failed flag to true, and returns 0 to
+ * signal that the error has been "handled," preventing program termination.
+ */
+static bool g_shm_attach_failed = false;
+static int shm_attach_error_handler(Display* dpy, XErrorEvent* ev) {
+    g_shm_attach_failed = true;
+    return 0;
+}
+
 /**
  * @brief Manages a pool of H.264 encoders and associated picture buffers.
  * This struct provides thread-safe storage and management for x264 encoder
@@ -1828,6 +1841,42 @@ void ScreenCaptureModule::capture_loop() {
         return;
     }
 
+    this->vaapi_operational = false;
+    this->nvenc_operational = false;
+
+    if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
+        local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
+        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
+                                     local_capture_height_actual, local_current_h264_crf, local_current_h264_fullcolor)) {
+            this->vaapi_operational = true;
+            this->vaapi_force_next_idr_ = true;
+            std::cout << "VAAPI Encoder Initialized successfully." << std::endl;
+        } else {
+            std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
+            local_use_cpu = true;
+        }
+    } else {
+      if (!local_use_cpu && this->is_nvidia_system_detected &&
+          local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
+        if (this->initialize_nvenc_encoder(local_capture_width_actual,
+                                     local_capture_height_actual,
+                                     local_current_h264_crf,
+                                     local_current_target_fps,
+                                     local_current_h264_fullcolor)) {
+          this->nvenc_operational = true;
+          this->nvenc_force_next_idr_ = true;
+          std::cout << "NVENC Encoder Initialized successfully." << std::endl;
+        } else {
+          std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
+          local_use_cpu = true;
+        }
+      } else {
+          if (!this->nvenc_operational && this->nvenc_state_.initialized) {
+            this->reset_nvenc_encoder();
+          }
+      }
+    }
+
     this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
     if (local_current_output_mode == OutputMode::H264) {
         bool use_nv12_planes = !local_use_cpu && local_current_h264_fullframe && !local_current_h264_fullcolor &&
@@ -1873,16 +1922,21 @@ void ScreenCaptureModule::capture_loop() {
     auto next_frame_time =
       std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
 
+    const int MAX_ATTACH_ATTEMPTS = 5;
+    const int RETRY_BACKOFF_MS = 500;
     char* display_env = std::getenv("DISPLAY");
     const char* display_name = display_env ? display_env : ":0";
     Display* display = XOpenDisplay(display_name);
+
     if (!display) {
       std::cerr << "Error: Failed to open X display " << display_name << std::endl;
       return;
     }
+
     Window root_window = DefaultRootWindow(display);
     int screen = DefaultScreen(display);
     XWindowAttributes attributes;
+
     if (XGetWindowAttributes(display, root_window, &attributes)) {
         if (local_capture_width_actual > attributes.width) {
             local_capture_width_actual = attributes.width;
@@ -1907,6 +1961,7 @@ void ScreenCaptureModule::capture_loop() {
       XCloseDisplay(display);
       return;
     }
+
     std::cout << "X Shared Memory Extension available." << std::endl;
 
     if (local_current_capture_cursor) {
@@ -1915,91 +1970,76 @@ void ScreenCaptureModule::capture_loop() {
         XCloseDisplay(display);
         return;
       }
-
       std::cout << "XFixes Extension available." << std::endl;
     }
 
     XShmSegmentInfo shminfo;
-    memset(&shminfo, 0, sizeof(shminfo));
     XImage* shm_image = nullptr;
+    bool shm_setup_complete = false;
 
-    shm_image = XShmCreateImage(
-      display, DefaultVisual(display, screen), DefaultDepth(display, screen),
-      ZPixmap, nullptr, &shminfo, local_capture_width_actual,
-      local_capture_height_actual);
-    if (!shm_image) {
-      std::cerr << "Error: XShmCreateImage failed for "
-                << local_capture_width_actual << "x"
-                << local_capture_height_actual << std::endl;
-      XCloseDisplay(display);
-      return;
+    for (int attempt = 1; attempt <= MAX_ATTACH_ATTEMPTS; ++attempt) {
+        memset(&shminfo, 0, sizeof(shminfo));
+        shm_image = XShmCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+                                    ZPixmap, nullptr, &shminfo, local_capture_width_actual,
+                                    local_capture_height_actual);
+        if (!shm_image) {
+            std::cerr << "Attempt " << attempt << ": XShmCreateImage failed." << std::endl;
+            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+            continue;
+        }
+
+        shminfo.shmid = shmget(IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height, IPC_CREAT | 0600);
+        if (shminfo.shmid < 0) {
+            perror("shmget");
+            XDestroyImage(shm_image);
+            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+            continue;
+        }
+
+        shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
+        if (shminfo.shmaddr == (char*)-1) {
+            perror("shmat");
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XDestroyImage(shm_image);
+            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+            continue;
+        }
+
+        shminfo.readOnly = False;
+        shm_image->data = shminfo.shmaddr;
+        g_shm_attach_failed = false;
+        XErrorHandler old_handler = XSetErrorHandler(shm_attach_error_handler);
+        XShmAttach(display, &shminfo);
+        XSync(display, False);
+        XSetErrorHandler(old_handler);
+
+        if (g_shm_attach_failed) {
+            std::cerr << "Attempt " << attempt << "/" << MAX_ATTACH_ATTEMPTS << ": XShmAttach failed with an X server error." << std::endl;
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XDestroyImage(shm_image);
+            if (attempt < MAX_ATTACH_ATTEMPTS) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+            }
+            continue;
+        }
+        
+        shm_setup_complete = true;
+        break;
     }
 
-    shminfo.shmid = shmget(IPC_PRIVATE,
-                           static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height,
-                           IPC_CREAT | 0600);
-    if (shminfo.shmid < 0) {
-      perror("shmget");
-      XDestroyImage(shm_image);
-      XCloseDisplay(display);
-      return;
+    if (!shm_setup_complete) {
+        std::cerr << "ERROR: Failed to set up XShm after " << MAX_ATTACH_ATTEMPTS << " attempts. Exiting capture thread." << std::endl;
+        if (display) {
+            XCloseDisplay(display);
+            display = nullptr;
+        }
+        return;
     }
 
-    shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
-    if (shminfo.shmaddr == (char*)-1) {
-      perror("shmat");
-      shmctl(shminfo.shmid, IPC_RMID, 0);
-      XDestroyImage(shm_image);
-      XCloseDisplay(display);
-      return;
-    }
-    shminfo.readOnly = False;
-    shm_image->data = shminfo.shmaddr;
-
-    if (!XShmAttach(display, &shminfo)) {
-      std::cerr << "Error: XShmAttach failed" << std::endl;
-      shmdt(shminfo.shmaddr);
-      shmctl(shminfo.shmid, IPC_RMID, 0);
-      XDestroyImage(shm_image);
-      XCloseDisplay(display);
-      return;
-    }
     std::cout << "XShm setup complete for " << local_capture_width_actual
               << "x" << local_capture_height_actual << "." << std::endl;
 
-    this->vaapi_operational = false;
-    this->nvenc_operational = false;
-
-    if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
-        local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
-                                     local_capture_height_actual, local_current_h264_crf, local_current_h264_fullcolor)) {
-            this->vaapi_operational = true;
-            this->vaapi_force_next_idr_ = true;
-            std::cout << "VAAPI Encoder Initialized successfully." << std::endl;
-        } else {
-            std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
-        }
-    } else {
-      if (!local_use_cpu && this->is_nvidia_system_detected &&
-          local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (this->initialize_nvenc_encoder(local_capture_width_actual,
-                                     local_capture_height_actual,
-                                     local_current_h264_crf,
-                                     local_current_target_fps,
-                                     local_current_h264_fullcolor)) {
-          this->nvenc_operational = true;
-          this->nvenc_force_next_idr_ = true;
-          std::cout << "NVENC Encoder Initialized successfully." << std::endl;
-        } else {
-          std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
-        }
-      } else {
-          if (!this->nvenc_operational && this->nvenc_state_.initialized) {
-            this->reset_nvenc_encoder();
-          }
-      }
-    }
     int num_cores = std::max(1, (int)std::thread::hardware_concurrency());
     std::cout << "CPU cores available: " << num_cores << std::endl;
     int num_stripes_config = num_cores;
