@@ -1,10 +1,13 @@
 import ctypes
 import os
+import threading
+import sys
 
 class CaptureSettings(ctypes.Structure):
     _fields_ = [
         ("capture_width", ctypes.c_int),
         ("capture_height", ctypes.c_int),
+        ("scale", ctypes.c_double),
         ("capture_x", ctypes.c_int),
         ("capture_y", ctypes.c_int),
         ("target_fps", ctypes.c_double),
@@ -29,14 +32,6 @@ class CaptureSettings(ctypes.Structure):
         ("debug_logging", ctypes.c_bool),
     ]
 
-WATERMARK_LOCATION_NONE = 0
-WATERMARK_LOCATION_TL = 1
-WATERMARK_LOCATION_TR = 2
-WATERMARK_LOCATION_BL = 3
-WATERMARK_LOCATION_BR = 4
-WATERMARK_LOCATION_MI = 5
-WATERMARK_LOCATION_AN = 6
-
 class StripeEncodeResult(ctypes.Structure):
     _fields_ = [
         ("type", ctypes.c_int),
@@ -53,80 +48,170 @@ StripeCallback = ctypes.CFUNCTYPE(
 
 lib_dir = os.path.dirname(__file__)
 lib_path = os.path.join(lib_dir, 'screen_capture_module.so')
+
+_legacy_lib = None
 try:
-    lib = ctypes.CDLL(lib_path)
-except OSError as e:
-    raise OSError(
-        f"Could not load shared library: {e}. Ensure "
-        f"'screen_capture_module.so' is in the "
-        f"'screen_capture' directory."
-    ) from e
+    if os.path.exists(lib_path):
+        _legacy_lib = ctypes.CDLL(lib_path)
+    else:
+        _legacy_lib = ctypes.CDLL('screen_capture_module.so')
+except OSError:
+    pass
 
-# Define the C function signatures for ctypes
-create_module = lib.create_screen_capture_module
-create_module.restype = ctypes.c_void_p
+if _legacy_lib:
+    create_module = _legacy_lib.create_screen_capture_module
+    create_module.restype = ctypes.c_void_p
+    destroy_module = _legacy_lib.destroy_screen_capture_module
+    destroy_module.argtypes = [ctypes.c_void_p]
+    start_capture_c = _legacy_lib.start_screen_capture
+    start_capture_c.argtypes = [ctypes.c_void_p, CaptureSettings, StripeCallback, ctypes.c_void_p]
+    stop_capture_c = _legacy_lib.stop_screen_capture
+    stop_capture_c.argtypes = [ctypes.c_void_p]
+    free_stripe_encode_result_data = _legacy_lib.free_stripe_encode_result_data
+    free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
 
-destroy_module = lib.destroy_screen_capture_module
-destroy_module.argtypes = [ctypes.c_void_p]
-
-start_capture = lib.start_screen_capture
-start_capture.argtypes = [
-    ctypes.c_void_p,
-    CaptureSettings,
-    StripeCallback,
-    ctypes.c_void_p
-]
-
-stop_capture = lib.stop_screen_capture
-stop_capture.argtypes = [ctypes.c_void_p]
-
-free_stripe_encode_result_data = lib.free_stripe_encode_result_data
-free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
-
+_GLOBAL_WAYLAND_BACKEND = None
+if os.environ.get("PIXELFLUX_WAYLAND") == "true":
+    try:
+        from . import pixelflux_wayland
+        _GLOBAL_WAYLAND_BACKEND = pixelflux_wayland.WaylandBackend()
+        print(">> [PixelFlux] Rust Wayland Backend Initialized Globally.")
+    except ImportError as e:
+        print(f">> [PixelFlux] Failed to load Wayland backend: {e}")
+        pass
 
 class ScreenCapture:
     """Python wrapper for screen capture module using ctypes."""
 
     def __init__(self):
-        self._module = create_module()
-        if not self._module:
-            raise Exception("Failed to create screen capture module.")
+        if _legacy_lib:
+            self._module = create_module()
+        else:
+            self._module = None
+        
         self._is_capturing = False
         self._python_stripe_callback = None
         self._c_callback = None
 
     def __del__(self):
         if hasattr(self, '_module') and self._module:
-            self.stop_capture()
-            destroy_module(self._module)
+            try:
+                self.stop_capture()
+                destroy_module(self._module)
+            except:
+                pass
             self._module = None
 
     def start_capture(self, settings: CaptureSettings, stripe_callback):
         if self._is_capturing:
             raise ValueError("Capture already started.")
-        if not callable(stripe_callback):
-            raise TypeError("stripe_callback must be callable.")
 
         self._python_stripe_callback = stripe_callback
+        mode = getattr(settings, 'mode', 'x11')
+
+    def start_capture(self, settings: CaptureSettings, stripe_callback):
+        if self._is_capturing:
+            raise ValueError("Capture already started.")
+
+        self._python_stripe_callback = stripe_callback
+        
+        if _GLOBAL_WAYLAND_BACKEND:
+            if settings.scale < 0.1:
+                if settings.debug_logging:
+                    print(f">> [PixelFlux] Warning: Scale {settings.scale} is invalid. Defaulting to 1.0")
+                settings.scale = 1.0
+
+            if settings.debug_logging:
+                print(f">> [PixelFlux] Connecting to Rust Wayland Backend (Scale: {settings.scale})...")
+            
+            is_h264 = (settings.output_mode == 1)
+
+            def rust_bridge_callback(data_bytes): 
+                if not self._python_stripe_callback:
+                    return
+                size = len(data_bytes)
+                c_buffer = (ctypes.c_ubyte * size).from_buffer_copy(data_bytes)
+                result_struct = StripeEncodeResult()
+                result_struct.size = size
+                result_struct.data = ctypes.cast(c_buffer, ctypes.POINTER(ctypes.c_ubyte))
+                if is_h264:
+                    result_struct.type = 0
+                    if size >= 4:
+                        result_struct.frame_id = int.from_bytes(data_bytes[2:4], 'big')
+                    else:
+                        result_struct.frame_id = 0
+                    if size >= 6:
+                         result_struct.stripe_y_start = int.from_bytes(data_bytes[4:6], 'big')
+                    else:
+                         result_struct.stripe_y_start = 0
+                    result_struct.stripe_height = settings.capture_height
+                else:
+                    result_struct.type = 1
+                    if size >= 2:
+                        result_struct.frame_id = int.from_bytes(data_bytes[0:2], 'big')
+                    else:
+                        result_struct.frame_id = 0
+                    if size >= 4:
+                        result_struct.stripe_y_start = int.from_bytes(data_bytes[2:4], 'big')
+                    else:
+                        result_struct.stripe_y_start = 0
+                    result_struct.stripe_height = 0
+                self._python_stripe_callback(ctypes.byref(result_struct), None)
+            _GLOBAL_WAYLAND_BACKEND.start_capture(rust_bridge_callback, settings)
+            self._is_capturing = True
+            return 
+
+        if not self._module:
+             raise OSError("Legacy screen_capture_module.so not found.")
+
+        if not callable(stripe_callback):
+            raise TypeError("stripe_callback must be callable.")
+        
         self._c_callback = StripeCallback(self._internal_c_callback)
-        start_capture(self._module, settings, self._c_callback, None)
+        start_capture_c(self._module, settings, self._c_callback, None)
         self._is_capturing = True
 
     def stop_capture(self):
         if not self._is_capturing:
             return
-        stop_capture(self._module)
+        
+        if self._module and self._c_callback:
+            stop_capture_c(self._module)
+            self._c_callback = None
+        
+        if _GLOBAL_WAYLAND_BACKEND:
+             _GLOBAL_WAYLAND_BACKEND.stop_capture()
+            
         self._is_capturing = False
         self._python_stripe_callback = None
-        self._c_callback = None
 
     def _internal_c_callback(self, result_ptr, user_data):
-        """
-        Internal C callback which calls the user's Python callback.
-        This function is called from a C thread, so it should be efficient.
-        """
         if self._is_capturing and self._python_stripe_callback:
             try:
                 self._python_stripe_callback(result_ptr, user_data)
             finally:
                 free_stripe_encode_result_data(result_ptr)
+
+    def inject_key(self, scancode, state):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.inject_key(scancode, state)
+
+    def inject_mouse_move(self, x, y):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.inject_mouse_move(float(x), float(y))
+
+    def inject_mouse_button(self, btn, state):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.inject_mouse_button(btn, state)
+
+    def inject_mouse_scroll(self, x, y):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.inject_mouse_scroll(float(x), float(y))
+
+    def set_cursor_rendering(self, enabled):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.set_cursor_rendering(bool(enabled))
+
+    def set_cursor_callback(self, callback):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.set_cursor_callback(callback)

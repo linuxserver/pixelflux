@@ -1,1 +1,5 @@
 graft pixelflux
+include pixelflux_wayland/Cargo.toml
+recursive-include pixelflux_wayland/src *
+include pyproject.toml
+include README.md

@@ -1,33 +1,48 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools-rust"]
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
 
 [tool.cibuildwheel.environment]
 LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"
+PATH = "$HOME/.cargo/bin:$PATH"
 
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
+    
+    # --- MANYLINUX (RPM-based) ---
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-9.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
         dnf install -y \
+            curl \
+            clang \
+            pixman-devel \
             libX11-devel \
             libXext-devel \
+            libXcursor-devel \
             libev-devel \
             libXcomposite-devel \
             libva-devel \
             libdrm-devel \
+            libinput-devel \
+            libxkbcommon-devel \
+            mesa-libgbm-devel \
+            wayland-devel \
+            systemd-devel \
             git \
             make \
             gcc \
             nasm \
             cmake \
-            gcc-c++ && \
+            gcc-c++ \
+            rust-toolset && \
         \
         (cd /tmp && \
             git clone --branch stable --depth 1 https://code.videolan.org/videolan/x264.git && \
@@ -72,10 +87,19 @@ before-all = """
             make install) && \
         \
         ldconfig
+
+    # --- ALPINE (APK-based) ---
     elif command -v apk; then
         apk add --no-cache \
+            build-base \
+            clang \
+            rust \
+            cargo \
+            clang20-libclang \
+            pixman-dev \
             libx11-dev \
             libxext-dev \
+            libxcursor-dev \
             libxfixes-dev \
             jpeg-dev \
             libev-dev \
@@ -85,17 +109,32 @@ before-all = """
             libxcomposite-dev \
             libva-dev \
             libdrm-dev \
+            libinput-dev \
+            libxkbcommon-dev \
+            mesa-dev \
+            wayland-dev \
+            eudev-dev \
             musl-dev \
-            ffmpeg-dev
+            ffmpeg-dev 
     else
         echo "Unsupported package manager"
         exit 1
     fi
 """
+
 repair-wheel-command = """
     auditwheel repair -w {dest_dir} {wheel} \
     --exclude libva.so.2 \
     --exclude libva-drm.so.2 \
     --exclude libva-x11.so.2 \
-    --exclude libdrm.so.2
+    --exclude libdrm.so.2 \
+    --exclude libgbm.so.1 \
+    --exclude libEGL.so.1 \
+    --exclude libgobject-2.0.so.0 \
+    --exclude libglib-2.0.so.0 \
+    --exclude libgmodule-2.0.so.0 \
+    --exclude libffi.so.6 \
+    --exclude libffi.so.7 \
+    --exclude libffi.so.8 \
+    --exclude libwayland-server.so.0
 """

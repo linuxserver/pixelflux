@@ -164,8 +164,13 @@ async def websocket_handler(websocket):
                 result = result_ptr.contents
                 if result.size > 0 and g_loop and not g_loop.is_closed():
                     raw_data_from_cpp = bytes(result.data[:result.size])
+                    final_payload = raw_data_from_cpp
+                    
+                    if client_settings.output_mode == 0:
+                        final_payload = b"\x03\x00" + raw_data_from_cpp
+                    
                     asyncio.run_coroutine_threadsafe(
-                        client_queue.put(raw_data_from_cpp), g_loop
+                        client_queue.put(final_payload), g_loop
                     )
         
         # Convert the Python closure into a C-compatible function pointer

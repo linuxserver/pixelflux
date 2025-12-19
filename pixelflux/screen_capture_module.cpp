@@ -267,6 +267,7 @@ enum class WatermarkLocation : int {
 struct CaptureSettings {
   int capture_width;
   int capture_height;
+  double scale;
   int capture_x;
   int capture_y;
   double target_fps;
@@ -297,6 +298,7 @@ struct CaptureSettings {
   CaptureSettings()
     : capture_width(1920),
       capture_height(1080),
+      scale(1.0),
       capture_x(0),
       capture_y(0),
       target_fps(60.0),

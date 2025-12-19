@@ -1,0 +1,58 @@
+[package]
+name = "pixelflux_wayland"
+version = "1.5.0"
+edition = "2021"
+
+[lib]
+name = "pixelflux_wayland"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.2", features = ["extension-module"] }
+wayland-server = "0.31.10"
+wayland-protocols = { version = "0.31", features = ["server"] }
+crossbeam-channel = "0.5"
+env_logger = "0.10"
+log = "0.4"
+calloop = "0.12"
+turbojpeg = "1.3" 
+rayon = "1.10"
+x264-sys = "0.2.2"
+libc = "0.2"
+yuv = "0.8.9"
+gbm = "0.14" 
+libloading = "0.8"
+libva-sys = "0.1.2"
+xcursor = "0.3.1"
+image = "0.25.9"
+ffmpeg-next = "8.0"
+ffmpeg-sys-next = "8.0"
+
+[dependencies.nvenc-sys]
+git = "https://github.com/legion-labs/nvenc-sys"
+rev = "996be4ceac8112e14ae127adcf8c699bcc1618f5"
+features = ["cuda"]
+
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+rev = "v0.7.0"
+default-features = false
+features = [
+    "backend_drm",
+    "backend_egl",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_udev",
+    "renderer_gl", 
+    "renderer_pixman",
+    "use_system_lib",
+    "desktop",
+    "wayland_frontend"
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

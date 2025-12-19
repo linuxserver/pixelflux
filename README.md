@@ -3,61 +3,101 @@
 [![PyPI version](https://badge.fury.io/py/pixelflux.svg)](https://badge.fury.io/py/pixelflux)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-**A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.**
+**A performant web native pixel delivery pipeline for diverse sources, blending parallel processing of pixel buffers with flexible modern encoding formats.**
 
-This module provides a Python interface to a high-performance C++ capture library. It captures pixel data from a source (currently X11 screen regions), detects changes, and encodes modified stripes into JPEG or H.264. It supports CPU-based encoding (libx264, libjpeg-turbo) as well as hardware-accelerated H.264 encoding via NVIDIA's NVENC and VA-API for Intel/AMD GPUs. The resulting data is delivered efficiently to your Python application via a callback mechanism.
+This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
+
+It supports CPU-based encoding (libx264, libjpeg-turbo) as well as hardware-accelerated H.264 encoding via NVIDIA's NVENC and VA-API for Intel/AMD GPUs. The Wayland backend features a **zero-copy pipeline**, passing GPU buffers directly to the encoder to minimize latency and CPU usage.
 
 ## Installation
 
-This module relies on a native C++ extension that is compiled during installation.
+This module relies on native C++ (X11) and Rust (Wayland) extensions that are compiled during installation.
 
-1.  **Prerequisites (for Debian/Ubuntu):**
-    Ensure you have a C++ compiler (`g++`) and development files for Python, X11, Xfixes, XShm, libjpeg-turbo, and libx264. These are required for the base software encoding functionality.
+### 1. Prerequisites
 
-    ```bash
-    sudo apt-get update && \
-    sudo apt-get install -y \
-      g++ \
-      libavcodec-dev \
-      libdrm-dev \
-      libjpeg-turbo8-dev \
-      libva-dev \
-      libx11-dev \
-      libx264-dev \
-      libxext-dev \
-      libxfixes-dev \
-      libyuv-dev \
-      python3-dev
-    ```
+Ensure you have a C++ compiler (`g++`), the Rust toolchain (`cargo`), and development files for Python and the underlying graphics libraries.
 
-2.  **Hardware Acceleration (Optional but Recommended):**
-    *   **NVIDIA (NVENC):** No extra packages are needed at compile time. If you have the NVIDIA driver installed, the library will be detected and used automatically at runtime.
-    *   **Intel/AMD (VA-API):** The `libva-dev` and `libdrm-dev` packages listed above are sufficient for compilation. Ensure you have the correct VA-API drivers for your hardware installed (e.g., `intel-media-va-driver-non-free` for Intel, `mesa-va-drivers` for AMD).
+**Base Dependencies (Debian/Ubuntu):**
+```bash
+sudo apt-get update && \
+sudo apt-get install -y \
+  g++ \
+  git \
+  curl \
+  python3-dev \
+  libavcodec-dev \
+  libavutil-dev \
+  libjpeg-turbo8-dev \
+  libx264-dev \
+  libyuv-dev
+```
 
-3.  **Install the Package:**
-    You can install directly from PyPI or from a local source clone.
+**X11 Backend Dependencies:**
+```bash
+sudo apt-get install -y \
+  libx11-dev \
+  libxext-dev \
+  libxfixes-dev
+```
 
-    **Option A: Install from PyPI**
-    ```bash
-    pip install pixelflux
-    ```
+**Wayland Backend Dependencies:**
+To build the Rust-based Wayland backend, you need the Rust toolchain and Wayland/DRM libraries:
 
-    **Option B: Install from a local source directory**
-    ```bash
-    # From the root of the project repository
-    pip install .
-    ```
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-    **Note:** The current backend is designed and tested for **Linux/X11** environments.
+# Install Libraries
+sudo apt-get install -y \
+  libgbm-dev \
+  libdrm-dev \
+  libwayland-dev \
+  libinput-dev \
+  libxkbcommon-dev \
+  libva-dev \
+  libclang-dev
+```
+
+### 2. Hardware Acceleration (Optional but Recommended)
+*   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
+*   **Intel/AMD (VA-API):** Ensure `libva-dev` and `libdrm-dev` are installed. You must also have the correct drivers (e.g., `intel-media-va-driver-non-free` or `mesa-va-drivers`).
+
+### 3. Install the Package
+
+**Option A: Install from PyPI**
+```bash
+pip install pixelflux
+```
+
+**Option B: Install from local source**
+```bash
+# From the root of the project repository
+pip install .
+```
 
 ## Usage
 
+### Backend Selection
+
+By default, `pixelflux` loads the legacy X11 backend. To enable the **Wayland** backend (built on [Smithay](https://github.com/Smithay/smithay)), set the following environment variable before importing the module:
+
+```bash
+export PIXELFLUX_WAYLAND=true
+```
+
+To test launching programs into this backend simply add `WAYLAND_DISPLAY=wayland-1` before launching them: 
+
+```bash
+WAYLAND_DISPLAY=wayland-1 glmark2-es2-wayland -s 1920x1080
+```
+
 ### Capture Settings
 
-The `CaptureSettings` class allows for detailed configuration of the capture process.
+The `CaptureSettings` class configures both backends.
 
 ```python
-# All attributes of the CaptureSettings object are standard ctypes properties.
+from pixelflux import CaptureSettings, ScreenCapture
+
 settings = CaptureSettings()
 
 # --- Core Capture ---
@@ -65,8 +105,9 @@ settings.capture_width = 1920
 settings.capture_height = 1080
 settings.capture_x = 0
 settings.capture_y = 0
-settings.target_fps = 60.0
 settings.capture_cursor = True
+settings.target_fps = 60.0
+settings.scale = 1.0  # Fractional scaling (Wayland only)
 
 # --- Encoding Mode ---
 # 0 for JPEG, 1 for H.264
@@ -90,8 +131,8 @@ settings.h264_fullframe = True           # Encode full frames (required for HW a
 settings.h264_streaming_mode = False     # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 
 # --- Hardware Acceleration ---
-# Set to >= 0 to enable VA-API on a specific /dev/dri/renderD* node.
-# Set to -1 to disable VA-API and let the system try NVENC if available.
+# >= 0: Enable GPU Encoding on /dev/dri/renderD(128 + index)
+# -1: Disable GPU Encoding (System will try NVENC if available when using the x11 backend, Wayland needs this set to a render node)
 settings.vaapi_render_node_index = -1
 
 # --- Change Detection & Optimization ---
@@ -107,71 +148,74 @@ settings.watermark_path = b"/path/to/your/watermark.png"
 settings.watermark_location_enum = 4 
 ```
 
-### Stripe Callback and Data Structure
+### Input Injection (Wayland Only)
 
-Your callback function receives a `ctypes.POINTER(StripeEncodeResult)`. You must access its fields via the `.contents` attribute.
-
-The `StripeEncodeResult` struct has the following fields:
+In Wayland mode, `pixelflux` acts as the compositor. You cannot use external tools like `xdotool`. Instead, use the input injection methods provided by the `ScreenCapture` instance:
 
 ```python
-# This is an illustrative Python representation of the C++ struct.
-class StripeEncodeResult(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),             # 1 for JPEG, 2 for H.264
-        ("stripe_y_start", ctypes.c_int),
-        ("stripe_height", ctypes.c_int),
-        ("size", ctypes.c_int),             # The size of the data in bytes
-        ("data", ctypes.POINTER(ctypes.c_ubyte)), # Pointer to the encoded data
-        ("frame_id", ctypes.c_int),         # Frame counter for this stripe
-    ]
+capture = ScreenCapture()
+capture.start_capture(settings, my_callback)
+
+# Inject Mouse Motion (Absolute coordinates)
+capture.inject_mouse_move(x=500.0, y=300.0)
+
+# Inject Mouse Button (1=Left, 2=Middle, 3=Right, etc.)
+# State: 1 = Pressed, 0 = Released
+capture.inject_mouse_button(btn=1, state=1) 
+
+# Inject Scroll (Vertical/Horizontal)
+capture.inject_mouse_scroll(x=0.0, y=10.0)
+
+# Inject Keyboard Key
+# scancode: Linux raw keycode (e.g., 17 for 'w')
+# state: 1 = Pressed, 0 = Released
+capture.inject_key(scancode=17, state=1)
 ```
 
-**Memory Management:** The data pointed to by `result.contents.data` is valid **only within the scope of your callback function**. The C++ library automatically frees this memory after your callback returns. To use the data, you must copy it, for example by using `ctypes.string_at(result.contents.data, result.contents.size)`.
+### Stripe Callback
+
+Your callback receives a `ctypes.POINTER(StripeEncodeResult)`.
+
+```python
+def my_callback(result_ptr, user_data):
+    result = result_ptr.contents
+    
+    # Access data
+    # result.type (0=H264, 1=JPEG)
+    # result.frame_id
+    # result.stripe_y_start
+    
+    # Copy data to Python bytes
+    encoded_data = ctypes.string_at(result.data, result.size)
+    
+    # Send encoded_data to client...
+```
+
+## Zero-Copy Pipeline (Wayland)
+
+The Wayland backend implements a **Zero-Copy** architecture for hardware encoding.
+
+1.  **Rendering:** The compositor renders the desktop to a GPU buffer (GBM).
+2.  **Export:** This buffer is exported as a `Dmabuf` (file descriptor).
+3.  **Encoding:** The `Dmabuf` is imported directly into the encoder context (NVENC or VA-API) without ever copying pixel data to system RAM (CPU).
+
+**Performance Note:** Enabling **watermarking** or utilizing a render node different from the encoding node will force a "Readback" fallback, copying pixels to the CPU and breaking the zero-copy chain. This increases latency and CPU load.
 
 ## Features
 
-*   **Efficient Pixel Capture:** Leverages a native C++ module using XShm for optimized X11 screen capture performance.
-*   **Flexible Encoding Backends:**
-    *   **Software:** libx264 (H.264) and libjpeg-turbo (JPEG).
-    *   **Hardware:** NVIDIA NVENC and VA-API (Intel, AMD).
-*   **Stripe-Based Processing:** For software encoding, can divide the screen into horizontal stripes and process them in parallel across CPU cores.
-*   **Change Detection:** Encodes only stripes that have changed (based on an XXH3 hash comparison) since the last frame, significantly reducing processing load and bandwidth for software encoding modes.
-*   **Dynamic Watermarking:** Overlay a PNG image on the captured video. The watermark can be pinned to a corner, centered, or animated to bounce around the screen.
-*   **Dynamic Quality Optimizations:**
-    *   **Paint-Over for Static Regions:** After a region remains static for `paint_over_trigger_frames`, it is resent at high quality (JPEG) or as a new IDR frame (H.264) to correct any compression artifacts.
-    *   **Damage Throttling:** For highly active regions, the system can temporarily reduce the frequency of change detection to save CPU cycles.
-*   **Direct Callback Mechanism:** Provides encoded stripe data directly to your Python code for real-time processing or streaming.
-
-## Example: Real-time H.264 Streaming with WebSockets
-
-A comprehensive example, `screen_to_browser.py`, is located in the `example` directory of this repository. This script demonstrates robust, real-time screen capture, H.264 encoding, and streaming via WebSockets. It sets up:
-
-*   An `asyncio`-based WebSocket server to stream encoded H.264 frames.
-*   An HTTP server to serve a client-side HTML page for viewing the stream.
-*   The `pixelflux` module to perform the screen capture and encoding.
-*   Dynamic capture region selection via the URL hash.
-
-**To run this example:**
-
-**Note:** This example assumes you are on a Linux host with a running X11 session.
-
-1.  First, ensure you have the `websockets` library installed:
-    ```bash
-    pip install websockets
-    ```
-
-2.  Navigate to the `example` directory within the repository:
-    ```bash
-    cd example
-    ```
-3.  Execute the Python script:
-    ```bash
-    python3 screen_to_browser.py
-    ```
-4.  Open your web browser to view the live stream. You can control the capture area:
-    *   **`http://localhost:9001`**: Captures from the screen's top-left corner (x=0).
-    *   **`http://localhost:9001/#50`**: Captures a region starting at x=50.
-    *   You can open multiple browser tabs with different hash values to see multiple, independent capture sessions running from the single server instance.
+*   **Hybrid Backend:**
+    *   **X11 (C++):** Legacy support using XShm.
+    *   **Wayland (Rust):** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
+*   **Flexible Encoding:**
+    *   **Software:** libx264 (H.264) and libjpeg-turbo (JPEG) with multi-threaded striping.
+    *   **Hardware:** NVIDIA NVENC and VA-API (Intel/AMD) with Zero-Copy support.
+*   **Smart Bandwidth Management:**
+    *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
+    *   **Paint-Over:** Automatically improves quality for static regions.
+    *   **Damage Throttling:** Limits processing during high-motion scenes.
+*   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland).
+*   **Cursor Compositing:** Hardware cursor planes or software rendering options.
+*   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.
 
 ## License
 
