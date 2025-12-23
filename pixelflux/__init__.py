@@ -69,6 +69,8 @@ if _legacy_lib:
     stop_capture_c.argtypes = [ctypes.c_void_p]
     free_stripe_encode_result_data = _legacy_lib.free_stripe_encode_result_data
     free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
+    request_idr = _legacy_lib.screen_capture_request_idr
+    request_idr.argtypes = [ctypes.c_void_p]
 
 _GLOBAL_WAYLAND_BACKEND = None
 if os.environ.get("PIXELFLUX_WAYLAND") == "true":
@@ -219,3 +221,7 @@ class ScreenCapture:
     def set_cursor_callback(self, callback):
         if _GLOBAL_WAYLAND_BACKEND:
             _GLOBAL_WAYLAND_BACKEND.set_cursor_callback(callback)
+
+    def request_idr_frame(self):
+        if self._is_capturing and self._module:
+            request_idr(self._module)

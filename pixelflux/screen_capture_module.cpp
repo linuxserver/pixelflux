@@ -671,7 +671,8 @@ StripeEncodeResult encode_stripe_h264(
   int current_crf_setting,
   int colorspace_setting,
   bool use_full_range,
-  bool h264_streaming_mode);
+  bool h264_streaming_mode,
+  bool force_id);
 
 /**
  * @brief Calculates a 64-bit XXH3 hash for a stripe of YUV data.
@@ -761,6 +762,7 @@ private:
     VaapiEncoderState vaapi_state_;
     std::mutex vaapi_mutex_;
     std::atomic<bool> vaapi_force_next_idr_{true};
+    std::atomic<bool> force_next_idr_{false};
 
     std::vector<uint8_t> full_frame_y_plane_;
     std::vector<uint8_t> full_frame_u_plane_;
@@ -897,6 +899,17 @@ public:
       watermark_path_internal.c_str(), watermark_location_internal,
       vaapi_render_node_index, use_cpu, debug_logging
       );
+  }
+
+  void request_idr(){
+    if (debug_logging) {
+      const char* backend = use_cpu ? "CPU" : (nvenc_operational ? "NVENC" : (vaapi_operational ? "VAAPI" : "None"));
+      std::cout << "Request IDR -> " << backend << std::endl;
+    }
+
+    if (use_cpu) force_next_idr_ = true;
+    else if (nvenc_operational) nvenc_force_next_idr_ = true;
+    else if (vaapi_operational) vaapi_force_next_idr_ = true;
   }
 };
 
@@ -1468,9 +1481,9 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "tune", "zerolatency", 0);
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "preset", "ultrafast", 0);
     if (use_yuv444) {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH_444_PREDICTIVE, 0);
     } else {
-        av_opt_set_int(vaapi_state_.codec_ctx, "profile", AV_PROFILE_H264_HIGH, 0);
+        av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH, 0);
     }
     av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CQP", 0);
     av_opt_set_int(vaapi_state_.codec_ctx->priv_data, "qp", qp, 0);
@@ -2803,11 +2816,12 @@ void ScreenCaptureModule::capture_loop() {
                 const uint8_t* v_plane_for_thread = full_frame_v_plane_.data() +
                     (static_cast<size_t>(this->yuv_planes_are_i444_ ?
                      start_y : (start_y / 2)) * full_frame_v_stride_);
-
+                
+                bool force_idr = this->force_next_idr_.exchange(false);
                 std::packaged_task<StripeEncodeResult(
                   MinimalEncoderStore&, int, int, int, int, const uint8_t*, int,
                   const uint8_t*, int, const uint8_t*, int, bool, int, int, int, bool,
-                  bool)>
+                  bool, bool)>
                   task(encode_stripe_h264);
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(
@@ -2821,7 +2835,8 @@ void ScreenCaptureModule::capture_loop() {
                   crf_for_encode,
                   derived_h264_colorspace_setting,
                   derived_h264_use_full_range,
-                  local_current_h264_streaming_mode
+                  local_current_h264_streaming_mode,
+									force_idr
                   ));
               }
             }
@@ -3118,7 +3133,8 @@ StripeEncodeResult encode_stripe_h264(
   int current_crf_setting,
   int colorspace_setting,
   bool use_full_range,
-  bool h264_streaming_mode) {
+  bool h264_streaming_mode,
+  bool force_idr) {
 
   StripeEncodeResult result;
   result.type = StripeDataType::H264;
@@ -3287,7 +3303,7 @@ StripeEncodeResult encode_stripe_h264(
   pic_in.img.i_stride[1] = u_stride;
   pic_in.img.i_stride[2] = v_stride;
 
-  bool force_idr_now = false;
+  bool force_idr_now = force_idr ? true :  false;
   {
     std::lock_guard<std::mutex> lock(h264_minimal_store.store_mutex);
     h264_minimal_store.ensure_size(thread_id);
@@ -3524,6 +3540,17 @@ extern "C" {
       module->start_capture();
     }
   }
+
+  // Expose the IDR request logic to the public C API
+  void screen_capture_request_idr(ScreenCaptureModuleHandle module_handle) {
+		if (module_handle) {
+			ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
+			if (module) {
+				module->request_idr();
+			}
+		}
+  }
+
   /**
    * @brief Stops the screen capture process.
    * @param module_handle Handle to the ScreenCaptureModule instance.
