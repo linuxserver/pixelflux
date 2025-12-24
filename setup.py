@@ -68,7 +68,7 @@ if not is_alpine:
 setup(
     name="pixelflux",
     install_requires=install_requires,
-    version="1.5.0",
+    version="1.5.1",
     author="Linuxserver.io",
     author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",

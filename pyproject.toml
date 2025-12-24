@@ -136,5 +136,18 @@ repair-wheel-command = """
     --exclude libffi.so.6 \
     --exclude libffi.so.7 \
     --exclude libffi.so.8 \
-    --exclude libwayland-server.so.0
+    --exclude libwayland-server.so.0 \
+    --exclude libxkbcommon.so.0 \
+    --exclude libpixman-1.so.0 \
+    --exclude liblzma.so.5 \
+    --exclude libz.so.1 \
+    --exclude libstdc++.so.6 \
+    --exclude libgcc_s.so.1 \
+    --exclude libX11.so.6 \
+    --exclude libXext.so.6 \
+    --exclude libXfixes.so.3 \
+    --exclude libxcb.so.1 \
+    --exclude libxcb-dri3.so.0 \
+    --exclude libxcb-shm.so.0 \
+    --exclude libxcb-render.so.0
 """

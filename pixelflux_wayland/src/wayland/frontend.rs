@@ -7,10 +7,14 @@ use gbm::{BufferObject, Device as RawGbmDevice};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-
+use std::sync::Mutex;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use smithay::backend::renderer::utils::RendererSurfaceState;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{ Buffer, Fourcc};
 use smithay::backend::renderer::{
-    gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
+    Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
 };
 use crate::wayland::cursor::Cursor;
 
@@ -22,7 +26,7 @@ use smithay::{
     input::{
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{
-            AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
+            AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, CursorImageStatus, GestureHoldBeginEvent,
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
             GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
@@ -39,14 +43,14 @@ use smithay::{
             Client, DisplayHandle,
         },
     },
-    utils::{Clock, IsAlive, Monotonic, Serial},
+    utils::{Clock, IsAlive, Monotonic, Serial, Rectangle},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             with_states, BufferAssignment, CompositorClientState, CompositorHandler,
             CompositorState, SurfaceAttributes,
         },
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
         seat::WaylandFocus,
@@ -60,7 +64,7 @@ use smithay::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
         },
-        shm::{with_buffer_contents, ShmHandler, ShmState},
+        shm::{with_buffer_contents, ShmHandler, ShmState, BufferAccessError},
         virtual_keyboard::VirtualKeyboardManagerState,
     },
 };
@@ -132,6 +136,8 @@ pub struct AppState {
     pub virtual_keyboard_state: VirtualKeyboardManagerState,
 
     pub current_cursor_icon: Option<CursorImageStatus>,
+    pub cursor_buffer: Option<WlBuffer>,
+    pub cursor_cache: std::collections::HashMap<u64, Vec<u8>>,
     pub render_cursor_on_framebuffer: bool,
 }
 
@@ -153,6 +159,13 @@ impl CompositorHandler for AppState {
     /// 4. Setting initial focus for keyboard/mouse when a window appears.
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        if let Some(CursorImageStatus::Surface(ref cursor_surface)) = self.current_cursor_icon {
+            if cursor_surface == surface {
+                let status = CursorImageStatus::Surface(surface.clone());
+                self.send_cursor_image(&status);
+            }
+        }
 
         if let Some(window) = self
             .space
@@ -214,6 +227,206 @@ impl CompositorHandler for AppState {
                 if let Some(keyboard) = self.seat.get_keyboard() {
                     keyboard.set_focus(self, Some(target.clone()), serial);
                 }
+            }
+        }
+    }
+}
+
+
+/// @brief Helper implementations for the global application state.
+impl AppState {
+    /// @brief Resolves the cursor state into image data and sends it to the Python layer.
+    ///
+    /// This method accepts a `CursorImageStatus` (Named, Hidden, or Surface), extracts
+    /// the relevant pixel data (checking the hash cache for surfaces to avoid re-encoding),
+    /// and outputs the final PNG bytes and hotspot coordinates to the registered Python callback.
+    fn send_cursor_image(&mut self, image: &CursorImageStatus) {
+        if let Some(ref cb) = self.cursor_callback {
+            let (msg_type, data, hot_x, hot_y) = match image {
+                CursorImageStatus::Named(icon) => {
+                    self.cursor_buffer = None;
+                    let name = cursor_icon_to_str(icon);
+                    if let Some((png_bytes, x, y)) = self.cursor_helper.get_png_data(name) {
+                        ("png", png_bytes, x as i32, y as i32)
+                    } else {
+                        ("error", Vec::new(), 0, 0)
+                    }
+                }
+                CursorImageStatus::Hidden => {
+                    self.cursor_buffer = None;
+                    ("hide", Vec::new(), 0, 0)
+                },
+                CursorImageStatus::Surface(ref surface) => {
+                    let mut final_png = Vec::new();
+                    let mut hot_x = 0;
+                    let mut hot_y = 0;
+                    let mut is_cursor_role = false;
+
+                    with_states(surface, |states| {
+                        if states.role == Some("cursor_image") {
+                            is_cursor_role = true;
+                        }
+                        if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>() {
+                            if let Ok(guard) = attributes.lock() {
+                                hot_x = guard.hotspot.x;
+                                hot_y = guard.hotspot.y;
+                            }
+                        }
+                    });
+
+                    if !is_cursor_role {
+                        return;
+                    }
+
+                    let buffer_found = with_states(surface, |states| {
+                        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+                        
+                        if let Some(BufferAssignment::NewBuffer(b)) = &attrs.current().buffer {
+                            return Some(b.clone());
+                        }
+
+                        if let Some(mutex) = states.data_map.get::<Mutex<RendererSurfaceState>>() {
+                            if let Ok(renderer_state) = mutex.try_lock() {
+                                if let Some(b) = renderer_state.buffer() {
+                                    let wl_buffer: &wayland_server::protocol::wl_buffer::WlBuffer = b;
+                                    return Some(wl_buffer.clone());
+                                }
+                            }
+                        }
+                        None
+                    });
+
+                    if let Some(buffer) = buffer_found {
+                        let shm_result = with_buffer_contents(&buffer, |ptr, len, spec| {
+                            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                            let mut hasher = DefaultHasher::new();
+                            slice.hash(&mut hasher);
+                            let hash = hasher.finish();
+                            (hash, spec.width, spec.height, spec.stride, slice.to_vec())
+                        });
+
+                        match shm_result {
+                            Ok((hash, width, height, stride, raw_bytes)) => {
+                                if let Some(cached_png) = self.cursor_cache.get(&hash) {
+                                    final_png = cached_png.clone();
+                                } else {
+                                    if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
+                                        let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+                                        let stride_usize = stride as usize;
+                                        
+                                        for y in 0..(height as u32) {
+                                            for x in 0..(width as u32) {
+                                                let offset = (y as usize * stride_usize) + (x as usize * 4);
+                                                if offset + 4 <= raw_bytes.len() {
+                                                    img_buf.put_pixel(x, y, Rgba([
+                                                        raw_bytes[offset + 2], 
+                                                        raw_bytes[offset + 1], 
+                                                        raw_bytes[offset], 
+                                                        raw_bytes[offset + 3]
+                                                    ]));
+                                                }
+                                            }
+                                        }
+
+                                        let mut bytes = Vec::new();
+                                        if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
+                                            self.cursor_cache.insert(hash, bytes.clone());
+                                            final_png = bytes;
+                                            if self.cursor_cache.len() > 100 {
+                                                self.cursor_cache.clear();
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            Err(BufferAccessError::NotManaged) => {
+                                let mut gles_data: Option<(u64, i32, i32, Vec<u8>)> = None;
+
+                                let dmabuf_opt = get_dmabuf(&buffer).ok().cloned();
+
+                                if let Some(mut dmabuf) = dmabuf_opt {
+                                    if let Some(renderer) = self.gles_renderer.as_mut() {
+                                        let width = dmabuf.width() as i32;
+                                        let height = dmabuf.height() as i32;
+
+                                        match renderer.bind(&mut dmabuf) {
+                                            Ok(mut frame) => {
+                                                let rect = Rectangle::new((0, 0).into(), (width, height).into());
+                                                
+                                                match renderer.copy_framebuffer(&mut frame, rect, Fourcc::Abgr8888) {
+                                                    Ok(mapping) => {
+                                                        match renderer.map_texture(&mapping) {
+                                                            Ok(data) => {
+                                                                let mut hasher = DefaultHasher::new();
+                                                                data.hash(&mut hasher);
+                                                                let hash = hasher.finish();
+                                                                gles_data = Some((hash, width, height, data.to_vec()));
+                                                            },
+                                                            Err(e) => eprintln!("Failed to map texture: {:?}", e)
+                                                        }
+                                                    },
+                                                    Err(e) => eprintln!("Failed to copy framebuffer: {:?}", e)
+                                                }
+                                            },
+                                            Err(e) => eprintln!("Failed to bind dmabuf to renderer: {:?}", e)
+                                        }
+                                    }
+                                }
+
+                                if let Some((hash, width, height, raw_bytes)) = gles_data {
+                                     if let Some(cached_png) = self.cursor_cache.get(&hash) {
+                                         final_png = cached_png.clone();
+                                     } else {
+                                         if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
+                                             let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+                                             let stride_usize = (width * 4) as usize;
+                                             
+                                             for y in 0..(height as u32) {
+                                                 for x in 0..(width as u32) {
+                                                     let offset = (y as usize * stride_usize) + (x as usize * 4);
+                                                     if offset + 4 <= raw_bytes.len() {
+                                                         img_buf.put_pixel(x, y, Rgba([
+                                                             raw_bytes[offset],     // R
+                                                             raw_bytes[offset + 1], // G
+                                                             raw_bytes[offset + 2], // B
+                                                             raw_bytes[offset + 3]  // A
+                                                         ]));
+                                                     }
+                                                 }
+                                             }
+
+                                             let mut bytes = Vec::new();
+                                             if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
+                                                 self.cursor_cache.insert(hash, bytes.clone());
+                                                 final_png = bytes;
+                                                 if self.cursor_cache.len() > 100 {
+                                                     self.cursor_cache.clear();
+                                                 }
+                                             }
+                                         }
+                                     }
+                                }
+                            },
+                            Err(_) => {}
+                        }
+                        
+                        self.cursor_buffer = Some(buffer);
+                    }
+
+                    if !final_png.is_empty() {
+                        ("png", final_png, hot_x, hot_y)
+                    } else {
+                        ("surface", Vec::new(), 0, 0)
+                    }
+                }
+            };
+
+            if !data.is_empty() || msg_type == "hide" || msg_type == "surface" {
+                #[allow(deprecated)]
+                Python::with_gil(|py| {
+                    let py_bytes = PyBytes::new(py, &data);
+                    let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
+                });
             }
         }
     }
@@ -659,92 +872,9 @@ impl SeatHandler for AppState {
     }
 
     /// @brief Called when the client requests a cursor change (e.g., hover over text).
-    ///
-    /// This method extracts the cursor image—either loading a system icon by name
-    /// or converting a client-provided SHM buffer to PNG—and sends it to the
-    /// Python layer to be forwarded to the web client.
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
-
-        if let Some(ref cb) = self.cursor_callback {
-            let (msg_type, data, hot_x, hot_y) = match image {
-                CursorImageStatus::Named(icon) => {
-                    let name = cursor_icon_to_str(&icon);
-                    if let Some((png_bytes, x, y)) = self.cursor_helper.get_png_data(name) {
-                        ("png", png_bytes, x, y)
-                    } else {
-                        ("error", Vec::new(), 0, 0)
-                    }
-                }
-                CursorImageStatus::Hidden => ("hide", Vec::new(), 0, 0),
-                CursorImageStatus::Surface(ref surface) => {
-                    let mut png_data = Vec::new();
-                    let hot_x = 0;
-                    let hot_y = 0;
-
-                    let buffer = with_states(surface, |states| {
-                        states
-                            .cached_state
-                            .get::<SurfaceAttributes>()
-                            .current()
-                            .buffer
-                            .as_ref()
-                            .and_then(|b| match b {
-                                BufferAssignment::NewBuffer(buffer) => Some(buffer.clone()),
-                                _ => None,
-                            })
-                    });
-
-                    if let Some(buffer) = buffer {
-                        let _ = with_buffer_contents(&buffer, |ptr, len, spec| {
-                            let width = spec.width as u32;
-                            let height = spec.height as u32;
-                            let stride = spec.stride as usize;
-
-                            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-                            let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
-
-                            for y in 0..height {
-                                for x in 0..width {
-                                    let offset = (y as usize * stride) + (x as usize * 4);
-                                    if offset + 4 <= slice.len() {
-                                        let b = slice[offset];
-                                        let g = slice[offset + 1];
-                                        let r = slice[offset + 2];
-                                        let a = slice[offset + 3];
-
-                                        img_buf.put_pixel(x, y, Rgba([r, g, b, a]));
-                                    }
-                                }
-                            }
-
-                            let mut bytes = Vec::new();
-                            let mut cursor = IoCursor::new(&mut bytes);
-                            if img_buf.write_to(&mut cursor, ImageFormat::Png).is_ok() {
-                                png_data = bytes;
-                            }
-                        });
-                    }
-
-                    if !png_data.is_empty() {
-                        ("png", png_data, hot_x, hot_y)
-                    } else {
-                        ("surface", Vec::new(), 0, 0)
-                    }
-                }
-            };
-
-            if !data.is_empty() || msg_type == "hide" {
-                #[allow(deprecated)]
-                Python::with_gil(|py| {
-                    let py_bytes = PyBytes::new(py, &data);
-                    if let Err(e) = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y)) {
-                        eprintln!("Cursor Callback error: {:?}", e);
-                    }
-                });
-            }
-        }
+        self.send_cursor_image(&image);
     }
 
     fn focus_changed(&mut self, _seat: &Seat<AppState>, _focus: Option<&Self::KeyboardFocus>) {}

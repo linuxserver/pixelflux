@@ -394,6 +394,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         cursor_helper: Cursor::load(),
         overlay_state: OverlayState::default(),
         current_cursor_icon: None,
+        cursor_buffer: None,
+        cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
     };
 
