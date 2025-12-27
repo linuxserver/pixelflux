@@ -35,7 +35,7 @@ features = ["cuda"]
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
-rev = "v0.7.0"
+rev = "ca932e042fa9ad150605c150a86275b85f9ad5b3"
 default-features = false
 features = [
     "backend_drm",

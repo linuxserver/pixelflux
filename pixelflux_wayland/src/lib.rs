@@ -50,7 +50,7 @@ use smithay::{
     desktop::{space::SpaceRenderElements, Space},
     input::{
         keyboard::{FilterResult, XkbConfig},
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
         SeatState,
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
@@ -74,6 +74,8 @@ use smithay::{
         shm::ShmState,
         socket::ListeningSocketSource,
         virtual_keyboard::VirtualKeyboardManagerState,
+        pointer_warp::PointerWarpManager,
+        relative_pointer::RelativePointerManagerState,
     },
 };
 
@@ -96,7 +98,7 @@ use encoders::software::MAX_STRIPE_CAPACITY;
 use encoders::vaapi::VaapiEncoder;
 
 use wayland::cursor::Cursor;
-use wayland::frontend::{AppState, ClientState, FocusTarget, GpuEncoder};
+use wayland::frontend::{AppState, ClientState, FocusTarget, GpuEncoder, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;
@@ -194,6 +196,7 @@ pub enum ThreadCommand {
     SetCursorCallback(Py<PyAny>),
     KeyboardKey { scancode: u32, state: u32 },
     PointerMotion { x: f64, y: f64 },
+    PointerRelativeMotion { dx: f64, dy: f64 },
     PointerButton { btn: u32, state: u32 },
     PointerAxis { x: f64, y: f64 },
     UpdateCursorConfig { render_on_framebuffer: bool },
@@ -345,6 +348,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let space = Space::default();
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
     let virtual_keyboard_state = VirtualKeyboardManagerState::new::<AppState, _>(&dh, |_client| true);
+    let pointer_warp_state = PointerWarpManager::new::<AppState>(&dh);
+    let relative_pointer_state = RelativePointerManagerState::new::<AppState>(&dh);
 
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
     seat.add_keyboard(XkbConfig::default(), 200, 25)
@@ -365,6 +370,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         dh: dh.clone(),
         seat,
         virtual_keyboard_state,
+        pointer_warp_state,
+        relative_pointer_state,
         outputs: Vec::new(),
         pending_windows: Vec::new(),
         frame_buffer: vec![0u8; (width * height * 4) as usize],
@@ -406,6 +413,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
             subpixel: Subpixel::Unknown,
             make: "Pixelflux".into(),
             model: "Virtual".into(),
+            serial_number: "001".into(),
         },
     );
     output.change_current_state(
@@ -689,8 +697,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 }
                 CalloopEvent::Msg(ThreadCommand::KeyboardKey { scancode, state: key_state_val }) => {
                     let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
-                    let serial = Serial::from(state.clock.now().as_millis() as u32);
-                    let time = state.clock.now().as_millis() as u32;
+                    let serial = next_serial();
+                    let time = wayland_time();
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         keyboard.input(state, Keycode::new(scancode), key_state, serial, time, |_, _, _| {
                             FilterResult::<()>::Forward
@@ -698,8 +706,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     }
                 }
                 CalloopEvent::Msg(ThreadCommand::PointerMotion { x, y }) => {
-                    let serial = Serial::from(state.clock.now().as_millis() as u32);
-                    let time = state.clock.now().as_millis() as u32;
+                    let serial = next_serial();
+                    let time = wayland_time();
                     let scale = state.settings.scale;
                     let logical_w = (state.settings.width as f64 / scale).floor();
                     let logical_h = (state.settings.height as f64 / scale).floor();
@@ -715,9 +723,50 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         pointer.frame(state);
                     }
                 }
+                CalloopEvent::Msg(ThreadCommand::PointerRelativeMotion { dx, dy }) => {
+                    let utime = wayland_utime();
+                    let time = wayland_time();
+                    let serial = next_serial();
+
+                    if let Some(pointer) = state.seat.get_pointer() {
+                        let current_pos = pointer.current_location();
+                        
+                        let scale = state.settings.scale;
+                        let max_w = (state.settings.width as f64 / scale).floor() - 1.0;
+                        let max_h = (state.settings.height as f64 / scale).floor() - 1.0;
+
+                        let new_x = (current_pos.x + dx).max(0.0).min(max_w);
+                        let new_y = (current_pos.y + dy).max(0.0).min(max_h);
+                        
+                        let new_pos = Point::<f64, smithay::utils::Logical>::from((new_x, new_y));
+
+                        let under = state.space.element_under(new_pos).map(|(window, loc)| {
+                            (FocusTarget(window.clone()), loc.to_f64())
+                        });
+
+                        pointer.motion(
+                            state, 
+                            under.clone(), 
+                            &MotionEvent { 
+                                location: new_pos, 
+                                serial, 
+                                time 
+                            }
+                        );
+
+                        let event = RelativeMotionEvent {
+                            utime,
+                            delta: (dx, dy).into(),
+                            delta_unaccel: (dx, dy).into(),
+                        };
+                        pointer.relative_motion(state, under, &event);
+
+                        pointer.frame(state);
+                    }
+                }
                 CalloopEvent::Msg(ThreadCommand::PointerButton { btn, state: btn_state_val }) => {
-                    let serial = Serial::from(state.clock.now().as_millis() as u32);
-                    let time = state.clock.now().as_millis() as u32;
+                    let serial = next_serial();
+                    let time = wayland_time();
                     let button_state = if btn_state_val > 0 { smithay::backend::input::ButtonState::Pressed } else { smithay::backend::input::ButtonState::Released };
 
                     if let Some(pointer) = state.seat.get_pointer() {
@@ -737,11 +786,25 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     }
                 }
                 CalloopEvent::Msg(ThreadCommand::PointerAxis { x, y }) => {
-                    let time = state.clock.now().as_millis() as u32;
+                    let time = wayland_time();
+                    
                     if let Some(pointer) = state.seat.get_pointer() {
+                        const V120_MULTIPLIER: f64 = 12.0; 
+
                         let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
-                        if x != 0.0 { frame = frame.value(Axis::Horizontal, x); }
-                        if y != 0.0 { frame = frame.value(Axis::Vertical, y); }
+
+                        if x != 0.0 { 
+                            frame = frame
+                                .value(Axis::Horizontal, x)
+                                .v120(Axis::Horizontal, (x * V120_MULTIPLIER) as i32);
+                        }
+                        
+                        if y != 0.0 { 
+                            frame = frame
+                                .value(Axis::Vertical, y)
+                                .v120(Axis::Vertical, (y * V120_MULTIPLIER) as i32);
+                        }
+
                         if x != 0.0 || y != 0.0 {
                             pointer.axis(state, frame);
                             pointer.frame(state);
@@ -1331,6 +1394,13 @@ impl WaylandBackend {
         self.tx
             .send(ThreadCommand::PointerMotion { x, y })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject motion: {}", e)))?;
+        Ok(())
+    }
+
+    fn inject_relative_mouse_move(&mut self, dx: f64, dy: f64) -> PyResult<()> {
+        self.tx
+            .send(ThreadCommand::PointerRelativeMotion { dx, dy })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject relative motion: {}", e)))?;
         Ok(())
     }
 

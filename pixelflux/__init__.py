@@ -200,6 +200,10 @@ class ScreenCapture:
         if _GLOBAL_WAYLAND_BACKEND:
             _GLOBAL_WAYLAND_BACKEND.inject_mouse_move(float(x), float(y))
 
+    def inject_relative_mouse_move(self, dx, dy):
+        if _GLOBAL_WAYLAND_BACKEND:
+            _GLOBAL_WAYLAND_BACKEND.inject_relative_mouse_move(float(dx), float(dy))
+
     def inject_mouse_button(self, btn, state):
         if _GLOBAL_WAYLAND_BACKEND:
             _GLOBAL_WAYLAND_BACKEND.inject_mouse_button(btn, state)

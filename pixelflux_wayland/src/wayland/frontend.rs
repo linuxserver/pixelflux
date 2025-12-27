@@ -16,12 +16,17 @@ use smithay::backend::allocator::{ Buffer, Fourcc};
 use smithay::backend::renderer::{
     Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
 };
+use smithay::input::dnd::{DndFocus, Source};
+use std::sync::Arc;
 use crate::wayland::cursor::Cursor;
+use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
+use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
     delegate_output, delegate_seat, delegate_shm, delegate_virtual_keyboard_manager,
-    delegate_xdg_shell,
+    delegate_xdg_shell, delegate_relative_pointer, delegate_pointer_warp, 
     desktop::{Space, Window},
     input::{
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
@@ -43,7 +48,7 @@ use smithay::{
             Client, DisplayHandle,
         },
     },
-    utils::{Clock, IsAlive, Monotonic, Serial, Rectangle},
+    utils::{Clock, IsAlive, Monotonic, Serial, Rectangle, Point, Logical},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -56,7 +61,7 @@ use smithay::{
         seat::WaylandFocus,
         selection::{
             data_device::{
-                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
             },
             SelectionHandler,
         },
@@ -73,6 +78,30 @@ use crate::encoders::overlay::OverlayState;
 use crate::encoders::vaapi::VaapiEncoder;
 use crate::nvenc::NvencEncoder;
 use crate::{RustCaptureSettings, StripeState};
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+pub fn next_serial() -> Serial {
+    Serial::from(SERIAL_COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+pub fn wayland_time() -> u32 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u32).wrapping_mul(1000).wrapping_add((ts.tv_nsec as u32) / 1_000_000)
+}
+
+pub fn wayland_utime() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
+}
 
 /// @brief Enum wrapper for supported GPU hardware encoders.
 pub enum GpuEncoder {
@@ -139,6 +168,8 @@ pub struct AppState {
     pub cursor_buffer: Option<WlBuffer>,
     pub cursor_cache: std::collections::HashMap<u64, Vec<u8>>,
     pub render_cursor_on_framebuffer: bool,
+    pub pointer_warp_state: PointerWarpManager,
+    pub relative_pointer_state: RelativePointerManagerState,
 }
 
 /// @brief Handler for core compositor events like surface creation and commits.
@@ -222,7 +253,7 @@ impl CompositorHandler for AppState {
                     output.enter(surface);
                 }
 
-                let serial = Serial::from(self.clock.now().as_millis() as u32);
+                let serial = next_serial();
                 let target = FocusTarget(window.clone());
                 if let Some(keyboard) = self.seat.get_keyboard() {
                     keyboard.set_focus(self, Some(target.clone()), serial);
@@ -432,18 +463,16 @@ impl AppState {
     }
 }
 
-// --- Boilerplate implementations for various Wayland protocols ---
-
 impl SelectionHandler for AppState {
     type SelectionUserData = ();
 }
+
 impl DataDeviceHandler for AppState {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
     }
 }
-impl ClientDndGrabHandler for AppState {}
-impl ServerDndGrabHandler for AppState {}
+impl WaylandDndGrabHandler for AppState {}
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
@@ -571,6 +600,81 @@ impl KeyboardTarget<AppState> for FocusTarget {
                 modifiers,
                 serial,
             );
+        }
+    }
+}
+
+/// @brief Routes Drag'n'Drop events to the underlying Wayland surface.
+///
+/// This delegates DnD operations (enter, motion, leave, drop) to the specific
+/// Wayland surface, allowing clients to negotiate data transfers (like file drops
+/// or text copy/paste) via the Wayland protocol.
+impl DndFocus<AppState> for FocusTarget {
+    type OfferData<S: Source> = <WlSurface as DndFocus<AppState>>::OfferData<S>;
+
+    fn enter<S: Source>(
+        &self,
+        data: &mut AppState,
+        dh: &DisplayHandle,
+        source: Arc<S>,
+        seat: &Seat<AppState>,
+        location: Point<f64, Logical>,
+        serial: &Serial,
+    ) -> Option<Self::OfferData<S>> {
+        if let Some(surface) = self.wl_surface() {
+            <WlSurface as DndFocus<AppState>>::enter(
+                surface.as_ref(),
+                data,
+                dh,
+                source,
+                seat,
+                location,
+                serial,
+            )
+        } else {
+            None
+        }
+    }
+
+    fn motion<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<AppState>,
+        location: Point<f64, Logical>,
+        time: u32,
+    ) {
+        if let Some(surface) = self.wl_surface() {
+            <WlSurface as DndFocus<AppState>>::motion(
+                surface.as_ref(),
+                data,
+                offer,
+                seat,
+                location,
+                time,
+            )
+        }
+    }
+
+    fn leave<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<AppState>,
+    ) {
+        if let Some(surface) = self.wl_surface() {
+            <WlSurface as DndFocus<AppState>>::leave(surface.as_ref(), data, offer, seat)
+        }
+    }
+
+    fn drop<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<AppState>,
+    ) {
+        if let Some(surface) = self.wl_surface() {
+            <WlSurface as DndFocus<AppState>>::drop(surface.as_ref(), data, offer, seat)
         }
     }
 }
@@ -880,6 +984,46 @@ impl SeatHandler for AppState {
     fn focus_changed(&mut self, _seat: &Seat<AppState>, _focus: Option<&Self::KeyboardFocus>) {}
 }
 
+/// @brief Handler for pointer warp requests, enabling clients to reset the cursor position.
+impl PointerWarpHandler for AppState {
+    fn warp_pointer(
+        &mut self,
+        surface: WlSurface,
+        _pointer: WlPointer,
+        pos: Point<f64, Logical>,
+        serial: Serial,
+    ) {
+        let surface_origin = self.space.elements().find_map(|window| {
+            if window.wl_surface().as_deref() == Some(&surface) {
+                self.space.element_location(window)
+            } else {
+                None
+            }
+        });
+
+        if let Some(origin) = surface_origin {
+            let global_pos = origin.to_f64() + pos;
+            let time = wayland_time();
+
+            if let Some(pointer) = self.seat.get_pointer() {
+                let under = self.space.element_under(global_pos).map(|(w, loc)| {
+                    (FocusTarget(w.clone()), loc.to_f64())
+                });
+                
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: global_pos,
+                        serial, 
+                        time,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// @brief Manages XDG Shell events (application windows).
 impl XdgShellHandler for AppState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -928,3 +1072,5 @@ delegate_dmabuf!(AppState);
 delegate_fractional_scale!(AppState);
 delegate_virtual_keyboard_manager!(AppState);
 delegate_data_device!(AppState);
+delegate_pointer_warp!(AppState);
+delegate_relative_pointer!(AppState);
