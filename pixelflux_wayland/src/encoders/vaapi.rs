@@ -11,8 +11,8 @@ use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
 static FF_INIT: Once = Once::new();
-
 const AV_DRM_MAX_PLANES: usize = 4;
+const QP_HYSTERESIS_LIMIT: u32 = 60;
 
 /// @brief Describes a DRM object (file descriptor) for FFmpeg interop.
 #[repr(C)]
@@ -81,6 +81,7 @@ fn ff_err_str(err: i32) -> String {
 /// filter graphs for format conversion, and the encoding loop.
 pub struct VaapiEncoder {
     encoder_ctx: *mut ff::AVCodecContext,
+    codec: *const ff::AVCodec,
 
     #[allow(dead_code)]
     hw_device_ctx: *mut ff::AVBufferRef,
@@ -88,6 +89,8 @@ pub struct VaapiEncoder {
     drm_device_ctx: *mut ff::AVBufferRef,
     #[allow(dead_code)]
     drm_frames_ctx: *mut ff::AVBufferRef,
+    
+    enc_frames_ctx: *mut ff::AVBufferRef,
 
     filter_graph: *mut ff::AVFilterGraph,
     buffersrc_ctx: *mut ff::AVFilterContext,
@@ -101,7 +104,10 @@ pub struct VaapiEncoder {
 
     width: i32,
     height: i32,
+    fps: i32,
+    
     current_qp: u32,
+    qp_hysteresis_counter: u32,
 }
 
 unsafe impl Send for VaapiEncoder {}
@@ -130,6 +136,9 @@ impl Drop for VaapiEncoder {
                 ff::avcodec_free_context(&mut self.encoder_ctx);
             }
 
+            if !self.enc_frames_ctx.is_null() {
+                ff::av_buffer_unref(&mut self.enc_frames_ctx);
+            }
             if !self.drm_frames_ctx.is_null() {
                 ff::av_buffer_unref(&mut self.drm_frames_ctx);
             }
@@ -215,15 +224,6 @@ impl VaapiEncoder {
                 return Err("h264_vaapi encoder not found".into());
             }
 
-            let encoder_ctx = ff::avcodec_alloc_context3(codec);
-            (*encoder_ctx).width = width;
-            (*encoder_ctx).height = height;
-            (*encoder_ctx).time_base = ff::AVRational { num: 1, den: fps };
-            (*encoder_ctx).framerate = ff::AVRational { num: fps, den: 1 };
-            (*encoder_ctx).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            (*encoder_ctx).hw_device_ctx = ff::av_buffer_ref(hw_device_ctx);
-            (*encoder_ctx).max_b_frames = 0;
-
             let mut enc_frames_ref = ff::av_hwframe_ctx_alloc(hw_device_ctx);
             let enc_frames = (*enc_frames_ref).data as *mut ff::AVHWFramesContext;
             (*enc_frames).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
@@ -235,7 +235,19 @@ impl VaapiEncoder {
             if ff::av_hwframe_ctx_init(enc_frames_ref) < 0 {
                 return Err("Failed to init encoder frames ctx".into());
             }
+
+            // Keep a reference for restarting the encoder
+            let saved_enc_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
+
+            let encoder_ctx = ff::avcodec_alloc_context3(codec);
+            (*encoder_ctx).width = width;
+            (*encoder_ctx).height = height;
+            (*encoder_ctx).time_base = ff::AVRational { num: 1, den: fps };
+            (*encoder_ctx).framerate = ff::AVRational { num: fps, den: 1 };
+            (*encoder_ctx).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*encoder_ctx).hw_device_ctx = ff::av_buffer_ref(hw_device_ctx);
             (*encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
+            (*encoder_ctx).max_b_frames = 0;
 
             ff::av_buffer_unref(&mut enc_frames_ref);
 
@@ -350,9 +362,11 @@ impl VaapiEncoder {
 
             Ok(Self {
                 encoder_ctx,
+                codec,
                 hw_device_ctx,
                 drm_device_ctx,
                 drm_frames_ctx: drm_frames_ref,
+                enc_frames_ctx: saved_enc_frames_ctx,
                 filter_graph,
                 buffersrc_ctx,
                 buffersink_ctx,
@@ -362,24 +376,83 @@ impl VaapiEncoder {
                 packet: ff::av_packet_alloc(),
                 width,
                 height,
+                fps,
                 current_qp: settings.h264_crf as u32,
+                qp_hysteresis_counter: 0,
             })
         }
     }
 
-    /// @brief Updates the quantization parameter (QP) if changed.
-    unsafe fn update_qp(&mut self, qp: u32) {
-        if self.current_qp != qp {
-            let qp_str = CString::new(qp.to_string()).unwrap();
-            let key = CString::new("qp").unwrap();
-            ff::av_opt_set(
-                self.encoder_ctx as *mut c_void,
-                key.as_ptr(),
-                qp_str.as_ptr(),
-                0,
-            );
-            self.current_qp = qp;
+    /// @brief Completely restarts the encoder context with a new QP.
+    ///
+    /// This is required because VAAPI dynamic QP updates are flaky or unsupported
+    /// on some drivers, necessitating a full stream stop/start to apply changes cleanly.
+    unsafe fn restart_encoder(&mut self, new_qp: u32) -> Result<(), String> {
+        if !self.encoder_ctx.is_null() {
+            ff::avcodec_free_context(&mut self.encoder_ctx);
         }
+
+        self.encoder_ctx = ff::avcodec_alloc_context3(self.codec);
+        if self.encoder_ctx.is_null() {
+            return Err("Failed to re-alloc encoder context".into());
+        }
+
+        (*self.encoder_ctx).width = self.width;
+        (*self.encoder_ctx).height = self.height;
+        (*self.encoder_ctx).time_base = ff::AVRational { num: 1, den: self.fps };
+        (*self.encoder_ctx).framerate = ff::AVRational { num: self.fps, den: 1 };
+        (*self.encoder_ctx).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*self.encoder_ctx).hw_device_ctx = ff::av_buffer_ref(self.hw_device_ctx);
+        (*self.encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(self.enc_frames_ctx);
+        (*self.encoder_ctx).max_b_frames = 0;
+
+        let mut opts: *mut ff::AVDictionary = ptr::null_mut();
+        let set_opt = |d: &mut *mut ff::AVDictionary, k: &str, v: &str| {
+            let ck = CString::new(k).unwrap();
+            let cv = CString::new(v).unwrap();
+            ff::av_dict_set(d, ck.as_ptr(), cv.as_ptr(), 0);
+        };
+
+        set_opt(&mut opts, "rc_mode", "CQP");
+        set_opt(&mut opts, "qp", &new_qp.to_string());
+        set_opt(&mut opts, "async_depth", "1");
+        set_opt(&mut opts, "profile", "high");
+        set_opt(&mut opts, "level", "4.1");
+
+        let ret = ff::avcodec_open2(self.encoder_ctx, self.codec, &mut opts);
+        ff::av_dict_free(&mut opts);
+
+        if ret < 0 {
+            return Err(format!("Failed to re-open encoder: {}", ff_err_str(ret)));
+        }
+
+        self.current_qp = new_qp;
+        Ok(())
+    }
+
+    /// @brief Updates the quantization parameter (QP) with hysteresis.
+    ///
+    /// If QP decreases (higher quality paint-over), it restarts immediately.
+    /// If QP increases (lower quality motion), it waits for the hysteresis limit
+    /// to avoid blinking artifacts.
+    unsafe fn update_qp(&mut self, target_qp: u32) -> Result<(), String> {
+        if target_qp == self.current_qp {
+            self.qp_hysteresis_counter = 0;
+            return Ok(()).into();
+        }
+
+        if target_qp < self.current_qp {
+            self.qp_hysteresis_counter = 0;
+            self.restart_encoder(target_qp)?;
+        } else {
+            self.qp_hysteresis_counter += 1;
+            if self.qp_hysteresis_counter > QP_HYSTERESIS_LIMIT {
+                self.qp_hysteresis_counter = 0;
+                self.restart_encoder(target_qp)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// @brief Retrieves encoded packets from the encoder and formats them with the custom header.
@@ -421,7 +494,7 @@ impl VaapiEncoder {
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         unsafe {
-            self.update_qp(qp);
+            self.update_qp(qp)?;
 
             let desc_size = mem::size_of::<AVDRMFrameDescriptor>();
             let desc_ptr = ff::av_mallocz(desc_size) as *mut AVDRMFrameDescriptor;
@@ -526,7 +599,7 @@ impl VaapiEncoder {
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         unsafe {
-            self.update_qp(qp);
+            self.update_qp(qp)?;
 
             let width = self.width as usize;
             let height = self.height as usize;

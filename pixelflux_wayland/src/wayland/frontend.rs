@@ -22,11 +22,14 @@ use crate::wayland::cursor::Cursor;
 use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
+use smithay::input::pointer::PointerHandle;
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
     delegate_output, delegate_seat, delegate_shm, delegate_virtual_keyboard_manager,
     delegate_xdg_shell, delegate_relative_pointer, delegate_pointer_warp, 
+    delegate_pointer_constraints,
     desktop::{Space, Window},
     input::{
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
@@ -170,6 +173,18 @@ pub struct AppState {
     pub render_cursor_on_framebuffer: bool,
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
+    pub pointer_constraints_state: PointerConstraintsState,
+}
+
+impl PointerConstraintsHandler for AppState {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {}
 }
 
 /// @brief Handler for core compositor events like surface creation and commits.
@@ -1074,3 +1089,4 @@ delegate_virtual_keyboard_manager!(AppState);
 delegate_data_device!(AppState);
 delegate_pointer_warp!(AppState);
 delegate_relative_pointer!(AppState);
+delegate_pointer_constraints!(AppState);

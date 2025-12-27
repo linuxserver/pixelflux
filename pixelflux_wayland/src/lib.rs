@@ -62,7 +62,7 @@ use smithay::{
         pixman,
         wayland_server::{Display, DisplayHandle},
     },
-    utils::{Clock, Physical, Point, Rectangle, Scale, Serial, Transform},
+    utils::{Clock, Physical, Point, Rectangle, Scale, Transform},
     wayland::{
         compositor::{with_states, CompositorState},
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
@@ -76,6 +76,7 @@ use smithay::{
         virtual_keyboard::VirtualKeyboardManagerState,
         pointer_warp::PointerWarpManager,
         relative_pointer::RelativePointerManagerState,
+        pointer_constraints::PointerConstraintsState,
     },
 };
 
@@ -350,6 +351,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let virtual_keyboard_state = VirtualKeyboardManagerState::new::<AppState, _>(&dh, |_client| true);
     let pointer_warp_state = PointerWarpManager::new::<AppState>(&dh);
     let relative_pointer_state = RelativePointerManagerState::new::<AppState>(&dh);
+    let pointer_constraints_state = PointerConstraintsState::new::<AppState>(&dh);
 
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
     seat.add_keyboard(XkbConfig::default(), 200, 25)
@@ -372,6 +374,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         virtual_keyboard_state,
         pointer_warp_state,
         relative_pointer_state,
+        pointer_constraints_state,
         outputs: Vec::new(),
         pending_windows: Vec::new(),
         frame_buffer: vec![0u8; (width * height * 4) as usize],
