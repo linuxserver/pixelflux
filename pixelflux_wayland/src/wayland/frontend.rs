@@ -19,11 +19,41 @@ use smithay::backend::renderer::{
 use smithay::input::dnd::{DndFocus, Source};
 use std::sync::Arc;
 use crate::wayland::cursor::Cursor;
+use smithay::wayland::viewporter::ViewporterState;
+use smithay::delegate_viewporter;
 use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::input::pointer::PointerHandle;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::delegate_single_pixel_buffer;
+use smithay::desktop::{PopupKind, PopupManager};
+use smithay::wayland::presentation::PresentationState;
+use smithay::delegate_presentation;
+use smithay::wayland::foreign_toplevel_list::{
+    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+};
+use smithay::wayland::shell::xdg::decoration::{
+    XdgDecorationHandler, XdgDecorationState,
+};
+use smithay::desktop::{layer_map_for_output, LayerSurface as DesktopLayerSurface};
+use smithay::wayland::shell::wlr_layer::{
+    WlrLayerShellHandler, WlrLayerShellState, Layer as WlrLayer, LayerSurface as WlrLayerSurface,
+};
+use smithay::delegate_layer_shell;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+use smithay::{delegate_foreign_toplevel_list, delegate_xdg_decoration};
+use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
+use smithay::delegate_data_control;
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
+use smithay::delegate_xdg_activation;
+use smithay::wayland::selection::primary_selection::{
+    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+};
+use smithay::delegate_primary_selection;
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
@@ -48,7 +78,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
-            Client, DisplayHandle,
+            Client, DisplayHandle, Resource,
         },
     },
     utils::{Clock, IsAlive, Monotonic, Serial, Rectangle, Point, Logical},
@@ -120,21 +150,31 @@ pub enum GpuEncoder {
 pub struct AppState {
     pub compositor_state: CompositorState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    pub viewporter_state: ViewporterState,
+    pub presentation_state: PresentationState,
     pub shm_state: ShmState,
+    pub single_pixel_buffer: SinglePixelBufferState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
     pub seat_state: SeatState<AppState>,
     pub shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
     pub space: Space<Window>,
     pub data_device_state: DataDeviceState,
+    pub data_control_state: DataControlState,
     pub dh: DisplayHandle,
     #[allow(dead_code)]
     pub seat: Seat<AppState>,
     pub outputs: Vec<Output>,
     pub pending_windows: Vec<Window>,
 
+    pub foreign_toplevel_list: ForeignToplevelListState,
+    pub xdg_decoration_state: XdgDecorationState,
+    pub xdg_activation_state: XdgActivationState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub popups: PopupManager,
     pub frame_buffer: Vec<u8>,
     pub nv12_buffer: Vec<u8>,
 
@@ -187,6 +227,99 @@ impl PointerConstraintsHandler for AppState {
     ) {}
 }
 
+impl ForeignToplevelListHandler for AppState {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list
+    }
+}
+
+impl XdgActivationHandler for AppState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        _token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        if token_data.timestamp.elapsed().as_secs() < 10 {
+            let window = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(&surface)).cloned();
+            if let Some(window) = window {
+                self.space.raise_element(&window, true);
+            }
+        }
+    }
+}
+
+impl PrimarySelectionHandler for AppState {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+
+impl XdgDecorationHandler for AppState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(mode);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
+impl WlrLayerShellHandler for AppState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        _layer: WlrLayer,
+        namespace: String,
+    ) {
+        let smithay_output = if let Some(wlo) = output.as_ref() {
+            self.outputs.iter().find(|o| o.owns(wlo))
+        } else {
+            self.outputs.first()
+        };
+
+        if let Some(output) = smithay_output {
+            let mode = output.current_mode().unwrap();
+            
+            surface.with_pending_state(|state| {
+                state.size = Some(((mode.size.w as f64) as i32, (mode.size.h as f64) as i32).into());
+            });
+            surface.send_configure();
+
+            let layer = DesktopLayerSurface::new(surface, namespace);
+            let _ = layer_map_for_output(output).map_layer(&layer);
+        }
+    }
+
+    fn layer_destroyed(&mut self, _surface: WlrLayerSurface) {}
+}
+
 /// @brief Handler for core compositor events like surface creation and commits.
 impl CompositorHandler for AppState {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -206,11 +339,40 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
+        if let Some(output) = self.outputs.first() {
+            let mut layer_map = layer_map_for_output(output);
+            let mut found = false;
+            for layer in layer_map.layers() {
+                if layer.wl_surface() == surface {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                layer_map.arrange();
+            }
+        }
+
         if let Some(CursorImageStatus::Surface(ref cursor_surface)) = self.current_cursor_icon {
             if cursor_surface == surface {
                 let status = CursorImageStatus::Surface(surface.clone());
                 self.send_cursor_image(&status);
             }
+        }
+
+        if let Some(handle) = with_states(surface, |states| states.data_map.get::<ForeignToplevelHandle>().cloned()) {
+             if let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(surface)) {
+                 if let Some(_toplevel) = window.toplevel() {
+                     let (title, app_id) = with_states(surface, |states| {
+                        let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap();
+                        (attributes.title.clone(), attributes.app_id.clone())
+                     });
+                     
+                     handle.send_title(&title.unwrap_or_default());
+                     handle.send_app_id(&app_id.unwrap_or_default());
+                     handle.send_done();
+                 }
+             }
         }
 
         if let Some(window) = self
@@ -269,7 +431,7 @@ impl CompositorHandler for AppState {
                 }
 
                 let serial = next_serial();
-                let target = FocusTarget(window.clone());
+                let target = FocusTarget::Window(window.clone());
                 if let Some(keyboard) = self.seat.get_keyboard() {
                     keyboard.set_focus(self, Some(target.clone()), serial);
                 }
@@ -487,6 +649,11 @@ impl DataDeviceHandler for AppState {
         &mut self.data_device_state
     }
 }
+impl DataControlHandler for AppState {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
+    }
+}
 impl WaylandDndGrabHandler for AppState {}
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -535,20 +702,48 @@ impl FractionalScaleHandler for AppState {
 /// (mouse, keyboard, touch). This struct bridges the gap between the abstract
 /// input event and the concrete Wayland surface contained within a `Window`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FocusTarget(pub Window);
+pub enum FocusTarget {
+    Window(Window),
+    Popup(PopupKind),
+    LayerSurface(DesktopLayerSurface),
+}
+
+impl From<Window> for FocusTarget {
+    fn from(w: Window) -> Self { FocusTarget::Window(w) }
+}
+
+impl From<PopupKind> for FocusTarget {
+    fn from(p: PopupKind) -> Self { FocusTarget::Popup(p) }
+}
+
+impl From<DesktopLayerSurface> for FocusTarget {
+    fn from(l: DesktopLayerSurface) -> Self { FocusTarget::LayerSurface(l) }
+}
 
 impl IsAlive for FocusTarget {
     fn alive(&self) -> bool {
-        self.0.alive()
+        match self {
+            FocusTarget::Window(w) => w.alive(),
+            FocusTarget::Popup(p) => p.alive(),
+            FocusTarget::LayerSurface(l) => l.alive(),
+        }
     }
 }
 
 impl WaylandFocus for FocusTarget {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
-        self.0.wl_surface()
+        match self {
+            FocusTarget::Window(w) => w.wl_surface(),
+            FocusTarget::Popup(p) => Some(Cow::Borrowed(p.wl_surface())),
+            FocusTarget::LayerSurface(l) => Some(Cow::Borrowed(l.wl_surface())),
+        }
     }
     fn same_client_as(&self, object_id: &ObjectId) -> bool {
-        self.0.same_client_as(object_id)
+        match self {
+            FocusTarget::Window(w) => w.same_client_as(object_id),
+            FocusTarget::Popup(p) => p.wl_surface().id().same_client_as(object_id),
+            FocusTarget::LayerSurface(l) => l.wl_surface().id().same_client_as(object_id),
+        }
     }
 }
 
@@ -996,7 +1191,16 @@ impl SeatHandler for AppState {
         self.send_cursor_image(&image);
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<AppState>, _focus: Option<&Self::KeyboardFocus>) {}
+    fn focus_changed(&mut self, seat: &Seat<AppState>, focus: Option<&Self::KeyboardFocus>) {
+        if let Some(focus_target) = focus {
+            let dh = &self.dh;
+            let client = focus_target.wl_surface().and_then(|s| dh.get_client(s.id()).ok());
+            set_primary_focus(dh, seat, client);
+        } else {
+            let dh = &self.dh;
+            set_primary_focus(dh, seat, None);
+        }
+    }
 }
 
 /// @brief Handler for pointer warp requests, enabling clients to reset the cursor position.
@@ -1022,7 +1226,7 @@ impl PointerWarpHandler for AppState {
 
             if let Some(pointer) = self.seat.get_pointer() {
                 let under = self.space.element_under(global_pos).map(|(w, loc)| {
-                    (FocusTarget(w.clone()), loc.to_f64())
+                    (FocusTarget::Window(w.clone()), loc.to_f64())
                 });
                 
                 pointer.motion(
@@ -1048,23 +1252,52 @@ impl XdgShellHandler for AppState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
         self.pending_windows.push(window);
+        let (title, app_id) = with_states(surface.wl_surface(), |states| {
+            let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap();
+            (attributes.title.clone(), attributes.app_id.clone())
+        });
+
+        let handle = self.foreign_toplevel_list.new_toplevel::<AppState>(title.unwrap_or_default(), app_id.unwrap_or_default());
+        
+        with_states(surface.wl_surface(), |states| states.data_map.insert_if_missing(|| handle));
     }
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        surface.send_configure().unwrap();
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface.clone())) {
+            eprintln!("Failed to track popup: {:?}", err);
+        }
+        let _ = surface.send_configure();
     }
     fn grab(
         &mut self,
-        _surface: PopupSurface,
+        surface: PopupSurface,
         _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: Serial,
+        serial: Serial,
     ) {
+        let kind = PopupKind::Xdg(surface);
+        if let Ok(root_surface) = smithay::desktop::find_popup_root_surface(&kind) {
+            if let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(&root_surface)).cloned() {
+                let _ = self.popups.grab_popup(FocusTarget::Window(window), kind, &self.seat, serial);
+            }
+        }
     }
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
+        surface: PopupSurface,
         _positioner: PositionerState,
-        _token: u32,
+        token: u32,
     ) {
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface.clone())) {
+            eprintln!("Failed to track popup: {:?}", err);
+        }
+        let _ = surface.send_repositioned(token);
+    }
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        if let Some(idx) = self.pending_windows.iter().position(|w| w.toplevel().map(|t| *t == surface).unwrap_or(false)) {
+            self.pending_windows.remove(idx);
+        }
+        if let Some(handle) = with_states(surface.wl_surface(), |states| states.data_map.get::<ForeignToplevelHandle>().cloned()) {
+             self.foreign_toplevel_list.remove_toplevel(&handle);
+        }
     }
 }
 
@@ -1087,6 +1320,15 @@ delegate_dmabuf!(AppState);
 delegate_fractional_scale!(AppState);
 delegate_virtual_keyboard_manager!(AppState);
 delegate_data_device!(AppState);
+delegate_data_control!(AppState);
 delegate_pointer_warp!(AppState);
 delegate_relative_pointer!(AppState);
 delegate_pointer_constraints!(AppState);
+delegate_foreign_toplevel_list!(AppState);
+delegate_xdg_decoration!(AppState);
+delegate_layer_shell!(AppState);
+delegate_single_pixel_buffer!(AppState);
+delegate_viewporter!(AppState);
+delegate_presentation!(AppState);
+delegate_xdg_activation!(AppState);
+delegate_primary_selection!(AppState);
