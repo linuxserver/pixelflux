@@ -712,6 +712,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     state.overlay_state.load_watermark(&settings.watermark_path);
                     state.callback = Some(cb);
                     state.is_capturing = true;
+                    state.render_cursor_on_framebuffer = settings.capture_cursor; 
                     state.settings = settings.clone();
                     state.encoded_frame_count = 0;
                     state.total_stripes_encoded = 0;
@@ -1031,90 +1032,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 Ok(mut frame) => {
                                     let mut elements: Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> = Vec::new();
 
-                                    {
-                                        let layer_map = layer_map_for_output(&output);
-
-                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                            for surface in layer_map.layers() {
-                                                let current_layer = surface.layer();
-                                                if current_layer == target_layer {
-                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                            WaylandSurfaceRenderElement::from_surface(
-                                                                renderer, surface.wl_surface(), states,
-                                                                geo.loc.to_physical_precise_round(1), 1.0,
-                                                                smithay::backend::renderer::element::Kind::Unspecified
-                                                            )
-                                                        });
-                                                        if let Ok(Some(e)) = elem {
-                                                            elements.push(CompositionElements::Surface(e));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
-                                    }
-
-                                    if let Ok(space_elements) = smithay::desktop::space::space_render_elements(renderer, [&state.space], &output, 1.0) {
-                                        elements.extend(space_elements.into_iter().map(CompositionElements::Space));
-                                    }
-
-                                    {
-                                        let layer_map = layer_map_for_output(&output);
-
-                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                            for surface in layer_map.layers() {
-                                                let current_layer = surface.layer();
-                                                if current_layer == target_layer {
-                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                            WaylandSurfaceRenderElement::from_surface(
-                                                                renderer, surface.wl_surface(), states,
-                                                                geo.loc.to_physical_precise_round(1), 1.0,
-                                                                smithay::backend::renderer::element::Kind::Unspecified
-                                                            )
-                                                        });
-                                                        if let Ok(Some(e)) = elem {
-                                                            elements.push(CompositionElements::Surface(e));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
-                                    }
-
-                                    for window in state.space.elements() {
-                                        if let Some(surface) = window.wl_surface() {
-                                            let window_loc = state.space.element_location(window).unwrap_or_default();
-                                            let popups = PopupManager::popups_for_surface(&surface);
-                                            
-                                            for (popup, location) in popups {
-                                                let popup_surface = popup.wl_surface(); {
-                                                    let popup_pos = window_loc + location;
-                                                    let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
-                                                        WaylandSurfaceRenderElement::from_surface(
-                                                            renderer,
-                                                            popup_surface,
-                                                            states,
-                                                            popup_pos.to_physical_precise_round(1),
-                                                            1.0,
-                                                            smithay::backend::renderer::element::Kind::Unspecified
-                                                        )
-                                                    });
-                                                    if let Ok(Some(e)) = elem {
-                                                        elements.push(CompositionElements::Surface(e));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
                                     if state.render_cursor_on_framebuffer {
                                         if let Some(pointer) = state.seat.get_pointer() {
                                             let pos = pointer.current_location();
@@ -1147,6 +1064,86 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         }
                                     }
 
+                                    {
+                                        let layer_map = layer_map_for_output(&output);
+
+                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                            for surface in layer_map.layers().rev() {
+                                                let current_layer = surface.layer();
+                                                if current_layer == target_layer {
+                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
+                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                            WaylandSurfaceRenderElement::from_surface(
+                                                                renderer, surface.wl_surface(), states,
+                                                                geo.loc.to_physical_precise_round(1), 1.0,
+                                                                smithay::backend::renderer::element::Kind::Unspecified
+                                                            )
+                                                        });
+                                                        if let Ok(Some(e)) = elem {
+                                                            elements.push(CompositionElements::Surface(e));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        };
+
+                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
+                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
+                                    }
+
+                                    for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
+                                        let window_loc = state.space.element_location(window).unwrap_or_default();
+
+                                        if let Some(surface) = window.wl_surface() {
+                                            let popups = PopupManager::popups_for_surface(&surface);
+                                            for (popup, location) in popups {
+                                                let popup_surface = popup.wl_surface();
+                                                let popup_pos = window_loc + location;
+                                                let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
+                                                    WaylandSurfaceRenderElement::from_surface(
+                                                        renderer,
+                                                        popup_surface,
+                                                        states,
+                                                        popup_pos.to_physical_precise_round(1),
+                                                        1.0,
+                                                        smithay::backend::renderer::element::Kind::Unspecified
+                                                    )
+                                                });
+                                                if let Ok(Some(e)) = elem {
+                                                    elements.push(CompositionElements::Surface(e));
+                                                }
+                                            }
+                                        }
+
+                                        elements.extend(window.render_elements(renderer, window_loc.to_physical_precise_round(1), Scale::from(1.0), 1.0).into_iter().map(CompositionElements::Space));
+                                    }
+
+                                    {
+                                        let layer_map = layer_map_for_output(&output);
+
+                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                            for surface in layer_map.layers() {
+                                                let current_layer = surface.layer();
+                                                if current_layer == target_layer {
+                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
+                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                            WaylandSurfaceRenderElement::from_surface(
+                                                                renderer, surface.wl_surface(), states,
+                                                                geo.loc.to_physical_precise_round(1), 1.0,
+                                                                smithay::backend::renderer::element::Kind::Unspecified
+                                                            )
+                                                        });
+                                                        if let Ok(Some(e)) = elem {
+                                                            elements.push(CompositionElements::Surface(e));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        };
+
+                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
+                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
+                                    }
                                     match damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
                                         Ok(result) => {
                                             render_success = true;
@@ -1230,7 +1227,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         let mut image = unsafe {
                             pixman::Image::from_raw_mut(pixman::FormatCode::A8R8G8B8, width as usize, height as usize, ptr, (width * 4) as usize, false).expect("Failed to create pixman image")
                         };
-                                match renderer.bind(&mut image) {
+                                    match renderer.bind(&mut image) {
                                     Ok(mut frame) => {
                                         let mut elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = Vec::new();
 
@@ -1257,13 +1254,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                 }
                                             };
 
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
+                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
+                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
                                         }
 
-                                        for window in state.space.elements_for_output(&output) {
+                                        for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
                                             let loc = state.space.element_location(window).unwrap_or_default();
-                                            elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(1), Scale::from(1.0), 1.0));
                                             
                                             if let Some(surface) = window.wl_surface() {
                                                 let popups = PopupManager::popups_for_surface(&surface);
@@ -1286,6 +1282,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                     }
                                                 }
                                             }
+
+                                            elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(1), Scale::from(1.0), 1.0));
                                         }
 
                                         {
@@ -1311,8 +1309,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                 }
                                             };
 
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
+                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
+                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
                                         }
 
                                 let render_age = if state.overlay_state.is_animated() { 0 } else { 1 };
