@@ -1229,12 +1229,44 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         };
                                     match renderer.bind(&mut image) {
                                     Ok(mut frame) => {
-                                        let mut elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = Vec::new();
+                                        let mut elements: Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>> = Vec::new();
+
+                                        if state.render_cursor_on_framebuffer {
+                                            if let Some(pointer) = state.seat.get_pointer() {
+                                                let pos = pointer.current_location();
+                                                let output_scale_val = output.current_scale().fractional_scale();
+                                                let scale = Scale::from(output_scale_val);
+
+                                                if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
+                                                    let name = wayland::frontend::cursor_icon_to_str(icon);
+                                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                                    if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
+                                                        if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
+                                                            elements.push(CompositionElements::Cursor(elem));
+                                                        }
+                                                    }
+                                                } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
+                                                     let phys_pos = pos.to_physical(scale);
+                                                     let elem_result = with_states(surface, |states| {
+                                                         WaylandSurfaceRenderElement::from_surface(renderer, surface, states, phys_pos, 1.0, smithay::backend::renderer::element::Kind::Cursor)
+                                                     });
+                                                     if let Ok(Some(cursor_elem)) = elem_result {
+                                                         elements.push(CompositionElements::Surface(cursor_elem));
+                                                     }
+                                                } else if state.current_cursor_icon.is_none() {
+                                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                                    let image = state.cursor_helper.get_image(output_scale_val.round() as u32, time);
+                                                    if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
+                                                        elements.push(CompositionElements::Cursor(elem));
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         {
                                             let layer_map = layer_map_for_output(&output);
 
-                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<WaylandSurfaceRenderElement<PixmanRenderer>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                                 for surface in layer_map.layers() {
                                                     let current_layer = surface.layer();
                                                     if current_layer == target_layer {
@@ -1247,7 +1279,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                                 )
                                                             });
                                                             if let Ok(Some(e)) = elem {
-                                                                elements.push(e);
+                                                                elements.push(CompositionElements::Surface(e));
                                                             }
                                                         }
                                                     }
@@ -1277,19 +1309,19 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                             )
                                                         });
                                                         if let Ok(Some(e)) = elem {
-                                                            elements.push(e);
+                                                            elements.push(CompositionElements::Surface(e));
                                                         }
                                                     }
                                                 }
                                             }
 
-                                            elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(1), Scale::from(1.0), 1.0));
+                                            elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(1), Scale::from(1.0), 1.0).into_iter().map(CompositionElements::Space));
                                         }
 
                                         {
                                             let layer_map = layer_map_for_output(&output);
 
-                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<WaylandSurfaceRenderElement<PixmanRenderer>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                                 for surface in layer_map.layers() {
                                                     let current_layer = surface.layer();
                                                     if current_layer == target_layer {
@@ -1302,7 +1334,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                                 )
                                                             });
                                                             if let Ok(Some(e)) = elem {
-                                                                elements.push(e);
+                                                                elements.push(CompositionElements::Surface(e));
                                                             }
                                                         }
                                                     }
