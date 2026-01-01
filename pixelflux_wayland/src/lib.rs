@@ -612,15 +612,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
                     }
 
-                    if watermark_active {
-                        println!("[Wayland] Decision: Watermark is active -> Forcing Readback (CPU path for pixels).");
-                    }
                     if different_gpu {
                         println!("[Wayland] Decision: Rendering and Encoding GPUs differ -> Forcing Readback (CPU path for pixels).");
                     }
                     if state.video_encoder.is_none() {
                         println!("[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding.");
-                    } else if !watermark_active && !different_gpu {
+                    } else if !different_gpu {
                         println!("[Wayland] Decision: Zero-Copy path active.");
                     }
 
@@ -931,7 +928,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     } else {
                         let rendering_gpu = state.use_gpu;
                         let encoding_gpu_avail = state.video_encoder.is_some();
-                        let watermark_active = state.settings.watermark_location_enum != 0 && !state.settings.watermark_path.is_empty();
                         let mut different_gpu = false;
 
                         if state.video_encoder.is_some() {
@@ -944,7 +940,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             }
                         }
 
-                        let is_readback = !rendering_gpu || !encoding_gpu_avail || watermark_active || different_gpu;
+                        let is_readback = !rendering_gpu || !encoding_gpu_avail || different_gpu;
                         let copy_mode_str = if is_readback { "Readback" } else { "ZeroCopy" };
 
                         let backend = match &state.video_encoder {
@@ -1010,7 +1006,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 let render_age = if state.overlay_state.is_animated() { 0 } else { 1 };
                 let rendering_gpu = state.use_gpu;
                 let encoding_gpu_avail = state.video_encoder.is_some();
-                let watermark_active = state.settings.watermark_location_enum != 0 && !state.settings.watermark_path.is_empty();
 
                 let mut different_gpu = false;
                 if state.video_encoder.is_some() {
@@ -1023,8 +1018,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     }
                 }
 
-                let needs_readback = !rendering_gpu || !encoding_gpu_avail || watermark_active || different_gpu;
-
+                let needs_readback = !rendering_gpu || !encoding_gpu_avail || different_gpu;
                 if rendering_gpu {
                     if let Some(renderer) = state.gles_renderer.as_mut() {
                         if let Some((_bo, dmabuf)) = state.offscreen_buffer.as_mut() {
@@ -1062,6 +1056,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                                 }
                                             }
                                         }
+                                    }
+
+                                    if let Some(elem) = state.overlay_state.get_watermark_element(renderer) {
+                                        elements.push(CompositionElements::Cursor(elem));
                                     }
 
                                     {
@@ -1153,13 +1151,11 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         },
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
-
                                     if needs_readback {
                                         let read_rect = Rectangle::new((0,0).into(), (width, height).into());
                                         if let Ok(mapping) = renderer.copy_framebuffer(&mut frame, read_rect, Fourcc::Abgr8888) {
                                             if let Ok(data) = renderer.map_texture(&mapping) {
                                                 state.frame_buffer.copy_from_slice(data);
-                                                state.overlay_state.apply(&mut state.frame_buffer, width, height, false);
 
                                                 if state.video_encoder.is_some() {
                                                     let w = width as u32;
@@ -1263,6 +1259,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                             }
                                         }
 
+                                        if let Some(elem) = state.overlay_state.get_watermark_element(renderer) {
+                                            elements.push(CompositionElements::Cursor(elem));
+                                        }
+
                                         {
                                             let layer_map = layer_map_for_output(&output);
 
@@ -1350,8 +1350,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                     Ok(result) => {
                                         render_success = true;
                                         if let Some(damage) = result.damage { damage_rects = damage.clone(); }
-
-                                        state.overlay_state.apply(&mut state.frame_buffer, width, height, true);
 
                                         if state.video_encoder.is_some() {
                                             let w = width as u32;
