@@ -428,6 +428,23 @@ impl CompositorHandler for AppState {
 
                 if let Some(output) = self.outputs.first() {
                     output.enter(surface);
+
+                    let mode = output.current_mode().unwrap();
+                    let scale = output.current_scale().fractional_scale();
+                    let (expected_w, expected_h) = (
+                        (mode.size.w as f64 / scale).round() as i32,
+                        (mode.size.h as f64 / scale).round() as i32,
+                    );
+                    
+                    let geo = window.geometry();
+                    if (geo.size.w - expected_w).abs() > 1 || (geo.size.h - expected_h).abs() > 1 {
+                        toplevel.with_pending_state(|state| {
+                            state.states.set(XdgState::Activated);
+                            state.states.set(XdgState::Fullscreen);
+                            state.size = Some((expected_w, expected_h).into());
+                        });
+                        toplevel.send_configure();
+                    }
                 }
 
                 let serial = next_serial();
