@@ -509,6 +509,11 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             for window in state.space.elements() {
                                 if let Some(surface) = window.wl_surface() {
                                     output.enter(&surface);
+                                    with_states(&surface, |states| {
+                                        smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                                            fs.set_preferred_scale(scale);
+                                        });
+                                    });
                                 }
                                 if let Some(toplevel) = window.toplevel() {
                                     toplevel.with_pending_state(|state| {

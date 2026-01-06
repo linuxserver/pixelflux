@@ -708,8 +708,16 @@ impl DmabufHandler for AppState {
 impl FractionalScaleHandler for AppState {
     fn new_fractional_scale(
         &mut self,
-        _surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) {
+        if let Some(output) = self.outputs.first() {
+            let scale = output.current_scale().fractional_scale();
+            with_states(&surface, |states| {
+                smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                    fs.set_preferred_scale(scale);
+                });
+            });
+        }
     }
 }
 
