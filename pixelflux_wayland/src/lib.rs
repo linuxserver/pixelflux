@@ -66,7 +66,7 @@ use smithay::{
         pixman,
         wayland_server::{Display, DisplayHandle},
     },
-    utils::{Clock, Physical, Point, Rectangle, Scale, Transform},
+    utils::{Clock, DeviceFd, Physical, Point, Rectangle, Scale, Transform},
     wayland::{
         compositor::{with_states, CompositorState},
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
@@ -88,7 +88,11 @@ use smithay::{
     wayland::shell::wlr_layer::WlrLayerShellState,
     wayland::xdg_activation::XdgActivationState,
     wayland::selection::primary_selection::PrimarySelectionState,
+    wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+    backend::drm::DrmDeviceFd,
 };
+
+use std::os::unix::io::OwnedFd;
 
 pub mod encoders {
     pub mod nvenc;
@@ -289,6 +293,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let mut dmabuf_global = None;
     let mut gbm_device_raw = None;
     let mut dmabuf_state = DmabufState::new();
+    let mut drm_syncobj_state = None;
 
     if use_gpu {
         println!("[Wayland] Initializing GL Renderer using device: {}", dri_node);
@@ -299,6 +304,14 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
             .write(true)
             .open(device_path)
             .expect("Failed to open render device");
+
+        let file_for_syncobj = file
+            .try_clone()
+            .expect("Failed to clone file for Syncobj");
+        let drm_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file_for_syncobj)));
+        if supports_syncobj_eventfd(&drm_fd) {
+            drm_syncobj_state = Some(DrmSyncobjState::new::<AppState>(&dh, drm_fd));
+        }
 
         let file_for_alloc = file
             .try_clone()
@@ -407,6 +420,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         xdg_decoration_state,
         xdg_activation_state,
         primary_selection_state,
+        drm_syncobj_state,
         popups,
         frame_buffer: vec![0u8; (width * height * 4) as usize],
         nv12_buffer: vec![0u8; (width * height * 3 / 2) as usize],
@@ -603,8 +617,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
                     }
 
-                    let watermark_active = !settings.watermark_path.is_empty()
-                        && settings.watermark_location_enum != 0;
                     let mut different_gpu = false;
 
                     if state.video_encoder.is_some() {

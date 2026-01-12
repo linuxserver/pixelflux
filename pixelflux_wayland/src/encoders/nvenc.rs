@@ -489,6 +489,14 @@ impl NvencEncoder {
             config.rcParams.constQP.qpInterP = settings.h264_crf as u32;
             config.rcParams.constQP.qpInterB = settings.h264_crf as u32;
             config.rcParams.constQP.qpIntra = settings.h264_crf as u32;
+            config.frameIntervalP = 1; 
+            config.gopLength = 0xFFFFFFFF;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.videoSignalTypePresentFlag = 1;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat = 5;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag = 1;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.colourPrimaries = 1;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.transferCharacteristics = 1;
+            config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix = 1;
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag =
                 if is_444 { 1 } else { 0 };

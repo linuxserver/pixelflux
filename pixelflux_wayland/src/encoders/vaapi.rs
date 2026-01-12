@@ -248,6 +248,7 @@ impl VaapiEncoder {
             (*encoder_ctx).hw_device_ctx = ff::av_buffer_ref(hw_device_ctx);
             (*encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
             (*encoder_ctx).max_b_frames = 0;
+            (*encoder_ctx).gop_size = std::ffi::c_int::MAX; 
 
             ff::av_buffer_unref(&mut enc_frames_ref);
 
@@ -405,6 +406,7 @@ impl VaapiEncoder {
         (*self.encoder_ctx).hw_device_ctx = ff::av_buffer_ref(self.hw_device_ctx);
         (*self.encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(self.enc_frames_ctx);
         (*self.encoder_ctx).max_b_frames = 0;
+        (*self.encoder_ctx).gop_size = std::ffi::c_int::MAX;
 
         let mut opts: *mut ff::AVDictionary = ptr::null_mut();
         let set_opt = |d: &mut *mut ff::AVDictionary, k: &str, v: &str| {

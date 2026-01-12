@@ -54,6 +54,8 @@ use smithay::wayland::selection::primary_selection::{
     set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
 };
 use smithay::delegate_primary_selection;
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, DrmSyncobjHandler};
+use smithay::delegate_drm_syncobj;
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
@@ -174,6 +176,7 @@ pub struct AppState {
     pub xdg_decoration_state: XdgDecorationState,
     pub xdg_activation_state: XdgActivationState,
     pub primary_selection_state: PrimarySelectionState,
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub popups: PopupManager,
     pub frame_buffer: Vec<u8>,
     pub nv12_buffer: Vec<u8>,
@@ -260,6 +263,12 @@ impl XdgActivationHandler for AppState {
 impl PrimarySelectionHandler for AppState {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
+    }
+}
+
+impl DrmSyncobjHandler for AppState {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
     }
 }
 
@@ -1357,3 +1366,4 @@ delegate_viewporter!(AppState);
 delegate_presentation!(AppState);
 delegate_xdg_activation!(AppState);
 delegate_primary_selection!(AppState);
+delegate_drm_syncobj!(AppState);
