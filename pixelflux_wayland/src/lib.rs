@@ -1469,8 +1469,13 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             send_frame = true;
                         }
 
-                        if is_dirty {
+                        if is_dirty || state.encoded_frame_count == 0 {
                             send_frame = true;
+                            
+                            if state.encoded_frame_count == 0 {
+                                force_idr = true;
+                            }
+
                             st.no_motion_frame_count = 0;
                             st.paint_over_sent = false;
                             st.h264_burst_frames_remaining = 0;
