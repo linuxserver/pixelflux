@@ -1,6 +1,6 @@
 [package]
 name = "pixelflux_wayland"
-version = "1.5.3"
+version = "1.5.6"
 edition = "2021"
 
 [lib]
