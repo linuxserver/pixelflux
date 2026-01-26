@@ -63,6 +63,15 @@ base_capture_settings.h264_fullframe = False
 base_capture_settings.h264_streaming_mode = False
 # Pass a vaapi node index 0 = renderD128, -1 to disable
 base_capture_settings.vaapi_render_node_index = -1
+# Switches to CBR mode and ignores CRF value. Used in conjunction with h264_bitrate_kbps.
+base_capture_settings.h264_cbr_mode = False
+# Target bitrate in kbps for CBR mode. Required when h264_cbr_mode is enabled.
+base_capture_settings.h264_bitrate_kbps = 4000
+# Optional VBV buffer size in kilobits for custom buffer size.
+base_capture_settings.h264_vbv_buffer_size_kb = 400
+# Allow pixelflux to adjust its capture width and height. Overrides provided width and height when enabled.
+base_capture_settings.auto_adjust_screen_capture_size = True
+#
 
 # --- Change Detection & Optimization ---
 # Use a higher quality setting for static regions that haven't changed for a while.

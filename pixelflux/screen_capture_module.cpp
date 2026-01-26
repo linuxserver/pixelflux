@@ -113,6 +113,8 @@ struct NvencEncoderState {
   int initialized_width = 0;
   int initialized_height = 0;
   int initialized_qp = -1;
+  bool cbr_mode = false;
+  int initialized_bitrate_kbps = 0;
   NV_ENC_BUFFER_FORMAT initialized_buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   CUcontext cuda_context = nullptr;
 
@@ -146,6 +148,8 @@ struct VaapiEncoderState {
     int initialized_qp = -1;
     bool initialized_is_444 = false;
     unsigned int frame_count = 0;
+    bool initialized_cbr = false;
+    int initialized_bitrate_kbps = 0;
 };
 
 
@@ -178,6 +182,8 @@ struct MinimalEncoderStore {
   std::vector<int> initialized_colorspaces;
   std::vector<bool> initialized_full_range_flags;
   std::vector<bool> force_idr_flags;
+  std::vector<bool> initialized_cbr_flags;
+  std::vector<int> initialized_bitrates;
   std::mutex store_mutex;
 
   /**
@@ -198,6 +204,8 @@ struct MinimalEncoderStore {
       initialized_colorspaces.resize(new_size, 0);
       initialized_full_range_flags.resize(new_size, false);
       force_idr_flags.resize(new_size, false);
+      initialized_cbr_flags.resize(new_size, false);
+      initialized_bitrates.resize(new_size, 0);
     }
   }
 
@@ -224,6 +232,8 @@ struct MinimalEncoderStore {
     initialized_colorspaces.clear();
     initialized_full_range_flags.clear();
     force_idr_flags.clear();
+    initialized_cbr_flags.clear();
+    initialized_bitrates.clear();
   }
 
   /**
@@ -290,6 +300,10 @@ struct CaptureSettings {
   int vaapi_render_node_index;
   bool use_cpu;
   bool debug_logging;
+  bool h264_cbr_mode;
+  int h264_bitrate_kbps;
+  int h264_vbv_buffer_size_kb;
+  bool auto_adjust_screen_capture_size;
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -320,7 +334,11 @@ struct CaptureSettings {
       watermark_location_enum(WatermarkLocation::NONE),
       vaapi_render_node_index(-1),
       use_cpu(false),
-      debug_logging(false) {}
+      debug_logging(false),
+      h264_cbr_mode(false),
+      h264_bitrate_kbps(4000),
+      h264_vbv_buffer_size_kb(0),
+      auto_adjust_screen_capture_size(false) {}
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -338,9 +356,21 @@ struct CaptureSettings {
    * @param dbd Damage block duration.
    * @param om Output mode (JPEG or H.264).
    * @param crf H.264 Constant Rate Factor.
+   * @param h264_po_crf H.264 paint-over CRF.
+   * @param h264_po_burst H.264 paint-over burst frames.
    * @param h264_fc H.264 full color (I444) flag.
    * @param h264_ff H.264 full frame encoding flag.
+   * @param h264_sm H.264 streaming mode flag.
    * @param capture_cursor Capture cursor flag.
+   * @param wm_path Watermark image file path.
+   * @param wm_loc Watermark location enum.
+   * @param vaapi_idx VA-API render node index.
+   * @param use_cpu_flag Force CPU encoding flag.
+   * @param debug_log Enable debug logging flag.
+   * @param cbr_mode H.264 CBR mode flag.
+   * @param bitrate_kbps H.264 CBR bitrate in kbps.
+   * @param vbv_buffer_size_kb H.264 VBV buffer size in kb.
+   * @param adjust_size Auto-adjust screen capture size flag.
    */
   CaptureSettings(int cw, int ch, int cx, int cy, double fps, int jq,
                   int pojq, bool upoq, int potf, int dbt, int dbd,
@@ -349,7 +379,8 @@ struct CaptureSettings {
                   bool capture_cursor = false,
                   const char* wm_path = nullptr,
                   WatermarkLocation wm_loc = WatermarkLocation::NONE,
-                  int vaapi_idx = -1, bool use_cpu_flag = false, bool debug_log = false)
+                  int vaapi_idx = -1, bool use_cpu_flag = false, bool debug_log = false,
+                  bool cbr_mode = false, int bitrate_kbps = 4000, int vbv_buffer_size_kb = 0, bool adjust_size = false)
     : capture_width(cw),
       capture_height(ch),
       capture_x(cx),
@@ -373,7 +404,11 @@ struct CaptureSettings {
       watermark_location_enum(wm_loc),
       vaapi_render_node_index(vaapi_idx),
       use_cpu(use_cpu_flag),
-      debug_logging(debug_log) {}
+      debug_logging(debug_log),
+      h264_cbr_mode(cbr_mode),
+      h264_bitrate_kbps(bitrate_kbps),
+      h264_vbv_buffer_size_kb(vbv_buffer_size_kb),
+      auto_adjust_screen_capture_size(adjust_size) {}
 };
 
 /**
@@ -652,6 +687,11 @@ StripeEncodeResult encode_stripe_jpeg(
  * @param current_crf_setting The H.264 CRF (Constant Rate Factor) to use for encoding.
  * @param colorspace_setting An integer indicating input YUV format (420 for I420, 444 for I444).
  * @param use_full_range True if full range color should be signaled in VUI, false for limited range.
+ * @param h264_streaming_mode True to enable streaming mode optimizations.
+ * @param force_idr True to force the encoder to generate an IDR (key) frame.
+ * @param is_cbr True to enable Constant Bitrate (CBR) mode, false for CRF mode.
+ * @param bitrate_kbps Target bitrate in kbps when CBR mode is enabled.
+ * @param vbv_buffer_size_kb VBV buffer size in kb for CBR mode (0 for auto/default).
  * @return A StripeEncodeResult containing the H.264 NAL units, or an empty result on failure.
  *         The result data includes a custom 10-byte header: type tag (0x04), frame type,
  *         frame_id (uint16_t), stripe_y_start (uint16_t), width (uint16_t), height (uint16_t),
@@ -672,7 +712,10 @@ StripeEncodeResult encode_stripe_h264(
   int colorspace_setting,
   bool use_full_range,
   bool h264_streaming_mode,
-  bool force_id);
+  bool force_id,
+  bool is_cbr,
+  int bitrate_kbps,
+  int vbv_buffer_size_kb);
 
 /**
  * @brief Calculates a 64-bit XXH3 hash for a stripe of YUV data.
@@ -686,6 +729,8 @@ StripeEncodeResult encode_stripe_h264(
  * @param height Height of the stripe.
  * @param is_i420 True if the YUV format is I420 (chroma planes are half width/height),
  *                false if I444 (chroma planes are full width/height).
+ * @param use_fullframe_hashing True to use full-frame hashing (samples every 12th row),
+ *                              false to hash every row.
  * @return A 64-bit hash value of the stripe data, or 0 on error.
  */
 uint64_t calculate_yuv_stripe_hash(const uint8_t* y_plane_stripe_start, int y_stride,
@@ -740,6 +785,10 @@ public:
   WatermarkLocation watermark_location_internal;
   bool use_cpu = false;
   bool debug_logging = false;
+  bool h264_cbr_mode = false;
+  int h264_bitrate_kbps = 4000;
+  int h264_vbv_buffer_size_kb = 0;
+  bool auto_adjust_screen_capture_size = false;
 
   std::atomic<bool> stop_requested;
   std::thread capture_thread;
@@ -782,10 +831,10 @@ private:
     mutable std::mutex watermark_data_mutex_;
 
     void reset_nvenc_encoder();
-    bool initialize_nvenc_encoder(int width, int height, int target_qp, double fps, bool use_yuv444);
+    bool initialize_nvenc_encoder(int width, int height, int target_qp, double fps, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb);
     StripeEncodeResult encode_fullframe_nvenc(int width, int height, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
     void reset_vaapi_encoder();
-    bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444);
+    bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb);
     StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
 
     void load_watermark_image();
@@ -879,6 +928,11 @@ public:
         std::lock_guard<std::mutex> data_lock(watermark_data_mutex_);
         watermark_loaded_ = false;
     }
+
+    h264_cbr_mode = new_settings.h264_cbr_mode;
+    h264_bitrate_kbps = new_settings.h264_bitrate_kbps;
+    h264_vbv_buffer_size_kb = new_settings.h264_vbv_buffer_size_kb;
+    auto_adjust_screen_capture_size = new_settings.auto_adjust_screen_capture_size;
   }
 
   /**
@@ -893,23 +947,73 @@ public:
       capture_width, capture_height, capture_x, capture_y, target_fps,
       jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
       paint_over_trigger_frames, damage_block_threshold,
-      damage_block_duration, output_mode, h264_crf,
-      h264_paintover_crf, h264_paintover_burst_frames,
-      h264_fullcolor, h264_fullframe, h264_streaming_mode, capture_cursor,
-      watermark_path_internal.c_str(), watermark_location_internal,
-      vaapi_render_node_index, use_cpu, debug_logging
-      );
+      damage_block_duration, output_mode, h264_crf, h264_paintover_crf,
+      h264_paintover_burst_frames, h264_fullcolor, h264_fullframe, h264_streaming_mode,
+      capture_cursor, watermark_path_internal.c_str(), watermark_location_internal,
+      vaapi_render_node_index, use_cpu, debug_logging, h264_cbr_mode, h264_bitrate_kbps,
+      h264_vbv_buffer_size_kb, auto_adjust_screen_capture_size);
   }
 
-  void request_idr(){
+  /**
+   * @brief Requests the next encoded frame to be an IDR (key) frame.
+   * This function is thread-safe. It sets flags that will cause the next
+   * encoded frame to be an IDR frame in the appropriate encoder backend.
+   */
+  void request_idr() {
     if (debug_logging) {
       const char* backend = use_cpu ? "CPU" : (nvenc_operational ? "NVENC" : (vaapi_operational ? "VAAPI" : "None"));
-      std::cout << "Request IDR -> " << backend << std::endl;
+      std::cout << "[pixelflux] Request IDR -> " << backend << std::endl;
     }
 
     if (use_cpu) force_next_idr_ = true;
     else if (nvenc_operational) nvenc_force_next_idr_ = true;
     else if (vaapi_operational) vaapi_force_next_idr_ = true;
+  }
+
+  /**
+   * @brief Updates the target video bitrate for H.264 CBR mode.
+   * This function is thread-safe. If CBR mode is not enabled, it does nothing.
+   * @param bitrate The new target bitrate in kbps.
+   */
+  void update_video_bitrate(int bitrate) {
+    if (!h264_cbr_mode) return;
+
+    if (debug_logging) {
+      std::cout << "[pixelflux] Updating video bitrate from " << h264_bitrate_kbps << " to " << bitrate << std::endl;
+    }
+     
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    h264_bitrate_kbps = static_cast<int>(std::abs(bitrate));
+  }
+
+  /**
+   * @brief Updates the VBV buffer size for H.264 CBR mode.
+   * This function is thread-safe. If CBR mode is not enabled, it does nothing.
+   * @param vbv_buffer_size_kb The new VBV buffer size in kb
+   */
+  void update_vbv_buffer_size(int vbv_buffer_size_kb) {
+    if (!h264_cbr_mode) return;
+
+    if (debug_logging) {
+      std::cout << "[pixelflux] Updating VBV buffer size from " << h264_vbv_buffer_size_kb << " to " << vbv_buffer_size_kb << std::endl;
+    }
+     
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    h264_vbv_buffer_size_kb = static_cast<int>(std::abs(vbv_buffer_size_kb));
+  }
+
+  /**
+   * @brief Updates the target framerate for video encoding.
+   * This function is thread-safe.
+   * @param fps The new target frames per second.
+   */
+  void update_framerate(double fps) {
+    if (debug_logging) {
+      std::cout << "[pixelflux] Updating video framerate from " << target_fps << " to " << fps << std::endl;
+    }
+     
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    target_fps = static_cast<double>(std::abs(fps));
   }
 };
 
@@ -1012,20 +1116,26 @@ void ScreenCaptureModule::reset_nvenc_encoder() {
  * This function is thread-safe. It sets up a new encoder session if one
  * is not already active. If an active session exists with the correct
  * dimensions and color format, it attempts a lightweight reconfiguration for
- * the target QP (quality). If dimensions or color format have changed, it
+ * the target QP (quality) or bitrate. If dimensions or color format have changed, it
  * performs a full teardown and re-initialization.
  * @param width The target encoding width.
  * @param height The target encoding height.
- * @param target_qp The target Quantization Parameter (lower is higher quality).
+ * @param target_qp The target Quantization Parameter (lower is higher quality) for CRF mode.
  * @param fps The target frames per second, used for rate control hints.
  * @param use_yuv444 True to configure for YUV 4:4:4, false for NV12 (4:2:0).
+ * @param is_cbr True to enable Constant Bitrate (CBR) mode, false for CRF mode.
+ * @param bitrate_kbps Target bitrate in kbps when CBR mode is enabled.
+ * @param vbv_buffer_size_kb VBV buffer size in kb for CBR mode (0 for auto/default).
  * @return True if the encoder is successfully initialized or reconfigured, false otherwise.
  */
 bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
                               int height,
                               int target_qp,
                               double fps,
-                              bool use_yuv444) {
+                              bool use_yuv444,
+                              bool is_cbr,
+                              int bitrate_kbps,
+                              int vbv_buffer_size_kb) {
   std::lock_guard<std::mutex> lock(nvenc_mutex_);
 
   NV_ENC_BUFFER_FORMAT target_buffer_format =
@@ -1034,35 +1144,65 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   if (nvenc_state_.initialized && nvenc_state_.initialized_width == width &&
       nvenc_state_.initialized_height == height &&
       nvenc_state_.initialized_qp == target_qp &&
-      nvenc_state_.initialized_buffer_format == target_buffer_format) {
+      nvenc_state_.initialized_buffer_format == target_buffer_format &&
+      nvenc_state_.cbr_mode == is_cbr &&
+      nvenc_state_.initialized_bitrate_kbps == bitrate_kbps) {
     return true;
   }
 
   if (nvenc_state_.initialized && nvenc_state_.initialized_width == width &&
       nvenc_state_.initialized_height == height &&
-      nvenc_state_.initialized_buffer_format == target_buffer_format) {
+      nvenc_state_.initialized_buffer_format == target_buffer_format &&
+      nvenc_state_.cbr_mode == is_cbr) {
 
-    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
-    NV_ENC_CONFIG new_config = nvenc_state_.encode_config;
+    bool reconfig_needed = false;
+    if (is_cbr) {
+        if (nvenc_state_.initialized_bitrate_kbps != bitrate_kbps) reconfig_needed = true;
+    } else {
+        if (nvenc_state_.initialized_qp != target_qp) reconfig_needed = true;
+    }
 
-    reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-    reconfigure_params.reInitEncodeParams = nvenc_state_.init_params;
-    reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
-    
-    new_config.rcParams.constQP.qpInterP = target_qp;
-    new_config.rcParams.constQP.qpIntra = target_qp;
-    new_config.rcParams.constQP.qpInterB = target_qp;
-    
-    bool is_quality_increasing = (target_qp < nvenc_state_.initialized_qp);
-    reconfigure_params.forceIDR = is_quality_increasing;
+    if (reconfig_needed) {
+      NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
+      NV_ENC_CONFIG new_config = nvenc_state_.encode_config;
 
-    NVENCSTATUS status = nvenc_state_.nvenc_funcs.nvEncReconfigureEncoder(
+      reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+      reconfigure_params.reInitEncodeParams = nvenc_state_.init_params;
+      reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
+
+      if (is_cbr) {
+        new_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+        uint32_t bps = static_cast<uint32_t>(bitrate_kbps * 1000);
+        new_config.rcParams.averageBitRate = bps;
+        new_config.rcParams.maxBitRate = bps;
+        if (vbv_buffer_size_kb > 0) {
+          new_config.rcParams.vbvBufferSize = static_cast<uint32_t>(vbv_buffer_size_kb * 1000);
+        } else {
+          new_config.rcParams.vbvBufferSize = (bps + 9) / 10;
+        }
+        reconfigure_params.forceIDR = false;
+      } else {
+        new_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+        new_config.rcParams.constQP.qpInterP = target_qp;
+        new_config.rcParams.constQP.qpIntra = target_qp;
+        new_config.rcParams.constQP.qpInterB = target_qp;
+        
+        bool is_quality_increasing = (target_qp < nvenc_state_.initialized_qp);
+        reconfigure_params.forceIDR = is_quality_increasing;
+      }
+
+      NVENCSTATUS status = nvenc_state_.nvenc_funcs.nvEncReconfigureEncoder(
         nvenc_state_.encoder_session, &reconfigure_params);
 
-    if (status == NV_ENC_SUCCESS) {
+      if (status == NV_ENC_SUCCESS) {
         nvenc_state_.initialized_qp = target_qp;
+        nvenc_state_.cbr_mode = is_cbr;
+        nvenc_state_.initialized_bitrate_kbps = bitrate_kbps;
         nvenc_state_.encode_config = new_config;
         return true;
+      }
+    } else {
+      return true;
     }
   }
 
@@ -1175,16 +1315,30 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
 
   nvenc_state_.encode_config.profileGUID =
     use_yuv444 ? NV_ENC_H264_PROFILE_HIGH_444_GUID : NV_ENC_H264_PROFILE_HIGH_GUID;
-  nvenc_state_.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-  nvenc_state_.encode_config.rcParams.constQP.qpInterP = target_qp;
-  nvenc_state_.encode_config.rcParams.constQP.qpIntra = target_qp;
-  nvenc_state_.encode_config.rcParams.constQP.qpInterB = target_qp;
+  
+  if (is_cbr) {
+     nvenc_state_.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+     uint32_t bps = static_cast<uint32_t>(bitrate_kbps * 1000);
+     nvenc_state_.encode_config.rcParams.averageBitRate = bps;
+     nvenc_state_.encode_config.rcParams.maxBitRate = bps;
+     if (vbv_buffer_size_kb > 0) {
+       nvenc_state_.encode_config.rcParams.vbvBufferSize = static_cast<uint32_t>(vbv_buffer_size_kb * 1000);
+     } else {
+       nvenc_state_.encode_config.rcParams.vbvBufferSize = bps * 0.1;
+     }
+  } else {
+      nvenc_state_.encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+      nvenc_state_.encode_config.rcParams.constQP.qpInterP = target_qp;
+      nvenc_state_.encode_config.rcParams.constQP.qpIntra = target_qp;
+      nvenc_state_.encode_config.rcParams.constQP.qpInterB = target_qp;
+  }
   nvenc_state_.encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
   nvenc_state_.encode_config.frameIntervalP = 1;
 
   NV_ENC_CONFIG_H264* h264_cfg = &nvenc_state_.encode_config.encodeCodecConfig.h264Config;
   h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
   h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
+  h264_cfg->repeatSPSPPS = 1;
   nvenc_state_.init_params.encodeConfig = &nvenc_state_.encode_config;
 
   status = nvenc_state_.nvenc_funcs.nvEncInitializeEncoder(nvenc_state_.encoder_session,
@@ -1239,6 +1393,8 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   nvenc_state_.initialized_height = height;
   nvenc_state_.initialized_qp = target_qp;
   nvenc_state_.initialized_buffer_format = target_buffer_format;
+  nvenc_state_.cbr_mode = is_cbr;
+  nvenc_state_.initialized_bitrate_kbps = bitrate_kbps;
   nvenc_state_.initialized = true;
   return true;
 }
@@ -1432,14 +1588,22 @@ void ScreenCaptureModule::reset_vaapi_encoder() {
  * @param qp The target Quantization Parameter for Constant QP (CQP) rate control.
  * @param use_yuv444 If true, configures the encoder for YUV 4:4:4 input;
  *                   otherwise, configures for YUV 4:2:0 (NV12).
+ * @param is_cbr True to enable Constant Bitrate (CBR) mode, false for CQP mode.
+ * @param bitrate_kbps Target bitrate in kbps when CBR mode is enabled.
+ * @param vbv_buffer_size_kb VBV buffer size in kb for CBR mode (0 for auto/default).
  * @return True if the encoder was successfully initialized, false otherwise.
  */
-bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444) {
+bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb) {
     std::unique_lock<std::mutex> lock(vaapi_mutex_);
     if (vaapi_state_.initialized && vaapi_state_.initialized_width == width &&
-        vaapi_state_.initialized_height == height && vaapi_state_.initialized_qp == qp &&
-        vaapi_state_.initialized_is_444 == use_yuv444) {
-        return true;
+        vaapi_state_.initialized_height == height &&
+        vaapi_state_.initialized_is_444 == use_yuv444 &&
+        vaapi_state_.initialized_cbr == is_cbr) {
+        if (is_cbr) {
+            if (vaapi_state_.initialized_bitrate_kbps == bitrate_kbps) return true;
+        } else {
+            if (vaapi_state_.initialized_qp == qp) return true;
+        }
     }
     if (vaapi_state_.initialized) {
         lock.unlock();
@@ -1485,8 +1649,23 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
     } else {
         av_opt_set_int(vaapi_state_.codec_ctx, "profile", FF_PROFILE_H264_HIGH, 0);
     }
-    av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CQP", 0);
-    av_opt_set_int(vaapi_state_.codec_ctx->priv_data, "qp", qp, 0);
+
+     if (is_cbr) {
+        av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CBR", 0);
+        int64_t bps = static_cast<int64_t>(bitrate_kbps) * 1000;
+        vaapi_state_.codec_ctx->bit_rate = bps;
+        vaapi_state_.codec_ctx->rc_max_rate = bps;
+        if (vbv_buffer_size_kb > 0) {
+          vaapi_state_.codec_ctx->rc_buffer_size = static_cast<int64_t>(vbv_buffer_size_kb) * 1000;
+        } else {
+          vaapi_state_.codec_ctx->rc_buffer_size = (bps + 9) / 10;
+        }
+        vaapi_state_.codec_ctx->rc_min_rate = bps;
+     } else {
+         av_opt_set(vaapi_state_.codec_ctx->priv_data, "rc_mode", "CQP", 0);
+         av_opt_set_int(vaapi_state_.codec_ctx->priv_data, "qp", qp, 0);
+      }
+
     vaapi_state_.hw_frames_ctx = av_hwframe_ctx_alloc(vaapi_state_.hw_device_ctx);
     if (!vaapi_state_.hw_frames_ctx) {
         std::cerr << "VAAPI_INIT: Failed to create hardware frames context." << std::endl;
@@ -1526,10 +1705,12 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
     vaapi_state_.initialized_qp = qp;
     vaapi_state_.initialized_is_444 = use_yuv444;
     vaapi_state_.frame_count = 0;
+    vaapi_state_.initialized_cbr = is_cbr;
+    vaapi_state_.initialized_bitrate_kbps = bitrate_kbps;
     if (debug_logging) {
         std::cout << "VAAPI_INIT: Encoder initialized successfully via FFmpeg for "
                   << width << "x" << height << " " << (use_yuv444 ? "YUV444P" : "NV12")
-                  << " with QP " << qp << "." << std::endl;
+                  << (is_cbr ? "with CBR:" + std::to_string(bitrate_kbps) : " with QP: " + std::to_string(qp)) << "." << std::endl;
     }
     return true;
 }
@@ -1815,6 +1996,10 @@ void ScreenCaptureModule::capture_loop() {
     WatermarkLocation local_watermark_location_setting;
     bool local_use_cpu;
     bool local_debug_logging;
+    bool local_current_h264_cbr_mode;
+    int local_current_h264_bitrate_kbps;
+    int local_current_h264_vbv_buffer_size_kb;
+    bool local_current_auto_adjust_screen_capture_size;
 
     {
       std::lock_guard<std::mutex> lock(settings_mutex);
@@ -1842,6 +2027,10 @@ void ScreenCaptureModule::capture_loop() {
       local_debug_logging = debug_logging;
       local_watermark_path_setting = watermark_path_internal;
       local_watermark_location_setting = watermark_location_internal;
+      local_current_h264_cbr_mode = h264_cbr_mode;
+      local_current_h264_bitrate_kbps = h264_bitrate_kbps;
+      local_current_h264_vbv_buffer_size_kb = h264_vbv_buffer_size_kb;
+      local_current_auto_adjust_screen_capture_size = auto_adjust_screen_capture_size;
     }
     if (local_current_output_mode == OutputMode::H264) {
       if (local_capture_width_actual % 2 != 0 && local_capture_width_actual > 0) {
@@ -1861,14 +2050,22 @@ void ScreenCaptureModule::capture_loop() {
 
     if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
         local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index, local_capture_width_actual,
-                                     local_capture_height_actual, local_current_h264_crf, local_current_h264_fullcolor)) {
+        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index,
+                                      local_capture_width_actual,
+                                      local_capture_height_actual,
+                                      local_current_h264_crf,
+                                      local_current_h264_fullcolor,
+                                      local_current_h264_cbr_mode,
+                                      local_current_h264_bitrate_kbps,
+                                      local_current_h264_vbv_buffer_size_kb)) {
             this->vaapi_operational = true;
             this->vaapi_force_next_idr_ = true;
             std::cout << "VAAPI Encoder Initialized successfully." << std::endl;
         } else {
             std::cerr << "VAAPI Encoder initialization failed. Falling back to CPU." << std::endl;
             local_use_cpu = true;
+            std::lock_guard<std::mutex> lock(settings_mutex);
+            this->use_cpu = true;
         }
     } else {
       if (!local_use_cpu && this->is_nvidia_system_detected &&
@@ -1877,18 +2074,78 @@ void ScreenCaptureModule::capture_loop() {
                                      local_capture_height_actual,
                                      local_current_h264_crf,
                                      local_current_target_fps,
-                                     local_current_h264_fullcolor)) {
+                                     local_current_h264_fullcolor,
+                                     local_current_h264_cbr_mode,
+                                     local_current_h264_bitrate_kbps,
+                                     local_current_h264_vbv_buffer_size_kb)) {
           this->nvenc_operational = true;
           this->nvenc_force_next_idr_ = true;
           std::cout << "NVENC Encoder Initialized successfully." << std::endl;
         } else {
           std::cerr << "NVENC Encoder initialization failed. Falling back to x264." << std::endl;
           local_use_cpu = true;
+          std::lock_guard<std::mutex> lock(settings_mutex);
+          this->use_cpu = true;
         }
       } else {
           if (!this->nvenc_operational && this->nvenc_state_.initialized) {
             this->reset_nvenc_encoder();
           }
+      }
+    }
+
+    std::chrono::duration < double > target_frame_duration_seconds =
+      std::chrono::duration < double > (1.0 / local_current_target_fps);
+
+    auto next_frame_time =
+      std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
+
+    const int MAX_ATTACH_ATTEMPTS = 5;
+    const int RETRY_BACKOFF_MS = 500;
+    char* display_env = std::getenv("DISPLAY");
+    const char* display_name = display_env ? display_env : ":0";
+    Display* display = XOpenDisplay(display_name);
+
+    if (!display) {
+      std::cerr << "Error: Failed to open X display " << display_name << std::endl;
+      return;
+    }
+
+    Window root_window = DefaultRootWindow(display);
+    int screen = DefaultScreen(display);
+    XWindowAttributes attributes;
+
+    if (XGetWindowAttributes(display, root_window, &attributes)) {
+      if (local_current_auto_adjust_screen_capture_size) {
+          std::cout << "[pixelflux] auto_adjust_screen_capture_size is enabled, ignoring requested capture size "
+                    << local_capture_width_actual << "x" << local_capture_height_actual
+                    << " and resetting x and y offset to 0" << std::endl;
+          
+          local_capture_width_actual = attributes.width;
+          local_capture_height_actual = attributes.height;
+          local_capture_x_offset = 0;
+          local_capture_y_offset = 0;
+
+          std::lock_guard<std::mutex> lock(settings_mutex);
+          this->capture_width = attributes.width;
+          this->capture_height = attributes.height;
+      } else {
+          if (local_capture_width_actual > attributes.width) {
+          local_capture_width_actual = attributes.width;
+          local_capture_x_offset = 0;
+        }
+        if (local_capture_height_actual > attributes.height) {
+            local_capture_height_actual = attributes.height;
+            local_capture_y_offset = 0;
+        }
+        if (local_capture_x_offset + local_capture_width_actual > attributes.width) {
+            local_capture_x_offset = attributes.width - local_capture_width_actual;
+        }
+        if (local_capture_y_offset + local_capture_height_actual > attributes.height) {
+            local_capture_y_offset = attributes.height - local_capture_height_actual;
+        }
+        if (local_capture_x_offset < 0) local_capture_x_offset = 0;
+        if (local_capture_y_offset < 0) local_capture_y_offset = 0;
       }
     }
 
@@ -1929,46 +2186,6 @@ void ScreenCaptureModule::capture_loop() {
 
     if (!local_watermark_path_setting.empty() && local_watermark_location_setting != WatermarkLocation::NONE) {
         load_watermark_image();
-    }
-
-    std::chrono::duration < double > target_frame_duration_seconds =
-      std::chrono::duration < double > (1.0 / local_current_target_fps);
-
-    auto next_frame_time =
-      std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
-
-    const int MAX_ATTACH_ATTEMPTS = 5;
-    const int RETRY_BACKOFF_MS = 500;
-    char* display_env = std::getenv("DISPLAY");
-    const char* display_name = display_env ? display_env : ":0";
-    Display* display = XOpenDisplay(display_name);
-
-    if (!display) {
-      std::cerr << "Error: Failed to open X display " << display_name << std::endl;
-      return;
-    }
-
-    Window root_window = DefaultRootWindow(display);
-    int screen = DefaultScreen(display);
-    XWindowAttributes attributes;
-
-    if (XGetWindowAttributes(display, root_window, &attributes)) {
-        if (local_capture_width_actual > attributes.width) {
-            local_capture_width_actual = attributes.width;
-            local_capture_x_offset = 0;
-        }
-        if (local_capture_height_actual > attributes.height) {
-            local_capture_height_actual = attributes.height;
-            local_capture_y_offset = 0;
-        }
-        if (local_capture_x_offset + local_capture_width_actual > attributes.width) {
-            local_capture_x_offset = attributes.width - local_capture_width_actual;
-        }
-        if (local_capture_y_offset + local_capture_height_actual > attributes.height) {
-            local_capture_y_offset = attributes.height - local_capture_height_actual;
-        }
-        if (local_capture_x_offset < 0) local_capture_x_offset = 0;
-        if (local_capture_y_offset < 0) local_capture_y_offset = 0;
     }
 
     if (!XShmQueryExtension(display)) {
@@ -2108,7 +2325,8 @@ void ScreenCaptureModule::capture_loop() {
         settings_ss << " | Mode: H264 (" << encoder_type << ")";
         settings_ss << (local_current_h264_fullframe ? " FullFrame" : " Striped");
         if (local_current_h264_streaming_mode) settings_ss << " Streaming";
-        settings_ss << " | CRF: " << local_current_h264_crf;
+        if (!local_current_h264_cbr_mode) settings_ss << " | CRF: " << local_current_h264_crf;
+        else settings_ss << " | CBR: " << local_current_h264_bitrate_kbps;
         if (local_current_use_paint_over_quality) {
             settings_ss << " | PaintOver CRF: " << local_current_h264_paintover_crf
                         << " (Burst: " << local_current_h264_paintover_burst_frames << "f)";
@@ -2191,6 +2409,10 @@ void ScreenCaptureModule::capture_loop() {
         local_watermark_location_setting = watermark_location_internal;
         local_use_cpu = use_cpu;
         local_debug_logging = debug_logging;
+        local_current_h264_cbr_mode = h264_cbr_mode;
+        local_current_h264_bitrate_kbps = h264_bitrate_kbps;
+        local_current_h264_vbv_buffer_size_kb = h264_vbv_buffer_size_kb;
+        local_current_auto_adjust_screen_capture_size = auto_adjust_screen_capture_size;
       }
 
       bool current_watermark_is_actually_loaded_in_loop;
@@ -2229,6 +2451,32 @@ void ScreenCaptureModule::capture_loop() {
       if (local_capture_width_actual <=0 || local_capture_height_actual <=0) {
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
           continue;
+      }
+
+      if (local_current_auto_adjust_screen_capture_size) {
+        XWindowAttributes attributes;
+        if (XGetWindowAttributes(display, root_window, &attributes)) {
+          if (local_capture_width_actual != attributes.width ||
+              local_capture_height_actual != attributes.height) {
+                if (debug_logging) {
+                    std::cout << "[pixelflux] Auto-adjusting capture size from "
+                              << local_capture_width_actual << "x"
+                              << local_capture_height_actual << " to "
+                              << attributes.width << "x"
+                              << attributes.height << std::endl;
+                }
+            local_capture_width_actual = attributes.width;
+            local_capture_height_actual = attributes.height;
+            local_capture_x_offset = 0;
+            local_capture_y_offset = 0;
+
+            std::lock_guard<std::mutex> lock(settings_mutex);
+            capture_width = local_capture_width_actual;
+            capture_height = local_capture_height_actual;
+            capture_x = 0;
+            capture_y = 0;
+          }
+        }
       }
 
       if (old_w != local_capture_width_actual || old_h != local_capture_height_actual ||
@@ -2780,7 +3028,14 @@ void ScreenCaptureModule::capture_loop() {
                 if (local_current_use_paint_over_quality && this->nvenc_force_next_idr_) {
                     target_qp_for_frame = local_current_h264_paintover_crf;
                 }
-                if (!this->initialize_nvenc_encoder(local_capture_width_actual, local_capture_height_actual, target_qp_for_frame, local_current_target_fps, local_current_h264_fullcolor)) {
+                if (!this->initialize_nvenc_encoder(local_capture_width_actual,
+                                              local_capture_height_actual,
+                                              target_qp_for_frame,
+                                              local_current_target_fps,
+                                              local_current_h264_fullcolor,
+                                              local_current_h264_cbr_mode,
+                                              local_current_h264_bitrate_kbps,
+                                              local_current_h264_vbv_buffer_size_kb)) {
                     std::cerr << "NVENC: Re-initialization for QP change failed. Disabling NVENC." << std::endl;
                     this->nvenc_operational = false;
                     this->reset_nvenc_encoder();
@@ -2820,8 +3075,8 @@ void ScreenCaptureModule::capture_loop() {
                 bool force_idr = this->force_next_idr_.exchange(false);
                 std::packaged_task<StripeEncodeResult(
                   MinimalEncoderStore&, int, int, int, int, const uint8_t*, int,
-                  const uint8_t*, int, const uint8_t*, int, bool, int, int, int, bool,
-                  bool, bool)>
+                  const uint8_t*, int, const uint8_t*, int, bool, int, int, int,
+                  bool, int, bool, bool, int, int)>
                   task(encode_stripe_h264);
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(
@@ -2836,7 +3091,10 @@ void ScreenCaptureModule::capture_loop() {
                   derived_h264_colorspace_setting,
                   derived_h264_use_full_range,
                   local_current_h264_streaming_mode,
-									force_idr
+                  force_idr,
+                  local_current_h264_cbr_mode,
+                  local_current_h264_bitrate_kbps,
+                  local_current_h264_vbv_buffer_size_kb
                   ));
               }
             }
@@ -2927,9 +3185,11 @@ void ScreenCaptureModule::capture_loop() {
                            (local_current_h264_fullframe ? " FF" : " Striped"))
                         : std::string(""))
                     << " Stripes: " << N_processing_stripes
-                    << (local_current_output_mode == OutputMode::H264
-                        ? " CRF:" + std::to_string(local_current_h264_crf)
-                        : " Q:" + std::to_string(local_current_jpeg_quality))
+                    << (local_current_output_mode == OutputMode::H264 && local_current_h264_cbr_mode ?
+                        " CBR:" + std::to_string(local_current_h264_bitrate_kbps): 
+                        (local_current_output_mode == OutputMode::H264
+                        ? " CRF" + std::to_string(local_current_h264_crf)
+                        : " Q:" + std::to_string(local_current_jpeg_quality)))
                     << " EncFPS: " << std::fixed << std::setprecision(2) << actual_fps_val
                     << " EncStripes/s: " << std::fixed << std::setprecision(2)
                     << total_stripes_per_second_val
@@ -3092,7 +3352,7 @@ StripeEncodeResult encode_stripe_jpeg(
  *
  * Manages a thread-specific x264 encoder instance from the provided encoder store.
  * The encoder is re-initialized if input parameters
- * such as resolution or colorspace change. The CRF can be reconfigured
+ * such as resolution or colorspace change. The CRF or bitrate can be reconfigured
  * between frames without a full re-initialization.
  *
  * The output NAL units are packaged into a StripeEncodeResult with a custom
@@ -3112,9 +3372,14 @@ StripeEncodeResult encode_stripe_jpeg(
  * @param v_stride          Stride in bytes for the V plane.
  * @param is_i444_input     `true` for I444 colorspace, `false` for I420.
  * @param frame_counter     The frame number, used to set the picture's PTS.
- * @param current_crf_setting The target Constant Rate Factor (CRF).
+ * @param current_crf_setting The target Constant Rate Factor (CRF) for CRF mode.
  * @param colorspace_setting Integer representing the colorspace (444 or 420).
  * @param use_full_range    If `true`, signals full-range color in the VUI.
+ * @param h264_streaming_mode If `true`, enables streaming mode optimizations.
+ * @param force_idr         If `true`, forces the encoder to generate an IDR frame.
+ * @param is_cbr            If `true`, enables Constant Bitrate (CBR) mode.
+ * @param h264_bitrate_kbps Target bitrate in kbps for CBR mode.
+ * @param vbv_buffer_size_kb VBV buffer size in kb for CBR mode (0 for auto/default).
  * @return                  A `StripeEncodeResult` containing the encoded bitstream.
  *                          The `data` buffer is dynamically allocated and must be
  *                          freed by the caller.
@@ -3134,7 +3399,10 @@ StripeEncodeResult encode_stripe_h264(
   int colorspace_setting,
   bool use_full_range,
   bool h264_streaming_mode,
-  bool force_idr) {
+  bool force_idr,
+  bool is_cbr,
+  int h264_bitrate_kbps,
+  int vbv_buffer_size_kb) {
 
   StripeEncodeResult result;
   result.type = StripeDataType::H264;
@@ -3193,14 +3461,21 @@ StripeEncodeResult encode_stripe_h264(
                                 colorspace_setting ||
                              h264_minimal_store.initialized_full_range_flags[thread_id] !=
                                 use_full_range);
+    bool rc_changed = !is_first_init && h264_minimal_store.initialized_cbr_flags[thread_id] != is_cbr;
+
 
     bool needs_crf_reinit = false;
     if (!is_first_init &&
         h264_minimal_store.initialized_crfs[thread_id] != current_crf_setting) {
         needs_crf_reinit = true;
     }
+    
+    bool needs_cbr_reinit = false;
+    if (!is_first_init && is_cbr && h264_minimal_store.initialized_bitrates[thread_id] != h264_bitrate_kbps) {
+        needs_cbr_reinit = true;
+    }
 
-    bool perform_full_reinit = is_first_init || dims_changed || cs_or_fr_changed;
+    bool perform_full_reinit = is_first_init || dims_changed || cs_or_fr_changed || rc_changed;
 
     if (perform_full_reinit) {
       if (h264_minimal_store.encoders[thread_id]) {
@@ -3221,9 +3496,6 @@ StripeEncodeResult encode_stripe_h264(
         param.i_fps_num = 60;
         param.i_fps_den = 1;
         param.i_keyint_max = X264_KEYINT_MAX_INFINITE;
-        param.rc.f_rf_constant =
-            static_cast<float>(std::max(0, std::min(51, current_crf_setting)));
-        param.rc.i_rc_method = X264_RC_CRF;
         param.b_repeat_headers = 1;
         param.b_annexb = 1;
         param.i_sync_lookahead = 0;
@@ -3233,6 +3505,21 @@ StripeEncodeResult encode_stripe_h264(
         param.vui.b_fullrange = 0;
         param.vui.i_sar_width = 1;
         param.vui.i_sar_height = 1;
+        if (is_cbr) {
+            param.rc.i_rc_method = X264_RC_ABR;
+            int abs_bitrate = static_cast<int>(std::abs(h264_bitrate_kbps));
+            param.rc.i_bitrate = abs_bitrate;
+            param.rc.i_vbv_max_bitrate = abs_bitrate;
+            if (vbv_buffer_size_kb > 0) {
+              param.rc.i_vbv_buffer_size = vbv_buffer_size_kb;
+            } else {
+              param.rc.i_vbv_buffer_size = (abs_bitrate + 9) / 10;
+            }
+            param.rc.b_filler = 0;
+        } else {
+            param.rc.i_rc_method = X264_RC_CRF;
+            param.rc.f_rf_constant = static_cast<float>(std::max(0, std::min(51, current_crf_setting)));
+        }
         if (param.i_csp == X264_CSP_I444) {
              param.vui.i_colorprim = 1;
              param.vui.i_transfer = 1;
@@ -3259,6 +3546,8 @@ StripeEncodeResult encode_stripe_h264(
           h264_minimal_store.initialized_colorspaces[thread_id] = colorspace_setting;
           h264_minimal_store.initialized_full_range_flags[thread_id] = use_full_range;
           h264_minimal_store.force_idr_flags[thread_id] = true;
+          h264_minimal_store.initialized_cbr_flags[thread_id] = is_cbr;
+          h264_minimal_store.initialized_bitrates[thread_id] = static_cast<int>(std::abs(h264_bitrate_kbps));
         }
       }
     } else if (needs_crf_reinit) {
@@ -3274,6 +3563,28 @@ StripeEncodeResult encode_stripe_h264(
           std::cerr << "H264 T" << thread_id
                     << ": x264_encoder_reconfig for CRF FAILED. Old CRF "
                     << h264_minimal_store.initialized_crfs[thread_id]
+                    << " may persist." << std::endl;
+        }
+      }
+    } else if (needs_cbr_reinit) {
+      x264_t* encoder_to_reconfig = h264_minimal_store.encoders[thread_id];
+      if (encoder_to_reconfig) {
+        x264_param_t params_for_reconfig;
+        x264_encoder_parameters(encoder_to_reconfig, &params_for_reconfig);
+        int abs_bitrate = static_cast<int>(std::abs(h264_bitrate_kbps));
+        params_for_reconfig.rc.i_bitrate = abs_bitrate;
+        params_for_reconfig.rc.i_vbv_max_bitrate = abs_bitrate;
+        if (vbv_buffer_size_kb > 0) {
+          params_for_reconfig.rc.i_vbv_buffer_size = vbv_buffer_size_kb;
+        } else {
+          params_for_reconfig.rc.i_vbv_buffer_size = static_cast<int>(abs_bitrate * 0.1);
+        }
+        if (x264_encoder_reconfig(encoder_to_reconfig, &params_for_reconfig) == 0) {
+          h264_minimal_store.initialized_bitrates[thread_id] = abs_bitrate;
+        } else {
+          std::cerr << "H264 T" << thread_id
+                    << ": x264_encoder_reconfig for CBR FAILED. Old CBR "
+                    << h264_minimal_store.initialized_bitrates[thread_id]
                     << " may persist." << std::endl;
         }
       }
@@ -3405,6 +3716,8 @@ StripeEncodeResult encode_stripe_h264(
  * @param is_i420 True if the YUV format is I420 (chroma planes are half width and
  *                half height of the luma plane). False if I444 (chroma planes have
  *                the same dimensions as the luma plane).
+ * @param use_fullframe_hashing True to use full-frame hashing (samples every 12th row),
+ *                              false to hash every row.
  * @return A 64-bit hash value representing the content of the YUV stripe.
  *         Returns 0 if input parameters are invalid (e.g., null pointers,
  *         non-positive dimensions).
@@ -3541,14 +3854,53 @@ extern "C" {
     }
   }
 
-  // Expose the IDR request logic to the public C API
-  void screen_capture_request_idr(ScreenCaptureModuleHandle module_handle) {
+  /**
+   * @brief Requests an IDR frame from an encoder
+   * @param moduel_handle Handle to the ScreenCaptureModule instance.
+  */
+  void request_idr(ScreenCaptureModuleHandle module_handle) {
 		if (module_handle) {
 			ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
 			if (module) {
 				module->request_idr();
 			}
 		}
+  }
+
+  /**
+   * @brief Update video bitrate of an encoder
+   * @param moduel_handle Handle to the ScreenCaptureModule instance.
+   * @param bitrate video bitrate to set 
+   */
+  void update_video_bitrate(ScreenCaptureModuleHandle module_handle, int bitrate) {
+    if (module_handle) {
+      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
+      if (module) module->update_video_bitrate(bitrate);
+    }
+  }
+
+  /**
+   * @brief Updates the framerate of the screen capture process.
+   * @param module_handle Handle to the ScreenCaptureModule instance.
+   * @param fps The new framerate to set.
+   */
+  void update_framerate(ScreenCaptureModuleHandle module_handle, double fps) {
+    if (module_handle) {
+      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
+      if (module) module->update_framerate(fps);
+    }
+  }
+
+    /**
+   * @brief Updates the VBV buffer size for H.264 CBR mode.
+   * @param module_handle Handle to the ScreenCaptureModule instance.
+   * @param vbv_buffer_size_kbps The new VBV buffer size in kb
+   */
+  void update_vbv_buffer_size(ScreenCaptureModuleHandle module_handle, int vbv_buffer_size_kb) {
+    if (module_handle) {
+      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
+      if (module) module->update_vbv_buffer_size(vbv_buffer_size_kb);
+    }
   }
 
   /**
