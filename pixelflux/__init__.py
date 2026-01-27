@@ -30,6 +30,10 @@ class CaptureSettings(ctypes.Structure):
         ("vaapi_render_node_index", ctypes.c_int),
         ("use_cpu", ctypes.c_bool),
         ("debug_logging", ctypes.c_bool),
+        ("h264_cbr_mode", ctypes.c_bool),
+        ("h264_bitrate_kbps", ctypes.c_int),
+        ("h264_vbv_buffer_size_kb", ctypes.c_int),
+        ("auto_adjust_screen_capture_size", ctypes.c_bool),
     ]
 
 class StripeEncodeResult(ctypes.Structure):
@@ -69,7 +73,15 @@ if _legacy_lib:
     stop_capture_c.argtypes = [ctypes.c_void_p]
     free_stripe_encode_result_data = _legacy_lib.free_stripe_encode_result_data
     free_stripe_encode_result_data.argtypes = [ctypes.POINTER(StripeEncodeResult)]
-
+    request_idr = _legacy_lib.request_idr
+    request_idr.argtypes = [ctypes.c_void_p]
+    update_video_bitrate_c = _legacy_lib.update_video_bitrate
+    update_video_bitrate_c.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    update_framerate_c = _legacy_lib.update_framerate
+    update_framerate_c.argtypes = [ctypes.c_void_p, ctypes.c_double]
+    update_vbv_buffer_size_c = _legacy_lib.update_vbv_buffer_size
+    update_vbv_buffer_size_c.argtypes = [ctypes.c_void_p, ctypes.c_int]
+ 
 _GLOBAL_WAYLAND_BACKEND = None
 if os.environ.get("PIXELFLUX_WAYLAND") == "true":
     try:
@@ -219,3 +231,19 @@ class ScreenCapture:
     def set_cursor_callback(self, callback):
         if _GLOBAL_WAYLAND_BACKEND:
             _GLOBAL_WAYLAND_BACKEND.set_cursor_callback(callback)
+
+    def request_idr_frame(self):
+        if self._is_capturing and self._module:
+            request_idr(self._module)
+
+    def update_video_bitrate(self, bitrate):
+        if self._is_capturing and self._module:
+            update_video_bitrate_c(self._module, bitrate)
+    
+    def update_framerate(self, fps):
+        if self._is_capturing and self._module:
+            update_framerate_c(self._module, ctypes.c_double(fps))
+    
+    def update_vbv_buf_size(self, buffer_size):
+        if self._is_capturing and self._module:
+            update_vbv_buffer_size_c(self._module, buffer_size)
