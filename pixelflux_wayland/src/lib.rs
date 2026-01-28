@@ -481,6 +481,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         let current_refresh = current_mode.refresh;
                         let target_refresh = (settings.target_fps * 1000.0).round() as i32;
 
+                        let scale = settings.scale.max(0.1);
+                        let logical_width = (settings.width as f64 / scale).round() as i32;
+                        let logical_height = (settings.height as f64 / scale).round() as i32;
+
                         if current_w != settings.width
                             || current_h != settings.height
                             || (current_scale - settings.scale).abs() > 0.001
@@ -501,30 +505,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 Some((0, 0).into()),
                             );
                             output.set_preferred(new_mode);
-
-                            let scale = settings.scale.max(0.1);
-                            let logical_width = (settings.width as f64 / scale).round() as i32;
-                            let logical_height = (settings.height as f64 / scale).round() as i32;
-
-                            for window in state.space.elements() {
-                                if let Some(surface) = window.wl_surface() {
-                                    output.enter(&surface);
-                                    with_states(&surface, |states| {
-                                        smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
-                                            fs.set_preferred_scale(scale);
-                                        });
-                                    });
-                                }
-                                if let Some(toplevel) = window.toplevel() {
-                                    toplevel.with_pending_state(|state| {
-                                        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-                                        state.states.set(State::Fullscreen);
-                                        state.states.set(State::Activated);
-                                        state.size = Some((logical_width, logical_height).into());
-                                    });
-                                    toplevel.send_configure();
-                                }
-                            }
 
                             let pixel_count = (settings.width * settings.height) as usize;
                             state.frame_buffer = vec![0u8; pixel_count * 4];
@@ -548,6 +528,26 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                     let dmabuf = create_dmabuf_from_bo(&bo);
                                     state.offscreen_buffer = Some((bo, dmabuf));
                                 }
+                            }
+                        }
+
+                        for window in state.space.elements() {
+                            if let Some(surface) = window.wl_surface() {
+                                output.enter(&surface);
+                                with_states(&surface, |states| {
+                                    smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                                        fs.set_preferred_scale(scale);
+                                    });
+                                });
+                            }
+                            if let Some(toplevel) = window.toplevel() {
+                                toplevel.with_pending_state(|state| {
+                                    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
+                                    state.states.set(State::Fullscreen);
+                                    state.states.set(State::Activated);
+                                    state.size = Some((logical_width, logical_height).into());
+                                });
+                                toplevel.send_configure();
                             }
                         }
                     }
