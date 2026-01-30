@@ -224,12 +224,15 @@ impl VaapiEncoder {
                 return Err("h264_vaapi encoder not found".into());
             }
 
+            let aligned_width = (width + 15) & !15;
+            let aligned_height = (height + 31) & !31;
+
             let mut enc_frames_ref = ff::av_hwframe_ctx_alloc(hw_device_ctx);
             let enc_frames = (*enc_frames_ref).data as *mut ff::AVHWFramesContext;
             (*enc_frames).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
             (*enc_frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
-            (*enc_frames).width = width;
-            (*enc_frames).height = height;
+            (*enc_frames).width = aligned_width;
+            (*enc_frames).height = aligned_height;
             (*enc_frames).initial_pool_size = 20;
 
             if ff::av_hwframe_ctx_init(enc_frames_ref) < 0 {
@@ -330,7 +333,11 @@ impl VaapiEncoder {
             (*outputs).pad_idx = 0;
             (*outputs).next = ptr::null_mut();
 
-            let filters_desc = CString::new("hwmap,scale_vaapi=format=nv12").unwrap();
+            let filters_desc = CString::new(format!(
+                "hwmap,scale_vaapi=w={}:h={}:format=nv12",
+                width, height
+            ))
+            .unwrap();
             if ff::avfilter_graph_parse_ptr(
                 filter_graph,
                 filters_desc.as_ptr(),
@@ -505,6 +512,7 @@ impl VaapiEncoder {
             }
 
             let mut resources = DmabufResources { fds: Vec::new() };
+            let strides: Vec<u32> = dmabuf.strides().collect();
 
             (*desc_ptr).nb_objects = dmabuf.handles().count() as i32;
             (*desc_ptr).nb_layers = 1;
@@ -517,7 +525,11 @@ impl VaapiEncoder {
                 }
                 resources.fds.push(fd);
                 (*desc_ptr).objects[i].fd = fd;
-                (*desc_ptr).objects[i].size = (self.width * self.height * 4) as usize;
+                
+                let stride = strides.get(i).copied().unwrap_or(strides[0]);
+                let aligned_height = (self.height + 31) & !31;
+                (*desc_ptr).objects[i].size = (stride as usize) * (aligned_height as usize);
+                
                 (*desc_ptr).objects[i].format_modifier = u64::from(dmabuf.format().modifier);
             }
 
@@ -621,6 +633,12 @@ impl VaapiEncoder {
 
             (*self.sw_frame).data[1] = nv12_pixels.as_ptr().add(width * height) as *mut u8;
             (*self.sw_frame).linesize[1] = self.width;
+
+            if ff::av_hwframe_get_buffer((*self.encoder_ctx).hw_frames_ctx, self.hw_frame, 0) < 0 {
+                return Err("Failed to allocate HW frame for NV12 path".into());
+            }
+            (*self.hw_frame).width = self.width;
+            (*self.hw_frame).height = self.height;
 
             if ff::av_hwframe_transfer_data(self.hw_frame, self.sw_frame, 0) < 0 {
                 return Err("Failed to upload frame to GPU".into());
