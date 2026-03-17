@@ -42,7 +42,7 @@ base_capture_settings.target_fps = 60.0
 base_capture_settings.capture_cursor = False
 
 # --- Encoding Mode ---
-# Sets the output codec. 0 for JPEG, 1 for H.264.
+# Sets the output codec. 0 for JPEG, 1 for H.264, 2 for AV1.
 base_capture_settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
 base_capture_settings.use_cpu = False

@@ -105,7 +105,8 @@ pub struct VaapiEncoder {
     width: i32,
     height: i32,
     fps: i32,
-    
+    output_mode: i32,
+ 
     current_qp: u32,
     qp_hysteresis_counter: u32,
 }
@@ -218,10 +219,11 @@ impl VaapiEncoder {
                 return Err("Failed to init DRM frames ctx".into());
             }
 
-            let codec_name = CString::new("h264_vaapi").unwrap();
+            let codec_name_str = if settings.output_mode == 2 { "av1_vaapi" } else { "h264_vaapi" };
+            let codec_name = CString::new(codec_name_str).unwrap();
             let codec = ff::avcodec_find_encoder_by_name(codec_name.as_ptr());
             if codec.is_null() {
-                return Err("h264_vaapi encoder not found".into());
+                return Err(format!("{} encoder not found", codec_name_str));
             }
 
             let aligned_width = (width + 15) & !15;
@@ -265,8 +267,13 @@ impl VaapiEncoder {
             set_opt(&mut opts, "rc_mode", "CQP");
             set_opt(&mut opts, "qp", &settings.h264_crf.to_string());
             set_opt(&mut opts, "async_depth", "1");
-            set_opt(&mut opts, "profile", "high");
-            set_opt(&mut opts, "level", "4.1");
+            if settings.output_mode == 2 {
+                set_opt(&mut opts, "profile", "main");
+                set_opt(&mut opts, "level", "4.0");
+            } else {
+                set_opt(&mut opts, "profile", "high");
+                set_opt(&mut opts, "level", "4.1");
+            }
 
             let ret = ff::avcodec_open2(encoder_ctx, codec, &mut opts);
             if ret < 0 {
@@ -385,6 +392,7 @@ impl VaapiEncoder {
                 width,
                 height,
                 fps,
+                output_mode: settings.output_mode,
                 current_qp: settings.h264_crf as u32,
                 qp_hysteresis_counter: 0,
             })
@@ -425,8 +433,13 @@ impl VaapiEncoder {
         set_opt(&mut opts, "rc_mode", "CQP");
         set_opt(&mut opts, "qp", &new_qp.to_string());
         set_opt(&mut opts, "async_depth", "1");
-        set_opt(&mut opts, "profile", "high");
-        set_opt(&mut opts, "level", "4.1");
+        if self.output_mode == 2 {
+            set_opt(&mut opts, "profile", "main");
+            set_opt(&mut opts, "level", "4.0");
+        } else {
+            set_opt(&mut opts, "profile", "high");
+            set_opt(&mut opts, "level", "4.1");
+        }
 
         let ret = ff::avcodec_open2(self.encoder_ctx, self.codec, &mut opts);
         ff::av_dict_free(&mut opts);
@@ -472,7 +485,7 @@ impl VaapiEncoder {
             let is_key = ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0;
 
             output.reserve(10 + size);
-            output.push(0x04);
+            output.push(if self.output_mode == 2 { 0x05 } else { 0x04 });
             output.push(if is_key { 0x01 } else { 0x00 });
             output.extend_from_slice(&(frame_number as u16).to_be_bytes());
             output.extend_from_slice(&0u16.to_be_bytes());

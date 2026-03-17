@@ -629,7 +629,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         .unwrap_or(1);
                     let mut n_stripes = num_cores;
 
-                    if settings.output_mode == 1 {
+                    if settings.output_mode == 1 || settings.output_mode == 2 {
                         if state.video_encoder.is_some() || settings.h264_fullframe {
                             n_stripes = 1;
                         } else {
@@ -667,7 +667,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             Some(GpuEncoder::Vaapi(_)) => "VAAPI",
                             None => "CPU",
                         };
-                        log_msg.push_str(&format!(" | Mode: H264 ({})", encoder_type));
+                        let codec_str = if settings.output_mode == 2 { "AV1" } else { "H264" };
+                        log_msg.push_str(&format!(" | Mode: {} ({})", codec_str, encoder_type));
 
                         if state.video_encoder.is_some() || settings.h264_fullframe {
                             log_msg.push_str(" FullFrame");
@@ -961,13 +962,14 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         let cs_str = if is_actually_444 { "CS_IN:I444" } else { "CS_IN:I420" };
                         let range_str = if is_actually_444 { "FR" } else { "LR" };
                         let frame_str = if state.video_encoder.is_some() || state.settings.h264_fullframe { "FF" } else { "Striped" };
+                        let codec_str = if state.settings.output_mode == 2 { "AV1" } else { "H264" };
 
-                        format!("H264 ({}) {} {} {} CRF:{}", backend, cs_str, range_str, frame_str, state.settings.h264_crf)
+                        format!("{} ({}) {} {} {} CRF:{}", codec_str, backend, cs_str, range_str, frame_str, state.settings.h264_crf)
                     };
 
                     let num_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
                     let mut n_stripes = num_cores;
-                    if state.settings.output_mode == 1 {
+                    if state.settings.output_mode == 1 || state.settings.output_mode == 2 {
                         if state.video_encoder.is_some() || state.settings.h264_fullframe {
                             n_stripes = 1;
                         } else {

@@ -135,8 +135,9 @@ class ScreenCapture:
 
             if settings.debug_logging:
                 print(f">> [PixelFlux] Connecting to Rust Wayland Backend (Scale: {settings.scale})...")
-            
+           
             is_h264 = (settings.output_mode == 1)
+            is_av1 = (settings.output_mode == 2)
 
             def rust_bridge_callback(data_bytes): 
                 if not self._python_stripe_callback:
@@ -146,8 +147,8 @@ class ScreenCapture:
                 result_struct = StripeEncodeResult()
                 result_struct.size = size
                 result_struct.data = ctypes.cast(c_buffer, ctypes.POINTER(ctypes.c_ubyte))
-                if is_h264:
-                    result_struct.type = 0
+                if is_h264 or is_av1:
+                    result_struct.type = 0 if is_h264 else 2
                     if size >= 4:
                         result_struct.frame_id = int.from_bytes(data_bytes[2:4], 'big')
                     else:
@@ -157,7 +158,7 @@ class ScreenCapture:
                     else:
                          result_struct.stripe_y_start = 0
                     result_struct.stripe_height = settings.capture_height
-                else:
+                else: 
                     result_struct.type = 1
                     if size >= 2:
                         result_struct.frame_id = int.from_bytes(data_bytes[0:2], 'big')
