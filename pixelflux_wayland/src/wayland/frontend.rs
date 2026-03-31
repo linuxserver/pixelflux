@@ -214,6 +214,7 @@ pub struct AppState {
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
+    pub render_node_path: String,
 }
 
 impl PointerConstraintsHandler for AppState {

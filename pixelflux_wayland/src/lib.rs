@@ -280,8 +280,25 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let display: Display<AppState> = Display::new().unwrap();
     let dh: DisplayHandle = display.handle();
 
-    let dri_node = std::env::var("DRINODE").unwrap_or_default();
-    let use_gpu = !dri_node.is_empty();
+    let auto_gpu = std::env::var("AUTO_GPU").unwrap_or_default().to_lowercase() == "true";
+    let mut dri_node = std::env::var("DRINODE").unwrap_or_default();
+
+    if auto_gpu {
+        if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+            let mut nodes: Vec<String> = entries.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("renderD"))
+                .collect();
+            nodes.sort();
+            if let Some(node) = nodes.first() {
+                dri_node = format!("/dev/dri/{}", node);
+                println!("[Wayland] AUTO_GPU enabled. Selected: {}", dri_node);
+            }
+        }
+    }
+
+    let mut use_gpu = !dri_node.is_empty();
+    let render_node_path = dri_node.clone();
 
     let mut gles_renderer = None;
     let mut pixman_renderer = None;
@@ -290,64 +307,73 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let mut gbm_device_raw = None;
     let mut dmabuf_state = DmabufState::new();
 
+    let mut gpu_success = false;
     if use_gpu {
         println!("[Wayland] Initializing GL Renderer using device: {}", dri_node);
-        let device_path = std::path::Path::new(&dri_node);
+        let init_res: Result<(), String> = (|| {
+            let device_path = std::path::Path::new(&dri_node);
+            let file = File::options().read(true).write(true).open(device_path)
+                .map_err(|e| format!("Failed to open render device: {}", e))?;
+            let file_for_alloc = file.try_clone()
+                .map_err(|e| format!("Failed to clone file for GBM Allocator: {}", e))?;
+            let gbm_allocator = RawGbmDevice::new(file_for_alloc)
+                .map_err(|_| "Failed to create Raw GBM Device")?;
+            let gbm = GbmDevice::new(file)
+                .map_err(|_| "Failed to create GBM device")?;
+            let egl = unsafe { EGLDisplay::new(gbm) }
+                .map_err(|_| "Failed to create EGL display")?;
+            let context = EGLContext::new(&egl)
+                .map_err(|_| "Failed to create EGL context")?;
+            let mut renderer = unsafe { GlesRenderer::new(context) }
+                .map_err(|_| "Failed to init GlesRenderer")?;
+            
+            if let Err(e) = renderer.bind_wl_display(&dh) {
+                println!("[Wayland] Warning: Failed to bind EGL to Wayland Display (Optional): {:?}", e);
+            }
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(device_path)
-            .expect("Failed to open render device");
+            let formats = Bind::<Dmabuf>::supported_formats(&renderer)
+                .ok_or("Failed to query formats")?
+                .into_iter()
+                .collect::<Vec<_>>();
 
-        let file_for_alloc = file
-            .try_clone()
-            .expect("Failed to clone file for GBM Allocator");
-        let gbm_allocator =
-            RawGbmDevice::new(file_for_alloc).expect("Failed to create Raw GBM Device");
+            let node = DrmNode::from_path(device_path)
+                .map_err(|_| "Failed to create DrmNode")?;
+            let dmabuf_default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats.clone()).build();
 
-        let gbm = GbmDevice::new(file).expect("Failed to create GBM device");
-        let egl = unsafe { EGLDisplay::new(gbm) }.expect("Failed to create EGL display");
-        let context = EGLContext::new(&egl).expect("Failed to create EGL context");
+            dmabuf_global = Some(if let Ok(default_feedback) = dmabuf_default_feedback {
+                dmabuf_state.create_global_with_default_feedback::<AppState>(&dh, &default_feedback)
+            } else {
+                dmabuf_state.create_global::<AppState>(&dh, formats)
+            });
 
-        let mut renderer =
-            unsafe { GlesRenderer::new(context) }.expect("Failed to init GlesRenderer");
-        if let Err(e) = renderer.bind_wl_display(&dh) {
-            println!("[Wayland] Warning: Failed to bind EGL to Wayland Display (Optional): {:?}", e);
+            let bo = gbm_allocator.create_buffer_object(
+                width as u32, height as u32, GbmFormat::Argb8888, BufferObjectFlags::RENDERING
+            ).map_err(|_| "Failed to allocate GBM buffer")?;
+
+            let dmabuf = create_dmabuf_from_bo(&bo);
+            offscreen_buffer = Some((bo, dmabuf));
+            gbm_device_raw = Some(gbm_allocator);
+            gles_renderer = Some(renderer);
+            Ok(())
+        })();
+
+        match init_res {
+            Ok(_) => gpu_success = true,
+            Err(e) => {
+                println!("[Wayland] GPU Initialization failed: {}. Falling back to Software Renderer (Pixman).", e);
+                use_gpu = false;
+            }
         }
+    }
 
-        let formats = Bind::<Dmabuf>::supported_formats(&renderer)
-            .expect("Failed to query formats")
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        let node = DrmNode::from_path(device_path).expect("Failed to create DrmNode");
-        let dmabuf_default_feedback =
-            DmabufFeedbackBuilder::new(node.dev_id(), formats.clone()).build();
-
-        dmabuf_global = Some(if let Ok(default_feedback) = dmabuf_default_feedback {
-            dmabuf_state.create_global_with_default_feedback::<AppState>(&dh, &default_feedback)
+    if !gpu_success {
+        if !dri_node.is_empty() && !use_gpu {
+            // Pass
         } else {
-            dmabuf_state.create_global::<AppState>(&dh, formats)
-        });
-
-        let bo = gbm_allocator
-            .create_buffer_object(
-                width as u32,
-                height as u32,
-                GbmFormat::Argb8888,
-                BufferObjectFlags::RENDERING,
-            )
-            .expect("Failed to allocate GBM buffer");
-
-        let dmabuf = create_dmabuf_from_bo(&bo);
-        offscreen_buffer = Some((bo, dmabuf));
-
-        gbm_device_raw = Some(gbm_allocator);
-        gles_renderer = Some(renderer);
-    } else {
-        println!("[Wayland] DRINODE unset. Initializing Software Renderer (Pixman).");
+            println!("[Wayland] DRINODE unset. Initializing Software Renderer (Pixman).");
+        }
         pixman_renderer = Some(PixmanRenderer::new().expect("Failed to init PixmanRenderer"));
+        use_gpu = false;
     }
 
     let compositor_state = CompositorState::new::<AppState>(&dh);
@@ -438,6 +464,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         cursor_buffer: None,
         cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
+        render_node_path,
     };
 
     let output = Output::new(
@@ -472,7 +499,16 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         .handle()
         .insert_source(command_rx, move |event, _, state| {
             match event {
-                CalloopEvent::Msg(ThreadCommand::StartCapture(cb, settings)) => {
+                CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
+                    let auto_gpu = std::env::var("AUTO_GPU").unwrap_or_default().to_lowercase() == "true";
+                    if auto_gpu {
+                        if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
+                            if let Ok(idx) = idx_str.parse::<i32>() {
+                                settings.vaapi_render_node_index = idx - 128;
+                            }
+                        }
+                    }
+
                     if let Some(output) = state.outputs.first() {
                         let current_mode = output.current_mode().unwrap();
                         let current_w = current_mode.size.w;
@@ -606,10 +642,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     let mut different_gpu = false;
 
                     if state.video_encoder.is_some() {
-                        let dri_node = std::env::var("DRINODE").unwrap_or_default();
                         let encode_node_idx = settings.vaapi_render_node_index;
-                        if !dri_node.is_empty() && encode_node_idx >= 0 {
-                            if !dri_node.contains(&format!("renderD{}", 128 + encode_node_idx)) {
+                        if !state.render_node_path.is_empty() && encode_node_idx >= 0 {
+                            if !state.render_node_path.contains(&format!("renderD{}", 128 + encode_node_idx)) {
                                 different_gpu = true;
                             }
                         }
@@ -1012,10 +1047,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
 
                 let mut different_gpu = false;
                 if state.video_encoder.is_some() {
-                    let dri_node = std::env::var("DRINODE").unwrap_or_default();
                     let encode_node_idx = state.settings.vaapi_render_node_index;
-                    if !dri_node.is_empty() && encode_node_idx >= 0 {
-                        if !dri_node.contains(&format!("renderD{}", 128 + encode_node_idx)) {
+                    if !state.render_node_path.is_empty() && encode_node_idx >= 0 {
+                        if !state.render_node_path.contains(&format!("renderD{}", 128 + encode_node_idx)) {
                             different_gpu = true;
                         }
                     }

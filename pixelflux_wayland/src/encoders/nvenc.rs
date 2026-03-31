@@ -79,6 +79,7 @@ struct CudaFunctions {
     _lib: Library,
     cuInit: unsafe extern "C" fn(flags: u32) -> CUresult,
     cuDeviceGet: unsafe extern "C" fn(device: *mut CUdevice, ordinal: i32) -> CUresult,
+    cuDeviceGetByPCIBusId: unsafe extern "C" fn(dev: *mut CUdevice, pciBusId: *const c_char) -> CUresult,
     cuCtxCreate_v2: unsafe extern "C" fn(
         pctx: *mut CUcontext,
         flags: u32,
@@ -314,6 +315,7 @@ impl NvencEncoder {
             Ok(CudaFunctions {
                 cuInit: load!(lib, b"cuInit\0"),
                 cuDeviceGet: load!(lib, b"cuDeviceGet\0"),
+                cuDeviceGetByPCIBusId: load!(lib, b"cuDeviceGetByPCIBusId\0"),
                 cuCtxCreate_v2: load!(lib, b"cuCtxCreate_v2\0"),
                 cuCtxPushCurrent_v2: load!(lib, b"cuCtxPushCurrent_v2\0"),
                 cuCtxPopCurrent_v2: load!(lib, b"cuCtxPopCurrent_v2\0"),
@@ -387,6 +389,19 @@ impl NvencEncoder {
         }
     }
 
+    /// @brief Retrieves the physical PCI Bus ID for a given DRM render node index.
+    fn get_pci_bus_id(render_index: i32) -> Option<String> {
+        let path = format!("/sys/class/drm/renderD{}/device", 128 + render_index);
+        if let Ok(target) = std::fs::read_link(&path) {
+            if let Some(name) = target.file_name() {
+                if let Some(name_str) = name.to_str() {
+                    return Some(name_str.to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// @brief Initializes the NVENC encoder, CUDA context, and primary resources.
     /// @input settings: Capture settings (resolution, FPS, QP).
     /// @input egl_display: The EGL display handle for interop.
@@ -413,7 +428,22 @@ impl NvencEncoder {
             Self::probe_devices(&cuda);
 
             let mut cu_device: CUdevice = 0;
-            (cuda.cuDeviceGet)(&mut cu_device, 0);
+            let mut device_found = false;
+
+            if let Some(pci_bus_id) = Self::get_pci_bus_id(settings.vaapi_render_node_index) {
+                let c_pci_bus_id = CString::new(pci_bus_id.clone()).unwrap();
+                if (cuda.cuDeviceGetByPCIBusId)(&mut cu_device, c_pci_bus_id.as_ptr()) == CUresult::CUDA_SUCCESS {
+                    println!("[NVENC] Bound to CUDA device via PCI Bus ID: {}", pci_bus_id);
+                    device_found = true;
+                }
+            }
+
+            if !device_found {
+                let res = (cuda.cuDeviceGet)(&mut cu_device, 0);
+                if res != CUresult::CUDA_SUCCESS {
+                    return Err("Failed to get default CUDA device".into());
+                }
+            }
 
             let mut cu_context: CUcontext = ptr::null_mut();
             let res = (cuda.cuCtxCreate_v2)(&mut cu_context, 0, cu_device);
