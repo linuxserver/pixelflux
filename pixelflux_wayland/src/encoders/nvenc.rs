@@ -505,11 +505,12 @@ impl NvencEncoder {
                 ..Default::default()
             };
 
-            let get_preset = function_list.nvEncGetEncodePresetConfig.unwrap();
-            get_preset(
+            let get_preset_ex = function_list.nvEncGetEncodePresetConfigEx.unwrap();
+            get_preset_ex(
                 encoder_session,
                 NV_ENC_CODEC_H264_GUID,
-                NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,
+                NV_ENC_PRESET_P3_GUID,
+                NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
                 &mut preset_config,
             );
 
@@ -534,7 +535,8 @@ impl NvencEncoder {
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
                 encodeGUID: NV_ENC_CODEC_H264_GUID,
-                presetGUID: NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,
+                presetGUID: NV_ENC_PRESET_P3_GUID,
+                tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
                 encodeWidth: width,
                 encodeHeight: height,
                 darWidth: width,
