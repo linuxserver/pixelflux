@@ -103,6 +103,37 @@ pub use encoders::nvenc;
 pub use encoders::software::StripeState;
 pub use encoders::vaapi;
 
+fn get_process_rss_bytes() -> usize {
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(rss_pages) = contents.split_whitespace().nth(1) {
+            if let Ok(pages) = rss_pages.parse::<usize>() {
+                return pages * 4096;
+            }
+        }
+    }
+    0
+}
+
+fn get_shm_usage_bytes() -> u64 {
+    let mut total_size = 0;
+    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                total_size += metadata.len();
+            }
+        }
+    }
+    total_size
+}
+
+fn calculate_memory_threshold(width: i32, height: i32) -> usize {
+    let frame_size = (width * height * 4) as usize;
+    let base_app_memory = 300 * 1024 * 1024;
+    let buffer_allowance = frame_size * 20;
+    let min_threshold = 1536 * 1024 * 1024;
+    (base_app_memory + buffer_allowance).max(min_threshold)
+}
+
 use encoders::nvenc::NvencEncoder;
 use encoders::overlay::OverlayState;
 use encoders::software::MAX_STRIPE_CAPACITY;
@@ -948,11 +979,26 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         .expect("Failed to init wayland socket source");
 
     let timer = Timer::immediate();
+    let mut is_memory_throttling = false;
     event_loop
         .handle()
         .insert_source(timer, move |_, _, state| {
             let loop_start_time = Instant::now();
             state.space.refresh();
+
+            let current_rss = get_process_rss_bytes();
+            let shm_usage = get_shm_usage_bytes();
+            let memory_threshold = calculate_memory_threshold(state.settings.width, state.settings.height);
+
+            if current_rss > memory_threshold || shm_usage > (4 * 1024 * 1024 * 1024) {
+                if !is_memory_throttling {
+                    is_memory_throttling = true;
+                }
+            } else if is_memory_throttling {
+                if current_rss < (memory_threshold as f64 * 0.75) as usize && shm_usage < (3 * 1024 * 1024 * 1024) {
+                    is_memory_throttling = false;
+                }
+            }
 
             let now = Instant::now();
             let elapsed = now.duration_since(state.last_log_time).as_secs_f64();
@@ -1017,8 +1063,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         n_stripes = n_stripes.min(state.settings.height as usize).max(1);
                     }
 
-                    println!("Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2}",
-                        state.settings.width, state.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec);
+                    let rss_mb = current_rss / 1024 / 1024;
+                    let shm_mb = shm_usage / 1024 / 1024;
+                    let throttle_warn = if is_memory_throttling { " [THROTTLED]" } else { "" };
+
+                    println!("Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2} Mem: {}MB SHM: {}MB{}",
+                        state.settings.width, state.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec, rss_mb, shm_mb, throttle_warn);
                 }
                 state.encoded_frame_count = 0;
                 state.total_stripes_encoded = 0;
@@ -1189,12 +1239,18 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if needs_readback {
-                                        let read_rect = Rectangle::new((0,0).into(), (width, height).into());
+                                        let read_rect = if is_memory_throttling {
+                                            Rectangle::new((0,0).into(), (1, 1).into())
+                                        } else {
+                                            Rectangle::new((0,0).into(), (width, height).into())
+                                        };
                                         if let Ok(mapping) = renderer.copy_framebuffer(&mut frame, read_rect, Fourcc::Abgr8888) {
                                             if let Ok(data) = renderer.map_texture(&mapping) {
-                                                state.frame_buffer.copy_from_slice(data);
+                                                if !is_memory_throttling {
+                                                    state.frame_buffer.copy_from_slice(data);
+                                                }
 
-                                                if state.video_encoder.is_some() {
+                                                if state.video_encoder.is_some() && !is_memory_throttling {
                                                     let w = width as u32;
                                                     let h = height as u32;
                                                     let src = &state.frame_buffer;
@@ -1388,7 +1444,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         render_success = true;
                                         if let Some(damage) = result.damage { damage_rects = damage.clone(); }
 
-                                        if state.video_encoder.is_some() {
+                                        if state.video_encoder.is_some() && !is_memory_throttling {
                                             let w = width as u32;
                                             let h = height as u32;
                                             let src = &state.frame_buffer;
@@ -1455,7 +1511,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
                     }
 
-                    if let Some(ref mut encoder) = state.video_encoder {
+                    if is_memory_throttling {
+                    } else if let Some(ref mut encoder) = state.video_encoder {
                         let is_dirty = !damage_rects.is_empty();
                         let is_animated = state.overlay_state.is_animated();
 
@@ -1588,7 +1645,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 }
             }
             let work_elapsed = loop_start_time.elapsed();
-            let target_frame_duration = Duration::from_secs_f64(1.0 / state.settings.target_fps);
+            let fps = if is_memory_throttling { 5.0 } else { state.settings.target_fps };
+            let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
             let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };
             TimeoutAction::ToDuration(final_wait)
