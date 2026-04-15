@@ -24,7 +24,7 @@ gbm = "0.14"
 libloading = "0.8"
 libva-sys = "0.1.2"
 xcursor = "0.3.1"
-image = "0.25.9"
+image = "=0.25.9"
 ffmpeg-next = "8.0"
 ffmpeg-sys-next = "8.0"
 
