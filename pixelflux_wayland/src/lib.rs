@@ -48,7 +48,7 @@ use smithay::{
             },
             gles::GlesRenderer,
             pixman::PixmanRenderer,
-            Bind, ExportMem, ImportAll, ImportEgl, ImportMem,
+            Bind, ImportAll, ImportEgl, ImportMem,
         },
     },
     desktop::{space::SpaceRenderElements, Space},
@@ -1239,68 +1239,75 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if needs_readback {
-                                        let read_rect = if is_memory_throttling {
-                                            Rectangle::new((0,0).into(), (1, 1).into())
+                                        let (read_w, read_h) = if is_memory_throttling {
+                                            (1, 1)
                                         } else {
-                                            Rectangle::new((0,0).into(), (width, height).into())
+                                            (width, height)
                                         };
-                                        if let Ok(mapping) = renderer.copy_framebuffer(&mut frame, read_rect, Fourcc::Abgr8888) {
-                                            if let Ok(data) = renderer.map_texture(&mapping) {
-                                                if !is_memory_throttling {
-                                                    state.frame_buffer.copy_from_slice(data);
-                                                }
+                                        
+                                        if !is_memory_throttling {
+                                            let _ = renderer.with_context(|gl| unsafe {
+                                                gl.ReadPixels(
+                                                    0, // x
+                                                    0, // y
+                                                    read_w,
+                                                    read_h,
+                                                    smithay::backend::renderer::gles::ffi::RGBA,
+                                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                                    state.frame_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                                                );
+                                            });
 
-                                                if state.video_encoder.is_some() && !is_memory_throttling {
-                                                    let w = width as u32;
-                                                    let h = height as u32;
-                                                    let src = &state.frame_buffer;
+                                            if state.video_encoder.is_some() {
+                                                let w = width as u32;
+                                                let h = height as u32;
+                                                let src = &state.frame_buffer;
 
-                                                    if state.settings.h264_fullcolor {
-                                                         let y_size = (w * h) as usize;
-                                                         let (y_plane, rest) = state.nv12_buffer.split_at_mut(y_size);
-                                                         let (u_plane, v_plane) = rest.split_at_mut(y_size);
+                                                if state.settings.h264_fullcolor {
+                                                     let y_size = (w * h) as usize;
+                                                     let (y_plane, rest) = state.nv12_buffer.split_at_mut(y_size);
+                                                     let (u_plane, v_plane) = rest.split_at_mut(y_size);
 
-                                                         let mut planar_image = yuv::YuvPlanarImageMut {
-                                                             y_plane: BufferStoreMut::Borrowed(y_plane),
-                                                             y_stride: w,
-                                                             u_plane: BufferStoreMut::Borrowed(u_plane),
-                                                             u_stride: w,
-                                                             v_plane: BufferStoreMut::Borrowed(v_plane),
-                                                             v_stride: w,
-                                                             width: w,
-                                                             height: h,
-                                                         };
+                                                     let mut planar_image = yuv::YuvPlanarImageMut {
+                                                         y_plane: BufferStoreMut::Borrowed(y_plane),
+                                                         y_stride: w,
+                                                         u_plane: BufferStoreMut::Borrowed(u_plane),
+                                                         u_stride: w,
+                                                         v_plane: BufferStoreMut::Borrowed(v_plane),
+                                                         v_stride: w,
+                                                         width: w,
+                                                         height: h,
+                                                     };
 
-                                                         let _ = yuv::rgba_to_yuv444(
-                                                             &mut planar_image,
-                                                             src,
-                                                             w * 4,
-                                                             YuvRange::Full,
-                                                             YuvStandardMatrix::Bt709,
-                                                             YuvConversionMode::Balanced
-                                                         );
-                                                    } else {
-                                                        let y_size = (w * h) as usize;
-                                                        let (y_plane, uv_plane) = state.nv12_buffer.split_at_mut(y_size);
+                                                     let _ = yuv::rgba_to_yuv444(
+                                                         &mut planar_image,
+                                                         src,
+                                                         w * 4,
+                                                         YuvRange::Full,
+                                                         YuvStandardMatrix::Bt709,
+                                                         YuvConversionMode::Balanced
+                                                     );
+                                                } else {
+                                                    let y_size = (w * h) as usize;
+                                                    let (y_plane, uv_plane) = state.nv12_buffer.split_at_mut(y_size);
 
-                                                        let mut planar_image = YuvBiPlanarImageMut {
-                                                            y_plane: BufferStoreMut::Borrowed(y_plane),
-                                                            y_stride: w,
-                                                            uv_plane: BufferStoreMut::Borrowed(uv_plane),
-                                                            uv_stride: w,
-                                                            width: w,
-                                                            height: h,
-                                                        };
+                                                    let mut planar_image = YuvBiPlanarImageMut {
+                                                        y_plane: BufferStoreMut::Borrowed(y_plane),
+                                                        y_stride: w,
+                                                        uv_plane: BufferStoreMut::Borrowed(uv_plane),
+                                                        uv_stride: w,
+                                                        width: w,
+                                                        height: h,
+                                                    };
 
-                                                        let _ = yuv::rgba_to_yuv_nv12(
-                                                            &mut planar_image,
-                                                            src,
-                                                            w * 4,
-                                                            YuvRange::Limited,
-                                                            YuvStandardMatrix::Bt709,
-                                                            YuvConversionMode::Balanced
-                                                        );
-                                                    }
+                                                    let _ = yuv::rgba_to_yuv_nv12(
+                                                        &mut planar_image,
+                                                        src,
+                                                        w * 4,
+                                                        YuvRange::Limited,
+                                                        YuvStandardMatrix::Bt709,
+                                                        YuvConversionMode::Balanced
+                                                    );
                                                 }
                                             }
                                         }
