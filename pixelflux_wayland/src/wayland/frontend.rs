@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Cursor as IoCursor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gbm::{BufferObject, Device as RawGbmDevice};
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -54,6 +54,18 @@ use smithay::wayland::selection::primary_selection::{
     set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
 };
 use smithay::delegate_primary_selection;
+use smithay::wayland::image_copy_capture::{
+    BufferConstraints, CaptureFailureReason, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState,
+    Session, SessionRef,
+};
+use smithay::wayland::image_capture_source::{
+    ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
+    OutputCaptureSourceHandler, OutputCaptureSourceState,
+};
+use smithay::output::WeakOutput;
+use smithay::{
+    delegate_image_capture_source, delegate_image_copy_capture, delegate_output_capture_source,
+};
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
@@ -102,7 +114,7 @@ use smithay::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
         },
-        shm::{with_buffer_contents, ShmHandler, ShmState, BufferAccessError},
+        shm::{with_buffer_contents, with_buffer_contents_mut, ShmHandler, ShmState, BufferAccessError},
         virtual_keyboard::VirtualKeyboardManagerState,
     },
 };
@@ -215,6 +227,11 @@ pub struct AppState {
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
+
+    pub image_capture_source: ImageCaptureSourceState,
+    pub output_capture_source: OutputCaptureSourceState,
+    pub image_copy_capture: ImageCopyCaptureState,
+    pub copy_capture_sessions: Vec<Session>,
 }
 
 impl PointerConstraintsHandler for AppState {
@@ -1336,6 +1353,110 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+impl ImageCaptureSourceHandler for AppState {
+    fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
+}
+
+impl OutputCaptureSourceHandler for AppState {
+    fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.output_capture_source
+    }
+
+    fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
+        source
+            .user_data()
+            .insert_if_missing(|| output.downgrade());
+    }
+}
+
+impl ImageCopyCaptureHandler for AppState {
+    fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.image_copy_capture
+    }
+
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
+        let weak_output = source.user_data().get::<WeakOutput>()?;
+        let output = weak_output.upgrade()?;
+        let mode = output.current_mode()?;
+        Some(BufferConstraints {
+            // Argb8888 matches pixelflux's pixman backbuffer (state.frame_buffer
+            // is allocated as A8R8G8B8 = wl_shm Argb8888 = memory order BGRA on LE).
+            // GLES path readback (Abgr8888) is a follow-up; until then advertising
+            // a single SHM format keeps the negotiation unambiguous.
+            size: smithay::utils::Size::from((mode.size.w, mode.size.h)),
+            shm: vec![smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888],
+            dma: None,
+        })
+    }
+
+    fn new_session(&mut self, session: Session) {
+        let constraints = self.capture_constraints(&session.source());
+        if let Some(c) = constraints {
+            session.update_constraints(c);
+        }
+        self.copy_capture_sessions.push(session);
+    }
+
+    fn frame(&mut self, _session: &SessionRef, frame: Frame) {
+        // SHM-only path (matches our advertised constraints). Pixman backbuffer
+        // is read directly from state.frame_buffer; GLES readback via
+        // copy_framebuffer + map_texture is a follow-up for the GPU code path.
+        let target = frame.buffer();
+
+        let buf_kind = smithay::backend::renderer::buffer_type(&target);
+        if !matches!(buf_kind, Some(smithay::backend::renderer::BufferType::Shm)) {
+            frame.fail(CaptureFailureReason::BufferConstraints);
+            return;
+        }
+
+        let src_w = self.settings.width as i32;
+        let src_h = self.settings.height as i32;
+        let src_stride = src_w * 4;
+        let needed_bytes = (src_stride as usize) * (src_h as usize);
+
+        if self.frame_buffer.len() < needed_bytes {
+            frame.fail(CaptureFailureReason::Unknown);
+            return;
+        }
+
+        let src = self.frame_buffer.as_ptr();
+
+        let copy_result = with_buffer_contents_mut(&target, |dst_ptr, dst_len, spec| {
+            if spec.format != smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888 {
+                return Err(CaptureFailureReason::BufferConstraints);
+            }
+            if spec.width < src_w || spec.height < src_h {
+                return Err(CaptureFailureReason::BufferConstraints);
+            }
+            let dst_stride = spec.stride;
+            if dst_stride < src_stride {
+                return Err(CaptureFailureReason::BufferConstraints);
+            }
+            let needed_dst = (dst_stride as usize) * (src_h as usize);
+            if dst_len < needed_dst {
+                return Err(CaptureFailureReason::BufferConstraints);
+            }
+            unsafe {
+                for y in 0..src_h {
+                    let src_row = src.add((y * src_stride) as usize);
+                    let dst_row = dst_ptr.add((y * dst_stride) as usize);
+                    std::ptr::copy_nonoverlapping(src_row, dst_row, src_stride as usize);
+                }
+            }
+            Ok(())
+        });
+
+        match copy_result {
+            Ok(Ok(())) => {
+                let now = Duration::from_millis(self.clock.now().as_millis() as u64);
+                frame.success(smithay::utils::Transform::Normal, None, now);
+            }
+            Ok(Err(reason)) => frame.fail(reason),
+            Err(_) => frame.fail(CaptureFailureReason::BufferConstraints),
+        }
+    }
+}
+
 // Delegate macros wire up Smithay's internal event dispatching to the AppState struct.
 delegate_compositor!(AppState);
 delegate_shm!(AppState);
@@ -1358,3 +1479,6 @@ delegate_viewporter!(AppState);
 delegate_presentation!(AppState);
 delegate_xdg_activation!(AppState);
 delegate_primary_selection!(AppState);
+delegate_image_copy_capture!(AppState);
+delegate_image_capture_source!(AppState);
+delegate_output_capture_source!(AppState);
