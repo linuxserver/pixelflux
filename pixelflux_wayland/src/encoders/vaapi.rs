@@ -7,6 +7,9 @@ use std::sync::Once;
 use ffmpeg_sys_next as ff;
 use libc::{close, dup};
 
+use std::sync::Arc;
+
+use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
@@ -105,9 +108,11 @@ pub struct VaapiEncoder {
     width: i32,
     height: i32,
     fps: i32,
-    
+
     current_qp: u32,
     qp_hysteresis_counter: u32,
+
+    recording_sink: Option<Arc<RecordingSink>>,
 }
 
 unsafe impl Send for VaapiEncoder {}
@@ -160,7 +165,10 @@ impl VaapiEncoder {
     ///
     /// @input settings: Capture configuration (resolution, FPS, QP, render node).
     /// @return Result containing the new VaapiEncoder instance.
-    pub fn new(settings: &RustCaptureSettings) -> Result<Self, String> {
+    pub fn new(
+        settings: &RustCaptureSettings,
+        recording_sink: Option<Arc<RecordingSink>>,
+    ) -> Result<Self, String> {
         FF_INIT.call_once(|| {});
 
         let width = settings.width;
@@ -387,6 +395,7 @@ impl VaapiEncoder {
                 fps,
                 current_qp: settings.h264_crf as u32,
                 qp_hysteresis_counter: 0,
+                recording_sink,
             })
         }
     }
@@ -481,6 +490,13 @@ impl VaapiEncoder {
 
             let slice = std::slice::from_raw_parts(data, size);
             output.extend_from_slice(slice);
+            // Out-of-band recording tap: VAAPI/FFmpeg emits Annex-B framed
+            // H.264 by default for the H.264 codec, matching what
+            // `ffmpeg -f h264 -i unix://...` reads. Same bytes that go to
+            // the Python callback, minus pixelflux's 8-byte custom header.
+            if let Some(ref sink) = self.recording_sink {
+                sink.write_frame(slice);
+            }
 
             ff::av_packet_unref(self.packet);
         }

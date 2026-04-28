@@ -215,6 +215,7 @@ pub struct AppState {
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
+    pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
 }
 
 impl PointerConstraintsHandler for AppState {

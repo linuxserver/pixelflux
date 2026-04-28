@@ -98,6 +98,7 @@ pub mod encoders {
 }
 
 pub mod wayland;
+pub mod recording_sink;
 
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
@@ -198,6 +199,11 @@ pub struct RustCaptureSettings {
     pub vaapi_render_node_index: i32,
     pub use_cpu: bool,
     pub debug_logging: bool,
+    /// Path to a Unix domain socket pixelflux will bind for an out-of-band
+    /// fanout of the encoded H.264 elementary stream. Empty string disables
+    /// the feature; the `PIXELFLUX_RECORDING_SOCKET` env var is consulted
+    /// as a fallback. See [`crate::recording_sink`] for details.
+    pub recording_socket: String,
 }
 
 impl Default for RustCaptureSettings {
@@ -228,6 +234,7 @@ impl Default for RustCaptureSettings {
             vaapi_render_node_index: -1,
             use_cpu: false,
             debug_logging: false,
+            recording_socket: String::new(),
         }
     }
 }
@@ -496,6 +503,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
         render_node_path,
+        recording_sink: None,
     };
 
     let output = Output::new(
@@ -538,6 +546,28 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 settings.vaapi_render_node_index = idx - 128;
                             }
                         }
+                    }
+
+                    // Bind the optional out-of-band recording sink. With the CPU encoder
+                    // this only produces a muxable H.264 elementary stream when
+                    // `h264_fullframe=true` (single-stripe mode); VAAPI/NVENC always
+                    // produce a single stream and tap cleanly. When the multi-stripe CPU
+                    // path is active, the recording sink is still bound but receives no
+                    // data — log a warning so operators notice the misconfiguration.
+                    state.recording_sink =
+                        crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
+                    if state.recording_sink.is_some()
+                        && settings.use_cpu
+                        && !settings.h264_fullframe
+                    {
+                        eprintln!(
+                            "[recording_sink] WARNING: recording_socket is set but use_cpu=true \
+                             and h264_fullframe=false. The CPU encoder runs in multi-stripe \
+                             mode by default, which produces N independent sub-frame H.264 \
+                             streams that cannot be muxed together. Set h264_fullframe=true \
+                             on the Python CaptureSettings (or upgrade to a GPU encoder) to \
+                             produce a recordable single-stream output."
+                        );
                     }
 
                     if let Some(output) = state.outputs.first() {
@@ -639,7 +669,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 std::ptr::null()
                             };
 
-                            match NvencEncoder::new(&settings, egl_display) {
+                            match NvencEncoder::new(&settings, egl_display, state.recording_sink.clone()) {
                                 Ok(encoder) => {
                                     state.video_encoder = Some(GpuEncoder::Nvenc(encoder));
                                     println!("[Wayland] NVENC Encoder initialized successfully.");
@@ -654,7 +684,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             if settings.h264_fullcolor {
                                 println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
                             } else {
-                                match VaapiEncoder::new(&settings) {
+                                match VaapiEncoder::new(&settings, state.recording_sink.clone()) {
                                     Ok(encoder) => {
                                         state.video_encoder = Some(GpuEncoder::Vaapi(encoder));
                                         println!(
@@ -792,6 +822,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     state.is_capturing = false;
                     state.callback = None;
                     state.video_encoder = None;
+                    // Drop the recording sink: the listener thread observes the shutdown
+                    // flag and exits, the socket file is unlinked, and any connected
+                    // clients see EOF on their next read.
+                    state.recording_sink = None;
                 }
                 CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
                     state.cursor_callback = Some(cb);
@@ -1577,6 +1611,16 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
 
                         if send_frame {
+                            // Periodic IDR injection: pixelflux's baseline
+                            // encoders use keyint=INFINITE for WebRTC latency,
+                            // but mid-stream recording consumers and segment-
+                            // muxing tools need a keyframe every ~2 s.
+                            let force_idr_for_recording = state
+                                .recording_sink
+                                .as_ref()
+                                .map(|s| s.should_force_idr())
+                                .unwrap_or(false);
+                            let force_idr = force_idr || force_idr_for_recording;
                             let result = match encoder {
                                 GpuEncoder::Nvenc(enc) => {
                                     if needs_readback {
@@ -1632,6 +1676,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             &state.settings,
                             state.frame_counter,
                             state.use_gpu,
+                            state.recording_sink.as_ref(),
                         );
 
                         if !encoded_packets.is_empty() {
@@ -1729,6 +1774,11 @@ impl WaylandBackend {
             vaapi_render_node_index: settings.getattr("vaapi_render_node_index")?.extract()?,
             use_cpu: settings.getattr("use_cpu")?.extract()?,
             debug_logging: settings.getattr("debug_logging")?.extract()?,
+            recording_socket: settings
+                .getattr("recording_socket")
+                .ok()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_default(),
         };
 
         self.tx

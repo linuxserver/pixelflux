@@ -1,8 +1,10 @@
+use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
 use std::ffi::CString;
 use std::ptr;
+use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 /// @brief Maximum number of stripes used for CPU encoding.
@@ -132,6 +134,7 @@ impl H264EncoderWrapper {
         force_idr: bool,
         fixed_header: &[u8],
         output_buf: &mut Vec<u8>,
+        recording_sink: Option<&Arc<RecordingSink>>,
     ) -> bool {
         unsafe {
             let mut pic_in: x264_sys::x264_picture_t = std::mem::zeroed();
@@ -190,6 +193,14 @@ impl H264EncoderWrapper {
                 for nal in nal_slice {
                     let payload = std::slice::from_raw_parts(nal.p_payload, nal.i_payload as usize);
                     output_buf.extend_from_slice(payload);
+                    // Out-of-band recording tap: x264 is configured with
+                    // `b_annexb=1` (see Self::new) so each NAL payload begins
+                    // with the standard 00 00 00 01 start code. Concatenated
+                    // NALs form a valid H.264 elementary stream that
+                    // `ffmpeg -f h264 -i unix://...` reads natively.
+                    if let Some(sink) = recording_sink {
+                        sink.write_frame(payload);
+                    }
                 }
                 return true;
             }
@@ -237,6 +248,7 @@ pub fn encode_cpu(
     settings: &RustCaptureSettings,
     frame_counter: u16,
     use_gpu: bool,
+    recording_sink: Option<&Arc<RecordingSink>>,
 ) -> Vec<Vec<u8>> {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -301,6 +313,18 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let target_fps = settings.target_fps;
+
+    // The recording tap only emits a coherent H.264 elementary stream when
+    // exactly one stripe is encoding the whole frame. With N>1 stripes, each
+    // encoder produces an independent sub-frame stream and concatenating them
+    // would yield garbled bytes. We only forward the sink to the inner encoder
+    // when n_processing_stripes==1; multi-stripe configurations silently skip
+    // the tap (the bind warning at StartCapture time tells operators why).
+    let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
+        recording_sink.cloned()
+    } else {
+        None
+    };
 
     stripes
         .par_iter_mut()
@@ -493,6 +517,15 @@ pub fn encode_cpu(
                         fixed_header[4..6].copy_from_slice(&(width_usize as u16).to_be_bytes());
                         fixed_header[6..8].copy_from_slice(&(actual_height as u16).to_be_bytes());
 
+                        // Periodic IDR for the recording sink: pixelflux's
+                        // baseline encoder uses keyint=INFINITE for WebRTC
+                        // latency, but mid-stream consumers and segment-
+                        // muxing recorders need a keyframe every ~2 s.
+                        let force_idr_for_recording = stripe_sink
+                            .as_ref()
+                            .map(|s| s.should_force_idr())
+                            .unwrap_or(false);
+
                         if enc.encode_with_headers(
                             &stripe_state.y_buf,
                             &stripe_state.u_buf,
@@ -501,9 +534,10 @@ pub fn encode_cpu(
                             uv_stride,
                             uv_stride,
                             frame_counter as i64,
-                            force_idr,
+                            force_idr || force_idr_for_recording,
                             &fixed_header,
                             &mut stripe_state.packet_buf,
+                            stripe_sink.as_ref(),
                         ) {
                             Some(stripe_state.packet_buf.clone())
                         } else {
