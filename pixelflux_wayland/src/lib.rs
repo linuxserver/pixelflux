@@ -88,6 +88,8 @@ use smithay::{
     wayland::shell::wlr_layer::WlrLayerShellState,
     wayland::xdg_activation::XdgActivationState,
     wayland::selection::primary_selection::PrimarySelectionState,
+    wayland::image_copy_capture::ImageCopyCaptureState,
+    wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState},
 };
 
 pub mod encoders {
@@ -429,6 +431,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let presentation_state = PresentationState::new::<AppState>(&dh, 1);
     let xdg_activation_state = XdgActivationState::new::<AppState>(&dh);
     let primary_selection_state = PrimarySelectionState::new::<AppState>(&dh);
+    let image_capture_source = ImageCaptureSourceState::new();
+    let output_capture_source = OutputCaptureSourceState::new::<AppState>(&dh);
+    let image_copy_capture = ImageCopyCaptureState::new::<AppState>(&dh);
     let popups = PopupManager::default();
 
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
@@ -496,6 +501,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
         render_node_path,
+        image_capture_source,
+        output_capture_source,
+        image_copy_capture,
+        copy_capture_sessions: Vec::new(),
     };
 
     let output = Output::new(
