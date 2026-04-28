@@ -76,23 +76,12 @@ impl OverlayState {
     /// @brief Loads an image from disk to use as the watermark.
     /// @input path: Filesystem path to the image.
     /// @input output_scale: The current output's fractional scale factor.
-    /// Used as the buffer's logical-to-physical scale so the rendered overlay
-    /// occupies the same physical extent as its source pixel dimensions.
-    /// Without this, on outputs with scale > 1 the buffer is rendered at
-    /// `pixel_size * output_scale` while position math (`frame_w - wm_w`)
-    /// still uses `wm_w` as if it were physical, causing the watermark to
-    /// extend past the right/bottom of the frame for any anchor other than
-    /// TL (where both anchor coords are 0 and the scale is a no-op).
     pub fn load_watermark(&mut self, path: &str, output_scale: f64) {
         if let Ok(img) = image::open(Path::new(path)) {
             let rgba = img.to_rgba8();
             self.wm_width = rgba.width();
             self.wm_height = rgba.height();
             self.wm_loaded = true;
-
-            // Round up so a 1.5 fractional scale doesn't clip off-screen
-            // (it may inset the watermark slightly from the edge instead).
-            // For integer scales (1, 2) this is exact and the math works out.
             let buffer_scale = output_scale.ceil().max(1.0) as i32;
 
             self.render_buffer = Some(MemoryRenderBuffer::from_slice(
