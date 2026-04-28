@@ -75,18 +75,20 @@ impl Default for OverlayState {
 impl OverlayState {
     /// @brief Loads an image from disk to use as the watermark.
     /// @input path: Filesystem path to the image.
-    pub fn load_watermark(&mut self, path: &str) {
+    /// @input output_scale: The current output's fractional scale factor.
+    pub fn load_watermark(&mut self, path: &str, output_scale: f64) {
         if let Ok(img) = image::open(Path::new(path)) {
             let rgba = img.to_rgba8();
             self.wm_width = rgba.width();
             self.wm_height = rgba.height();
             self.wm_loaded = true;
+            let buffer_scale = output_scale.ceil().max(1.0) as i32;
 
             self.render_buffer = Some(MemoryRenderBuffer::from_slice(
                 &rgba.into_vec(),
                 Fourcc::Abgr8888,
                 (self.wm_width as i32, self.wm_height as i32),
-                1,
+                buffer_scale,
                 Transform::Normal,
                 None,
             ));

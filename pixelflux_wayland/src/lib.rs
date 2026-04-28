@@ -775,7 +775,14 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
 
                     println!("{}", log_msg);
 
-                    state.overlay_state.load_watermark(&settings.watermark_path);
+                    let watermark_output_scale = state
+                        .outputs
+                        .first()
+                        .map(|o| o.current_scale().fractional_scale())
+                        .unwrap_or(1.0);
+                    state
+                        .overlay_state
+                        .load_watermark(&settings.watermark_path, watermark_output_scale);
                     state.callback = Some(cb);
                     state.is_capturing = true;
                     state.render_cursor_on_framebuffer = settings.capture_cursor; 
