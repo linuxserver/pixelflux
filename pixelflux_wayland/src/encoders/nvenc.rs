@@ -10,6 +10,7 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
+use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use nvenc_sys::cuda::*;
 use nvenc_sys::*;
@@ -183,6 +184,7 @@ pub struct NvencEncoder {
     egl: Arc<EglFunctions>,
     _nvenc_lib: Arc<NvencLibrary>,
     nvenc_funcs: NV_ENCODE_API_FUNCTION_LIST,
+    recording_sink: Option<Arc<RecordingSink>>,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -409,6 +411,7 @@ impl NvencEncoder {
     pub fn new(
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
+        recording_sink: Option<Arc<RecordingSink>>,
     ) -> Result<Self, String> {
         println!("[NVENC] Initializing...");
 
@@ -531,6 +534,8 @@ impl NvencEncoder {
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag =
                 if is_444 { 1 } else { 0 };
+            config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
+            config.encodeCodecConfig.h264Config.set_outputAUD(1);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
@@ -621,6 +626,7 @@ impl NvencEncoder {
                 egl,
                 _nvenc_lib: nvenc_lib,
                 nvenc_funcs: function_list,
+                recording_sink,
             })
         }
     }
@@ -726,7 +732,11 @@ impl NvencEncoder {
         output.extend_from_slice(&(self.height as u16).to_be_bytes());
 
         if data_size > 0 && !data_ptr.is_null() {
-            output.extend_from_slice(std::slice::from_raw_parts(data_ptr, data_size));
+            let slice = std::slice::from_raw_parts(data_ptr, data_size);
+            output.extend_from_slice(slice);
+            if let Some(ref sink) = self.recording_sink {
+                sink.write_frame(slice);
+            }
         }
 
         (self.nvenc_funcs.nvEncUnlockBitstream.unwrap())(self.encoder_session, output_bitstream);

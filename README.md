@@ -205,6 +205,27 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 
 **Performance Note:** Enabling **watermarking** or utilizing a render node different from the encoding node will force a "Readback" fallback, copying pixels to the CPU and breaking the zero-copy chain. This increases latency and CPU load.
 
+## Recording Sink (Wayland)
+
+The Wayland backend can output the raw H.264 video stream directly to a Unix domain socket for external recording.
+
+*Note: This feature requires full-frame H.264 encoding (CPU, VA-API, or NVENC) and does not work with JPEG or striped H.264 modes.*
+
+```python
+# Enable the unix socket (forces IDR frames every 30 frames and on connect)
+settings.recording_socket = "/tmp/pixelflux_record"
+```
+
+You can then capture the stream using `ffmpeg`:
+
+```bash
+# Raw copy
+ffmpeg -f h264 -i unix:///tmp/pixelflux_record -c:v copy test.h264
+
+# Re-encode for a clean MP4
+ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p test.mp4
+```
+
 ## Features
 
 *   **Hybrid Backend:**
@@ -220,6 +241,7 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 *   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland).
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.
+*   **Recording Sink:** Direct Unix socket output of full-frame H.264 streams for local capture.
 
 ## License
 

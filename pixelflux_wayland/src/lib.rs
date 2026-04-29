@@ -98,6 +98,7 @@ pub mod encoders {
 }
 
 pub mod wayland;
+pub mod recording_sink;
 
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
@@ -198,6 +199,7 @@ pub struct RustCaptureSettings {
     pub vaapi_render_node_index: i32,
     pub use_cpu: bool,
     pub debug_logging: bool,
+    pub recording_socket: String,
 }
 
 impl Default for RustCaptureSettings {
@@ -228,6 +230,7 @@ impl Default for RustCaptureSettings {
             vaapi_render_node_index: -1,
             use_cpu: false,
             debug_logging: false,
+            recording_socket: String::new(),
         }
     }
 }
@@ -496,6 +499,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
         render_node_path,
+        recording_sink: None,
     };
 
     let output = Output::new(
@@ -539,6 +543,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             }
                         }
                     }
+
+                    state.recording_sink =
+                        crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
 
                     if let Some(output) = state.outputs.first() {
                         let current_mode = output.current_mode().unwrap();
@@ -639,7 +646,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 std::ptr::null()
                             };
 
-                            match NvencEncoder::new(&settings, egl_display) {
+                            match NvencEncoder::new(&settings, egl_display, state.recording_sink.clone()) {
                                 Ok(encoder) => {
                                     state.video_encoder = Some(GpuEncoder::Nvenc(encoder));
                                     println!("[Wayland] NVENC Encoder initialized successfully.");
@@ -654,7 +661,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             if settings.h264_fullcolor {
                                 println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
                             } else {
-                                match VaapiEncoder::new(&settings) {
+                                match VaapiEncoder::new(&settings, state.recording_sink.clone()) {
                                     Ok(encoder) => {
                                         state.video_encoder = Some(GpuEncoder::Vaapi(encoder));
                                         println!(
@@ -709,6 +716,23 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
                     } else {
                         n_stripes = n_stripes.min(settings.height as usize).max(1);
+                    }
+
+                    if state.recording_sink.is_some() {
+                        if settings.output_mode == 0 {
+                            eprintln!(
+                                "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
+                                 The recording sink requires a single H.264 stream. Please set output_mode=1 \
+                                 on the Python CaptureSettings to produce a recordable output."
+                            );
+                        } else if state.video_encoder.is_none() && !settings.h264_fullframe {
+                            eprintln!(
+                                "[recording_sink] WARNING: recording_socket is set but the CPU encoder is running in \
+                                 multi-stripe mode. This produces N independent sub-frame H.264 streams that \
+                                 cannot be muxed together. Set h264_fullframe=true on the Python CaptureSettings \
+                                 (or use a working GPU encoder) to produce a recordable single-stream output."
+                            );
+                        }
                     }
 
                     let mut log_msg = format!(
@@ -799,6 +823,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     state.is_capturing = false;
                     state.callback = None;
                     state.video_encoder = None;
+                    state.recording_sink = None;
                 }
                 CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
                     state.cursor_callback = Some(cb);
@@ -1584,6 +1609,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
 
                         if send_frame {
+                            let force_idr_for_recording = state
+                                .recording_sink
+                                .as_ref()
+                                .map(|s| s.should_force_idr())
+                                .unwrap_or(false);
+                            let force_idr = force_idr || force_idr_for_recording;
                             let result = match encoder {
                                 GpuEncoder::Nvenc(enc) => {
                                     if needs_readback {
@@ -1639,6 +1670,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             &state.settings,
                             state.frame_counter,
                             state.use_gpu,
+                            state.recording_sink.as_ref(),
                         );
 
                         if !encoded_packets.is_empty() {
@@ -1736,6 +1768,11 @@ impl WaylandBackend {
             vaapi_render_node_index: settings.getattr("vaapi_render_node_index")?.extract()?,
             use_cpu: settings.getattr("use_cpu")?.extract()?,
             debug_logging: settings.getattr("debug_logging")?.extract()?,
+            recording_socket: settings
+                .getattr("recording_socket")
+                .ok()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_default(),
         };
 
         self.tx

@@ -1,8 +1,10 @@
+use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
 use std::ffi::CString;
 use std::ptr;
+use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 /// @brief Maximum number of stripes used for CPU encoding.
@@ -132,6 +134,7 @@ impl H264EncoderWrapper {
         force_idr: bool,
         fixed_header: &[u8],
         output_buf: &mut Vec<u8>,
+        recording_sink: Option<&Arc<RecordingSink>>,
     ) -> bool {
         unsafe {
             let mut pic_in: x264_sys::x264_picture_t = std::mem::zeroed();
@@ -190,6 +193,9 @@ impl H264EncoderWrapper {
                 for nal in nal_slice {
                     let payload = std::slice::from_raw_parts(nal.p_payload, nal.i_payload as usize);
                     output_buf.extend_from_slice(payload);
+                    if let Some(sink) = recording_sink {
+                        sink.write_frame(payload);
+                    }
                 }
                 return true;
             }
@@ -237,6 +243,7 @@ pub fn encode_cpu(
     settings: &RustCaptureSettings,
     frame_counter: u16,
     use_gpu: bool,
+    recording_sink: Option<&Arc<RecordingSink>>,
 ) -> Vec<Vec<u8>> {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -301,6 +308,11 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let target_fps = settings.target_fps;
+    let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
+        recording_sink.cloned()
+    } else {
+        None
+    };
 
     stripes
         .par_iter_mut()
@@ -493,6 +505,11 @@ pub fn encode_cpu(
                         fixed_header[4..6].copy_from_slice(&(width_usize as u16).to_be_bytes());
                         fixed_header[6..8].copy_from_slice(&(actual_height as u16).to_be_bytes());
 
+                        let force_idr_for_recording = stripe_sink
+                            .as_ref()
+                            .map(|s| s.should_force_idr())
+                            .unwrap_or(false);
+
                         if enc.encode_with_headers(
                             &stripe_state.y_buf,
                             &stripe_state.u_buf,
@@ -501,9 +518,10 @@ pub fn encode_cpu(
                             uv_stride,
                             uv_stride,
                             frame_counter as i64,
-                            force_idr,
+                            force_idr || force_idr_for_recording,
                             &fixed_header,
                             &mut stripe_state.packet_buf,
+                            stripe_sink.as_ref(),
                         ) {
                             Some(stripe_state.packet_buf.clone())
                         } else {
