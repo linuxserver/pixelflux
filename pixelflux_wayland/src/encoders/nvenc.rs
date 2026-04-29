@@ -534,6 +534,8 @@ impl NvencEncoder {
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag =
                 if is_444 { 1 } else { 0 };
+            config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
+            config.encodeCodecConfig.h264Config.set_outputAUD(1);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
@@ -732,11 +734,6 @@ impl NvencEncoder {
         if data_size > 0 && !data_ptr.is_null() {
             let slice = std::slice::from_raw_parts(data_ptr, data_size);
             output.extend_from_slice(slice);
-            // Out-of-band recording tap. NVENC defaults to Annex-B output
-            // for H.264 with the standard preset (no NV_ENC_CONFIG_H264_VUI
-            // override of outputAUD/outputPictureTimingSEI), so the slice is
-            // a valid H.264 elementary stream the way `ffmpeg -f h264 -i
-            // unix://...` expects.
             if let Some(ref sink) = self.recording_sink {
                 sink.write_frame(slice);
             }

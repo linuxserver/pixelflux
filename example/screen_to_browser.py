@@ -96,6 +96,14 @@ base_capture_settings.paint_over_jpeg_quality = 90
 # Options: 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle, 6:Animated
 base_capture_settings.watermark_location_enum = 0
 
+# --- Recording ---
+# When this is set to a valid path (string) will enable a unix socket for recording
+# i.e. '/tmp/test' can be recorded with "ffmpeg -f h264 -i unix:///tmp/test -c:v copy test.h264"
+# For a clean recording the stream might need a re-encode i.e.:
+# "ffmpeg -f h264 -framerate 60 -i unix:///tmp/test -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p test.mp4"
+# This option enables IDR frames every 30 frames and on socket connection
+base_capture_settings.recording_socket = None
+
 # ==============================================================================
 # --- Multi-Client State Management ---
 # ==============================================================================

@@ -199,10 +199,6 @@ pub struct RustCaptureSettings {
     pub vaapi_render_node_index: i32,
     pub use_cpu: bool,
     pub debug_logging: bool,
-    /// Path to a Unix domain socket pixelflux will bind for an out-of-band
-    /// fanout of the encoded H.264 elementary stream. Empty string disables
-    /// the feature; the `PIXELFLUX_RECORDING_SOCKET` env var is consulted
-    /// as a fallback. See [`crate::recording_sink`] for details.
     pub recording_socket: String,
 }
 
@@ -548,27 +544,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
                     }
 
-                    // Bind the optional out-of-band recording sink. With the CPU encoder
-                    // this only produces a muxable H.264 elementary stream when
-                    // `h264_fullframe=true` (single-stripe mode); VAAPI/NVENC always
-                    // produce a single stream and tap cleanly. When the multi-stripe CPU
-                    // path is active, the recording sink is still bound but receives no
-                    // data — log a warning so operators notice the misconfiguration.
                     state.recording_sink =
                         crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
-                    if state.recording_sink.is_some()
-                        && settings.use_cpu
-                        && !settings.h264_fullframe
-                    {
-                        eprintln!(
-                            "[recording_sink] WARNING: recording_socket is set but use_cpu=true \
-                             and h264_fullframe=false. The CPU encoder runs in multi-stripe \
-                             mode by default, which produces N independent sub-frame H.264 \
-                             streams that cannot be muxed together. Set h264_fullframe=true \
-                             on the Python CaptureSettings (or upgrade to a GPU encoder) to \
-                             produce a recordable single-stream output."
-                        );
-                    }
 
                     if let Some(output) = state.outputs.first() {
                         let current_mode = output.current_mode().unwrap();
@@ -741,6 +718,23 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         n_stripes = n_stripes.min(settings.height as usize).max(1);
                     }
 
+                    if state.recording_sink.is_some() {
+                        if settings.output_mode == 0 {
+                            eprintln!(
+                                "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
+                                 The recording sink requires a single H.264 stream. Please set output_mode=1 \
+                                 on the Python CaptureSettings to produce a recordable output."
+                            );
+                        } else if state.video_encoder.is_none() && !settings.h264_fullframe {
+                            eprintln!(
+                                "[recording_sink] WARNING: recording_socket is set but the CPU encoder is running in \
+                                 multi-stripe mode. This produces N independent sub-frame H.264 streams that \
+                                 cannot be muxed together. Set h264_fullframe=true on the Python CaptureSettings \
+                                 (or use a working GPU encoder) to produce a recordable single-stream output."
+                            );
+                        }
+                    }
+
                     let mut log_msg = format!(
                         "Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
                         settings.width, settings.height, settings.target_fps, n_stripes
@@ -822,9 +816,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     state.is_capturing = false;
                     state.callback = None;
                     state.video_encoder = None;
-                    // Drop the recording sink: the listener thread observes the shutdown
-                    // flag and exits, the socket file is unlinked, and any connected
-                    // clients see EOF on their next read.
                     state.recording_sink = None;
                 }
                 CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
@@ -1611,10 +1602,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
 
                         if send_frame {
-                            // Periodic IDR injection: pixelflux's baseline
-                            // encoders use keyint=INFINITE for WebRTC latency,
-                            // but mid-stream recording consumers and segment-
-                            // muxing tools need a keyframe every ~2 s.
                             let force_idr_for_recording = state
                                 .recording_sink
                                 .as_ref()

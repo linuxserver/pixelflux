@@ -193,11 +193,6 @@ impl H264EncoderWrapper {
                 for nal in nal_slice {
                     let payload = std::slice::from_raw_parts(nal.p_payload, nal.i_payload as usize);
                     output_buf.extend_from_slice(payload);
-                    // Out-of-band recording tap: x264 is configured with
-                    // `b_annexb=1` (see Self::new) so each NAL payload begins
-                    // with the standard 00 00 00 01 start code. Concatenated
-                    // NALs form a valid H.264 elementary stream that
-                    // `ffmpeg -f h264 -i unix://...` reads natively.
                     if let Some(sink) = recording_sink {
                         sink.write_frame(payload);
                     }
@@ -313,13 +308,6 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let target_fps = settings.target_fps;
-
-    // The recording tap only emits a coherent H.264 elementary stream when
-    // exactly one stripe is encoding the whole frame. With N>1 stripes, each
-    // encoder produces an independent sub-frame stream and concatenating them
-    // would yield garbled bytes. We only forward the sink to the inner encoder
-    // when n_processing_stripes==1; multi-stripe configurations silently skip
-    // the tap (the bind warning at StartCapture time tells operators why).
     let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
         recording_sink.cloned()
     } else {
@@ -517,10 +505,6 @@ pub fn encode_cpu(
                         fixed_header[4..6].copy_from_slice(&(width_usize as u16).to_be_bytes());
                         fixed_header[6..8].copy_from_slice(&(actual_height as u16).to_be_bytes());
 
-                        // Periodic IDR for the recording sink: pixelflux's
-                        // baseline encoder uses keyint=INFINITE for WebRTC
-                        // latency, but mid-stream consumers and segment-
-                        // muxing recorders need a keyframe every ~2 s.
                         let force_idr_for_recording = stripe_sink
                             .as_ref()
                             .map(|s| s.should_force_idr())

@@ -164,6 +164,7 @@ impl VaapiEncoder {
     /// frame contexts, and configures the FFmpeg filter graph for color conversion.
     ///
     /// @input settings: Capture configuration (resolution, FPS, QP, render node).
+    /// @input recording_sink: Optional Unix socket sink for encoded output.
     /// @return Result containing the new VaapiEncoder instance.
     pub fn new(
         settings: &RustCaptureSettings,
@@ -490,10 +491,6 @@ impl VaapiEncoder {
 
             let slice = std::slice::from_raw_parts(data, size);
             output.extend_from_slice(slice);
-            // Out-of-band recording tap: VAAPI/FFmpeg emits Annex-B framed
-            // H.264 by default for the H.264 codec, matching what
-            // `ffmpeg -f h264 -i unix://...` reads. Same bytes that go to
-            // the Python callback, minus pixelflux's 8-byte custom header.
             if let Some(ref sink) = self.recording_sink {
                 sink.write_frame(slice);
             }
