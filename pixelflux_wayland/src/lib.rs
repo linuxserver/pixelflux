@@ -313,6 +313,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
     let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
     let display: Display<AppState> = Display::new().unwrap();
     let dh: DisplayHandle = display.handle();
+    dh.set_default_max_buffer_size(10 * 1024 * 1024);
 
     let auto_gpu = std::env::var("AUTO_GPU").unwrap_or_default().to_lowercase() == "true";
     let mut dri_node = std::env::var("DRINODE").unwrap_or_default();

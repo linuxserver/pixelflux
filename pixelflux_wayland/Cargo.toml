@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.27.2", features = ["extension-module"] }
-wayland-server = "0.31.10"
+wayland-server = { version = "0.31.10", features = ["libwayland_1_23"] }
 wayland-protocols = { version = "0.31", features = ["server"] }
 crossbeam-channel = "0.5"
 env_logger = "0.10"
