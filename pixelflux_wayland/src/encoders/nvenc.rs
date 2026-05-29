@@ -419,6 +419,13 @@ impl NvencEncoder {
         let cuda = Arc::new(Self::load_cuda()?);
         let nvenc_lib = Arc::new(Self::load_nvenc()?);
 
+        static LEAK_ONCE: std::sync::Once = std::sync::Once::new();
+        LEAK_ONCE.call_once(|| {
+            std::mem::forget(egl.clone());
+            std::mem::forget(cuda.clone());
+            std::mem::forget(nvenc_lib.clone());
+        });
+
         unsafe {
             let res = (cuda.cuInit)(0);
             if res != CUresult::CUDA_SUCCESS {

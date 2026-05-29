@@ -301,6 +301,9 @@ impl VaapiEncoder {
             (*par).time_base = ff::AVRational { num: 1, den: fps };
 
             let ret = ff::av_buffersrc_parameters_set(buffersrc_ctx, par);
+            if !(*par).hw_frames_ctx.is_null() {
+                ff::av_buffer_unref(&mut (*par).hw_frames_ctx);
+            }
             ff::av_free(par as *mut c_void);
             if ret < 0 {
                 return Err(format!(
