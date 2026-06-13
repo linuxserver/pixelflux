@@ -135,5 +135,11 @@ fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
     cursor_file
         .read_to_end(&mut cursor_data)
         .map_err(|e| e.to_string())?;
-    parse_xcursor(&cursor_data).ok_or("Failed to parse".to_string())
+    // Reject empty parses so nearest_images()'s min_by_key().unwrap() can't panic
+    // on a valid-header-but-zero-image cursor file.
+    let imgs = parse_xcursor(&cursor_data).ok_or("Failed to parse".to_string())?;
+    if imgs.is_empty() {
+        return Err("Cursor file has no images".to_string());
+    }
+    Ok(imgs)
 }

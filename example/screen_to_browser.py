@@ -9,14 +9,16 @@ screen capture session. The capture region can be controlled via the URL hash.
 
 # Standard library imports
 import asyncio
+import ctypes
 import os
+import sys
 import mimetypes
 import websockets
 import websockets.asyncio.server as ws_async
 import threading
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
+from pixelflux import CaptureSettings, ScreenCapture, StripeCallback, OwnedFrame
 
 # ==============================================================================
 # --- BASE CONFIGURATION SETTINGS ---
@@ -46,6 +48,13 @@ base_capture_settings.capture_cursor = False
 base_capture_settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
 base_capture_settings.use_cpu = False
+
+# --- Zero-copy deferred free ---
+# On Py 3.12+ pixelflux can hand the buffer's ownership to Python (OwnedFrame), so we
+# send its memoryview with no copy. H.264 only: the JPEG path re-frames with a 2-byte
+# prefix and needs a fresh bytes object. Below 3.12 there's no PEP 688 pin, so we copy.
+DEFERRED_FREE = sys.version_info >= (3, 12) and base_capture_settings.output_mode != 0
+base_capture_settings.deferred_free = DEFERRED_FREE
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
@@ -125,9 +134,14 @@ async def send_stripes_task(websocket, queue):
         # This loop will run until the connection is closed,
         # which will raise a ConnectionClosed exception.
         while True:
-            data_to_send = await queue.get()
-            await websocket.send(data_to_send)
-            queue.task_done()
+            item = await queue.get()
+            try:
+                # item == {'data': <memoryview|bytes>, 'owner': <OwnedFrame|None>}. Keeping
+                # `item` (hence the OwnedFrame) referenced for the whole send keeps the C
+                # buffer alive until the send releases the view, so zero-copy is safe.
+                await websocket.send(item['data'])
+            finally:
+                queue.task_done()
 
     except websockets.exceptions.ConnectionClosed:
         # This is the expected, clean way to exit the loop when a client disconnects.
@@ -177,18 +191,32 @@ async def websocket_handler(websocket):
         # without needing global lookups or user_data.
         def client_specific_callback(result_ptr, user_data_ptr):
             """Callback invoked by pixelflux when a new video stripe is ready."""
-            if result_ptr:
-                result = result_ptr.contents
-                if result.size > 0 and g_loop and not g_loop.is_closed():
-                    raw_data_from_cpp = bytes(result.data[:result.size])
-                    final_payload = raw_data_from_cpp
-                    
-                    if client_settings.output_mode == 0:
-                        final_payload = b"\x03\x00" + raw_data_from_cpp
-                    
-                    asyncio.run_coroutine_threadsafe(
-                        client_queue.put(final_payload), g_loop
-                    )
+            if not result_ptr:
+                return
+            result = result_ptr.contents
+            if not (result.data and result.size > 0 and g_loop and not g_loop.is_closed()):
+                return
+
+            if DEFERRED_FREE:
+                # Zero-copy: take ownership FIRST (before any early-return). The queued
+                # item holds both the memoryview and the owner, so the OwnedFrame outlives
+                # the send and its buffer stays alive until the view is released.
+                owner = OwnedFrame.take(result_ptr)
+                if owner is None:
+                    return
+                item_to_queue = {'data': owner.memoryview(), 'owner': owner}
+            else:
+                # Fallback (Py < 3.12, or JPEG re-framing): copy, since pixelflux frees
+                # the buffer when this callback returns, before the coroutine sends it.
+                raw_data_from_cpp = ctypes.string_at(result.data, result.size)
+                final_payload = raw_data_from_cpp
+                if client_settings.output_mode == 0:
+                    final_payload = b"\x03\x00" + raw_data_from_cpp
+                item_to_queue = {'data': final_payload, 'owner': None}
+
+            asyncio.run_coroutine_threadsafe(
+                client_queue.put(item_to_queue), g_loop
+            )
         
         # Convert the Python closure into a C-compatible function pointer
         c_callback = StripeCallback(client_specific_callback)

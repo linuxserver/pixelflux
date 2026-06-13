@@ -128,11 +128,15 @@ fn get_shm_usage_bytes() -> u64 {
 }
 
 fn calculate_memory_threshold(width: i32, height: i32) -> usize {
-    let frame_size = (width * height * 4) as usize;
-    let base_app_memory = 300 * 1024 * 1024;
-    let buffer_allowance = frame_size * 20;
-    let min_threshold = 1536 * 1024 * 1024;
-    (base_app_memory + buffer_allowance).max(min_threshold)
+    let frame_size = (width.max(0) as usize)
+        .saturating_mul(height.max(0) as usize)
+        .saturating_mul(4);
+    let base_app_memory: usize = 300 * 1024 * 1024;
+    let buffer_allowance = frame_size.saturating_mul(20);
+    let min_threshold: usize = 1536 * 1024 * 1024;
+    base_app_memory
+        .saturating_add(buffer_allowance)
+        .max(min_threshold)
 }
 
 use encoders::nvenc::NvencEncoder;
@@ -240,12 +244,24 @@ pub enum ThreadCommand {
     StopCapture,
     SetCursorCallback(Py<PyAny>),
     KeyboardKey { scancode: u32, state: u32 },
+    // Inject by X11/XKB keysym, resolved to a keycode (+ shift level) against our own
+    // smithay xkb keymap. See the KeyboardKeysym handler.
+    KeyboardKeysym { keysym: u32, state: u32 },
+    // Reply with the smithay keyboard's keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a
+    // consumer (selkies) can build its reverse keysym map from the IDENTICAL keymap.
+    GetXkbKeymap { reply: std::sync::mpsc::Sender<String> },
     PointerMotion { x: f64, y: f64 },
     PointerRelativeMotion { dx: f64, dy: f64 },
     PointerButton { btn: u32, state: u32 },
     PointerAxis { x: f64, y: f64 },
     UpdateCursorConfig { render_on_framebuffer: bool },
+    RequestIdr,
 }
+
+/// X11/XKB keycode = Linux evdev keycode + 8. `inject_key` works in evdev space so the
+/// KeyboardKey handler ADDS this; `inject_keysym` resolves against xkb's already-X11 keycodes
+/// (min..=max) and passes them straight to `KeyboardHandle::input`, so it never adds it.
+const EVDEV_TO_XKB_KEYCODE_OFFSET: u32 = 8;
 
 fn get_gpu_driver(card_index: i32) -> String {
     let path = format!("/sys/class/drm/renderD{}/device/driver", 128 + card_index);
@@ -253,6 +269,91 @@ fn get_gpu_driver(card_index: i32) -> String {
         Ok(link_path) => link_path.to_string_lossy().to_lowercase(),
         Err(_) => String::new(),
     }
+}
+
+/// True when GPU auto-selection is requested, preferring SELKIES_AUTO_GPU and
+/// only consulting AUTO_GPU when SELKIES_AUTO_GPU is unset.
+fn auto_gpu_enabled() -> bool {
+    std::env::var("SELKIES_AUTO_GPU")
+        .or_else(|_| std::env::var("AUTO_GPU"))
+        .unwrap_or_default()
+        .to_lowercase()
+        == "true"
+}
+
+/// Resolve a usable /dev/dri/renderD* node by walking /sys/class/drm cards in
+/// numeric order. This skips cards with no render node (e.g. an IPMI/VGA card0)
+/// and only returns a node that is actually present in this namespace, so it
+/// behaves correctly inside containers where /dev/dri is filtered.
+fn auto_select_render_node() -> Option<String> {
+    // Don't `?`-return if /sys/class/drm is unreadable (e.g. a container that
+    // bind-mounts /dev/dri without /sys): fall through to the /dev/dri scan below.
+    let mut cards: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let num = e.file_name().into_string().ok()?.strip_prefix("card")?.parse::<u32>().ok()?;
+            Some((num, e.path()))
+        })
+        .collect();
+    cards.sort_by_key(|(n, _)| *n);
+    for (_, path) in &cards {
+        if let Ok(drm_entries) = std::fs::read_dir(path.join("device/drm")) {
+            for de in drm_entries.flatten() {
+                let name = de.file_name().into_string().unwrap_or_default();
+                if name.starts_with("renderD") {
+                    let dev = format!("/dev/dri/{}", name);
+                    if std::path::Path::new(&dev).exists() {
+                        return Some(dev);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: lowest render node directly under /dev/dri.
+    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.first().map(|n| format!("/dev/dri/{}", n))
+}
+
+/// Resolve a keysym to an X11 keycode (+ whether Shift is needed) against smithay's own xkb
+/// keymap. Prefers the unshifted level-0 binding, else the shifted level-1 binding. Returns
+/// None if no key in the active layout produces it. Read-only; never panics on the keysym.
+fn resolve_keysym_to_keycode(
+    keymap: &smithay::input::keyboard::xkb::Keymap,
+    layout: smithay::input::keyboard::Layout,
+    target_keysym: u32,
+) -> Option<(u32, bool)> {
+    use smithay::input::keyboard::xkb;
+    let min_kc = keymap.min_keycode().raw();
+    let max_kc = keymap.max_keycode().raw();
+    if min_kc > max_kc {
+        return None;
+    }
+    // First pass: an exact match at the unshifted level (level 0) is always preferred so we don't
+    // synthesize a needless Shift.
+    for raw_kc in min_kc..=max_kc {
+        let kc = xkb::Keycode::new(raw_kc);
+        let syms_0 = keymap.key_get_syms_by_level(kc, layout.0, 0);
+        if syms_0.iter().any(|s| s.raw() == target_keysym) {
+            return Some((raw_kc, false));
+        }
+    }
+    // Second pass: reachable only at the shifted level (level 1) -> needs Shift.
+    for raw_kc in min_kc..=max_kc {
+        let kc = xkb::Keycode::new(raw_kc);
+        let syms_1 = keymap.key_get_syms_by_level(kc, layout.0, 1);
+        if syms_1.iter().any(|s| s.raw() == target_keysym) {
+            return Some((raw_kc, true));
+        }
+    }
+    None
 }
 
 /// @brief The main execution loop of the Wayland backend.
@@ -282,52 +383,38 @@ fn get_gpu_driver(card_index: i32) -> String {
 ///      "Zero-Copy" path (sharing DMABUFs directly with hardware encoders) vs the "Readback"
 ///      path (copying pixels for CPU-based processing/encoding).
 ///    - **Transmission**: Sends the encoded video packets back to the Python layer via callback.
-fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>) {
-    let mut width: i32 = 1024;
-    let mut height: i32 = 768;
-
-    if let Ok(res_str) = std::env::var("MAX_RES") {
-        let parts: Vec<&str> = res_str.split('x').collect();
-        if parts.len() == 2 {
-            if let (Ok(w), Ok(h)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
-                width = w;
-                height = h;
-                println!("[Wayland] Resolution set via MAX_RES: {}x{}", width, height);
-            }
-        }
-    }
-    if let Ok(w_str) = std::env::var("SELKIES_MANUAL_WIDTH") {
-        if let Ok(w) = w_str.parse::<i32>() {
-            width = w;
-            println!("[Wayland] Width override via SELKIES_MANUAL_WIDTH: {}", width);
-        }
-    }
-
-    if let Ok(h_str) = std::env::var("SELKIES_MANUAL_HEIGHT") {
-        if let Ok(h) = h_str.parse::<i32>() {
-            height = h;
-            println!("[Wayland] Height override via SELKIES_MANUAL_HEIGHT: {}", height);
-        }
-    }
+fn run_wayland_thread(
+    command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
+    initial_width: i32,
+    initial_height: i32,
+    explicit_dri_node: String,
+) {
+    // Initial framebuffer size comes from selkies (the server owns resolution policy
+    // and forwards it via the WaylandBackend constructor); first StartCapture resizes.
+    let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
+    let height: i32 = if initial_height > 0 { initial_height } else { 768 };
 
     let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
     let display: Display<AppState> = Display::new().unwrap();
     let dh: DisplayHandle = display.handle();
     dh.set_default_max_buffer_size(10 * 1024 * 1024);
 
-    let auto_gpu = std::env::var("AUTO_GPU").unwrap_or_default().to_lowercase() == "true";
-    let mut dri_node = std::env::var("DRINODE").unwrap_or_default();
-
-    if auto_gpu {
-        if let Ok(entries) = std::fs::read_dir("/dev/dri") {
-            let mut nodes: Vec<String> = entries.flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("renderD"))
-                .collect();
-            nodes.sort();
-            if let Some(node) = nodes.first() {
-                dri_node = format!("/dev/dri/{}", node);
-                println!("[Wayland] AUTO_GPU enabled. Selected: {}", dri_node);
+    // Explicit node from selkies (via the constructor); fall back to AUTO_GPU
+    // hardware detection (which the device library owns) when none was given.
+    let mut dri_node = explicit_dri_node;
+    if dri_node.is_empty() && auto_gpu_enabled() {
+        if let Some(node) = auto_select_render_node() {
+            dri_node = node;
+            println!("[Wayland] AUTO_GPU enabled. Selected: {}", dri_node);
+        }
+    }
+    // With no explicit node and AUTO_GPU off, honor an operator-set DRINODE before
+    // falling back to the software renderer.
+    if dri_node.is_empty() && !auto_gpu_enabled() {
+        if let Ok(node) = std::env::var("DRINODE") {
+            if !node.is_empty() {
+                dri_node = node;
+                println!("[Wayland] Using DRINODE from environment: {}", dri_node);
             }
         }
     }
@@ -490,6 +577,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         start_time: Instant::now(),
         clock: Clock::new(),
         frame_counter: 0,
+        pending_force_idr: false,
+        synthetic_shift_keysyms: std::collections::HashSet::new(),
         use_gpu,
         video_encoder: None,
         vaapi_state: StripeState::default(),
@@ -536,13 +625,19 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         .insert_source(command_rx, move |event, _, state| {
             match event {
                 CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
-                    let auto_gpu = std::env::var("AUTO_GPU").unwrap_or_default().to_lowercase() == "true";
+                    let auto_gpu = auto_gpu_enabled();
                     if auto_gpu {
                         if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
                             if let Ok(idx) = idx_str.parse::<i32>() {
                                 settings.vaapi_render_node_index = idx - 128;
                             }
                         }
+                    }
+
+                    // H.264 4:2:0 needs even dimensions.
+                    if settings.output_mode == 1 {
+                        settings.width &= !1;
+                        settings.height &= !1;
                     }
 
                     state.recording_sink =
@@ -583,11 +678,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
 
                             let pixel_count = (settings.width * settings.height) as usize;
                             state.frame_buffer = vec![0u8; pixel_count * 4];
-                            if settings.h264_fullcolor {
-                                state.nv12_buffer = vec![0u8; pixel_count * 3];
-                            } else {
-                                state.nv12_buffer = vec![0u8; pixel_count * 3 / 2];
-                            }
 
                             if state.use_gpu {
                                 if let Some(gbm) = state.gbm_device.as_mut() {
@@ -604,6 +694,18 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                     state.offscreen_buffer = Some((bo, dmabuf));
                                 }
                             }
+                        }
+
+                        // Size depends on fullcolor too, so (re)size unconditionally,
+                        // not only on a resolution change.
+                        let nv12_pixel_count = (settings.width * settings.height) as usize;
+                        let nv12_needed = if settings.h264_fullcolor {
+                            nv12_pixel_count * 3
+                        } else {
+                            nv12_pixel_count * 3 / 2
+                        };
+                        if state.nv12_buffer.len() != nv12_needed {
+                            state.nv12_buffer = vec![0u8; nv12_needed];
                         }
 
                         for window in state.space.elements() {
@@ -816,6 +918,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     state.total_stripes_encoded = 0;
                     state.last_log_time = Instant::now();
                     state.frame_counter = 0;
+                    state.pending_force_idr = false;
                     state.stripes.clear();
                     state.vaapi_state = StripeState::default();
                 }
@@ -834,10 +937,100 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     let serial = next_serial();
                     let time = wayland_time();
                     if let Some(keyboard) = state.seat.get_keyboard() {
-                        keyboard.input(state, Keycode::new(scancode), key_state, serial, time, |_, _, _| {
+                        // scancode is an evdev keycode; xkb/smithay want X11 keycodes (see
+                        // EVDEV_TO_XKB_KEYCODE_OFFSET).
+                        keyboard.input(state, Keycode::new(scancode.saturating_add(EVDEV_TO_XKB_KEYCODE_OFFSET)), key_state, serial, time, |_, _, _| {
                             FilterResult::<()>::Forward
                         });
                     }
+                }
+                CalloopEvent::Msg(ThreadCommand::KeyboardKeysym { keysym, state: key_state_val }) => {
+                    // Inject by keysym against our own live xkb keymap: resolve to an X11 keycode
+                    // (+ Shift), then inject, synthesizing a Shift press/release for shifted keysyms.
+                    let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
+                    if let Some(keyboard) = state.seat.get_keyboard() {
+                        // Phase 1: resolve against the keymap (read-only) -> (target keycode, needs
+                        // Shift, Shift_L keycode). No `.unwrap()` on attacker-supplied data.
+                        let resolved: Option<(u32, bool, u32)> =
+                            keyboard.with_xkb_state(state, |context| {
+                                let xkb_guard = match context.xkb().lock() {
+                                    Ok(g) => g,
+                                    Err(_) => return None,
+                                };
+                                let layout = xkb_guard.active_layout();
+                                // SAFETY: the &Keymap borrow stays within this guard's scope and is
+                                // only read; we never store it past the lock.
+                                let keymap = unsafe { xkb_guard.keymap() };
+                                let target = resolve_keysym_to_keycode(keymap, layout, keysym);
+                                let (kc, needs_shift) = target?;
+                                // Resolve Shift_L (0xFFE1) only if we actually need it; fall back to
+                                // the conventional X11 keycode 50 (evdev KEY_LEFTSHIFT 42 + 8).
+                                let shift_kc = if needs_shift {
+                                    resolve_keysym_to_keycode(keymap, layout, 0xFFE1)
+                                        .map(|(kc, _)| kc)
+                                        .unwrap_or(42 + EVDEV_TO_XKB_KEYCODE_OFFSET)
+                                } else {
+                                    0
+                                };
+                                Some((kc, needs_shift, shift_kc))
+                            });
+
+                        // Phase 2: inject (with_xkb_state has returned, so re-borrowing `state` mut
+                        // is fine). Keycodes are already X11-space, passed straight to smithay.
+                        if let Some((kc, needs_shift, shift_kc)) = resolved {
+                            let inject = |state: &mut AppState, x11_kc: u32, ks: KeyState| {
+                                let serial = next_serial();
+                                let time = wayland_time();
+                                keyboard.input(state, Keycode::new(x11_kc), ks, serial, time, |_, _, _| {
+                                    FilterResult::<()>::Forward
+                                });
+                            };
+
+                            match key_state {
+                                KeyState::Pressed => {
+                                    if needs_shift {
+                                        inject(state, shift_kc, KeyState::Pressed);
+                                        state.synthetic_shift_keysyms.insert(keysym);
+                                    }
+                                    inject(state, kc, KeyState::Pressed);
+                                }
+                                KeyState::Released => {
+                                    inject(state, kc, KeyState::Released);
+                                    // Release the synthetic Shift only if we pressed it on key-down,
+                                    // regardless of the current required-level (layout could change).
+                                    if state.synthetic_shift_keysyms.remove(&keysym) {
+                                        inject(state, shift_kc, KeyState::Released);
+                                    }
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "[Wayland] inject_keysym: keysym {:#06x} not found in active xkb layout; ignoring",
+                                keysym
+                            );
+                        }
+                    }
+                }
+                CalloopEvent::Msg(ThreadCommand::GetXkbKeymap { reply }) => {
+                    // Hand back our keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can
+                    // build its reverse keysym map from the IDENTICAL keymap.
+                    let mut keymap_str = String::new();
+                    if let Some(keyboard) = state.seat.get_keyboard() {
+                        keymap_str = keyboard.with_xkb_state(state, |context| {
+                            match context.xkb().lock() {
+                                Ok(guard) => {
+                                    // SAFETY: read-only use of the &Keymap within the guard scope.
+                                    let keymap = unsafe { guard.keymap() };
+                                    keymap.get_as_string(
+                                        smithay::input::keyboard::xkb::KEYMAP_FORMAT_TEXT_V1,
+                                    )
+                                }
+                                Err(_) => String::new(),
+                            }
+                        });
+                    }
+                    // Best-effort: the caller may have timed out and dropped the receiver.
+                    let _ = reply.send(keymap_str);
                 }
                 CalloopEvent::Msg(ThreadCommand::PointerMotion { x, y }) => {
                     let serial = next_serial();
@@ -956,7 +1149,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 }
                             }
                         }
-                        pointer.button(state, &ButtonEvent { button: btn, state: button_state, serial, time });
+                        // `btn` is already an evdev BTN_ code by contract (the selkies
+                        // consumer sends e.g. 272=BTN_LEFT/273=BTN_RIGHT/274=BTN_MIDDLE,
+                        // and 0x113=BTN_SIDE/0x114=BTN_EXTRA for back/forward), so pass it
+                        // straight through to smithay's pointer.
+                        let button = btn;
+                        pointer.button(state, &ButtonEvent { button, state: button_state, serial, time });
                         pointer.frame(state);
                     }
                 }
@@ -988,6 +1186,11 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 }
                 CalloopEvent::Msg(ThreadCommand::UpdateCursorConfig { render_on_framebuffer }) => {
                     state.render_cursor_on_framebuffer = render_on_framebuffer;
+                }
+                CalloopEvent::Msg(ThreadCommand::RequestIdr) => {
+                    // On-demand keyframe (client reconnect / decoder reset). Consumed on
+                    // the next captured frame; forces a send + IDR even on a static screen.
+                    state.pending_force_idr = true;
                 }
                 CalloopEvent::Closed => {}
             }
@@ -1048,7 +1251,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         let mut different_gpu = false;
 
                         if state.video_encoder.is_some() {
-                            let dri_node = std::env::var("DRINODE").unwrap_or_default();
+                            // Use the node resolved at startup, not a fresh env read.
+                            let dri_node = state.render_node_path.clone();
                             let encode_node_idx = state.settings.vaapi_render_node_index;
                             if !dri_node.is_empty() && encode_node_idx >= 0 {
                                 if !dri_node.contains(&format!("renderD{}", 128 + encode_node_idx)) {
@@ -1111,6 +1315,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
             if !state.is_capturing {
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
+
+            // READ (don't take) the on-demand IDR request: it's cleared below only where an
+            // encoder actually consumes it, so a request on a skipped frame isn't dropped.
+            let requested_idr = state.pending_force_idr;
 
             state.overlay_state.update_position(
                 state.settings.width,
@@ -1272,12 +1480,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if needs_readback {
-                                        let (read_w, read_h) = if is_memory_throttling {
-                                            (1, 1)
-                                        } else {
-                                            (width, height)
-                                        };
-                                        
+                                        // Throttling skips readback entirely, so this is always full-size.
+                                        let (read_w, read_h) = (width, height);
+
                                         if !is_memory_throttling {
                                             let _ = renderer.with_context(|gl| unsafe {
                                                 gl.ReadPixels(
@@ -1586,21 +1791,40 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             send_frame = true;
                         }
 
-                        if is_dirty || state.encoded_frame_count == 0 {
+                        // Periodic recovery keyframe. The HW encoders use an effectively infinite
+                        // GOP and the Wayland path has no request-IDR channel, so a (re)connecting
+                        // client can only start decoding once an IDR is forced. Keep the author's
+                        // intent of NOT emitting a keyframe every second on a static screen by
+                        // spacing these ~2s apart (vs the pre-commit ~1s), which still bounds
+                        // reconnect-recovery latency instead of leaving it at one IDR per u16 wrap
+                        // (~18 min @ 60fps).
+                        let kf_interval = ((state.settings.target_fps * 2.0).round() as u64).max(1);
+                        let periodic_idr = (state.frame_counter as u64 % kf_interval) == 0;
+                        // A recovery keyframe is due either on real motion, the first frame, the
+                        // periodic cadence, or an on-demand request.
+                        let recovery_idr = state.frame_counter == 0 || periodic_idr || requested_idr;
+                        if is_dirty {
+                            // Real motion: full reset of paint-over bookkeeping (the screen changed).
                             send_frame = true;
-                            
-                            if state.encoded_frame_count == 0 {
-                                force_idr = true;
-                            }
-
+                            force_idr = recovery_idr;
                             st.no_motion_frame_count = 0;
                             st.paint_over_sent = false;
                             st.h264_burst_frames_remaining = 0;
                             target_qp = normal_qp;
+                        } else if recovery_idr {
+                            // Recovery keyframe on a STATIC screen. Do NOT reset no_motion_frame_count
+                            // / paint_over_sent here -- that restarts the paint-over countdown every
+                            // ~2s and can starve it (those reset only on real motion above). Leave an
+                            // in-flight burst untouched; override QP only if none is running.
+                            send_frame = true;
+                            force_idr = true;
+                            if st.h264_burst_frames_remaining <= 0 {
+                                target_qp = normal_qp;
+                            }
                         } else if !send_frame {
                             st.no_motion_frame_count += 1;
 
-                            if use_paint_over && st.no_motion_frame_count >= trigger_frames && !st.paint_over_sent {
+                            if use_paint_over && st.no_motion_frame_count >= trigger_frames && !st.paint_over_sent && paint_qp < normal_qp {
                                 send_frame = true;
                                 st.paint_over_sent = true;
                                 force_idr = true;
@@ -1662,6 +1886,14 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                              damage_rects.push(Rectangle::new((0,0).into(), (width, height).into()));
                         }
 
+                        // Give the software H.264 path the same IDR triggers as the GPU path
+                        // (request_idr + ~2s periodic recovery); without it CPU has no IDR channel.
+                        let kf_interval = ((state.settings.target_fps * 2.0).round() as u64).max(1);
+                        let periodic_idr = (state.frame_counter as u64 % kf_interval) == 0;
+                        // Only meaningful for H.264 (output_mode 1); encode_cpu ignores it for JPEG.
+                        let force_idr_all = state.settings.output_mode == 1
+                            && (state.frame_counter == 0 || periodic_idr || requested_idr);
+
                         let encoded_packets = encoders::software::encode_cpu(
                             &mut state.stripes,
                             &state.frame_buffer,
@@ -1672,6 +1904,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             state.frame_counter,
                             state.use_gpu,
                             state.recording_sink.as_ref(),
+                            force_idr_all,
                         );
 
                         if !encoded_packets.is_empty() {
@@ -1688,11 +1921,17 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             }
                         }
                     }
+                    // Consume the on-demand IDR request only now that an encode pass actually ran;
+                    // if throttling, leave it set for the next frame rather than dropping it.
+                    if !is_memory_throttling {
+                        state.pending_force_idr = false;
+                    }
                     state.frame_counter = state.frame_counter.wrapping_add(1);
                 }
             }
             let work_elapsed = loop_start_time.elapsed();
-            let fps = if is_memory_throttling { 5.0 } else { state.settings.target_fps };
+            // Clamp to a positive, finite fps; Duration::from_secs_f64 panics on inf/negative.
+            let fps = (if is_memory_throttling { 5.0 } else { state.settings.target_fps }).max(1.0);
             let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
             let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };
@@ -1723,10 +1962,10 @@ struct WaylandBackend {
 #[pymethods]
 impl WaylandBackend {
     #[new]
-    fn new() -> Self {
+    fn new(width: i32, height: i32, dri_node: String) -> Self {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
         thread::spawn(move || {
-            run_wayland_thread(rx);
+            run_wayland_thread(rx, width, height, dri_node);
         });
         WaylandBackend { tx }
     }
@@ -1776,6 +2015,22 @@ impl WaylandBackend {
                 .unwrap_or_default(),
         };
 
+        // `omit_stripe_headers` is unsupported here: the Python bridge parses the fixed header at
+        // fixed offsets (JPEG: 4 bytes [frame_id, y_start]; H.264: 10 bytes [0x04, type, frame_id,
+        // y_start, width, height]), so headers are always emitted. Warn rather than silently ignore.
+        if settings
+            .getattr("omit_stripe_headers")
+            .ok()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[Wayland] WARNING: omit_stripe_headers=true is unsupported on the Wayland backend \
+                 and is being ignored; stripe headers are always emitted (the Python bridge parses \
+                 them at fixed offsets)."
+            );
+        }
+
         self.tx
             .send(ThreadCommand::StartCapture(callback, rust_settings))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to send start command: {}", e)))?;
@@ -1801,6 +2056,32 @@ impl WaylandBackend {
             .send(ThreadCommand::KeyboardKey { scancode, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject key: {}", e)))?;
         Ok(())
+    }
+
+    /// Inject a key by X11/XKB keysym (e.g. 0x41 'A', 0xFF0D Return), resolved against our own
+    /// xkb keymap. Prefer over `inject_key` when you have a keysym. A shifted keysym gets a
+    /// synthetic Shift press/release. `state`: 1 = press, 0 = release.
+    fn inject_keysym(&mut self, keysym: u32, state: u32) -> PyResult<()> {
+        self.tx
+            .send(ThreadCommand::KeyboardKeysym { keysym, state })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject keysym: {}", e)))?;
+        Ok(())
+    }
+
+    /// Return the active xkb keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can build
+    /// a reverse keysym->keycode map from the identical keymap. Empty string if it can't be read.
+    fn get_xkb_keymap_string(&self, py: Python<'_>) -> PyResult<String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<String>();
+        self.tx
+            .send(ThreadCommand::GetXkbKeymap { reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request keymap: {}", e)))?;
+        // Release the GIL while waiting (the wayland thread can call back into Python -> deadlock);
+        // move the owned Receiver in (it's Send) and bound the wait so a stall can't hang us.
+        let result = py.detach(move || reply_rx.recv_timeout(Duration::from_secs(2)));
+        match result {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(String::new()),
+        }
     }
 
     fn inject_mouse_move(&mut self, x: f64, y: f64) -> PyResult<()> {
@@ -1835,6 +2116,16 @@ impl WaylandBackend {
         self.tx
             .send(ThreadCommand::UpdateCursorConfig { render_on_framebuffer: enabled })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor config: {}", e)))?;
+        Ok(())
+    }
+
+    /// Forces an IDR/keyframe on the next captured frame so a (re)connecting client
+    /// or a decoder reset can resume immediately instead of waiting for the periodic
+    /// recovery keyframe. No-op cost on the JPEG/software path (keyframes are N/A).
+    fn request_idr_frame(&mut self) -> PyResult<()> {
+        self.tx
+            .send(ThreadCommand::RequestIdr)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request IDR: {}", e)))?;
         Ok(())
     }
 }

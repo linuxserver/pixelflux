@@ -23,6 +23,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::delegate_viewporter;
 use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::input::pointer::PointerHandle;
@@ -197,6 +198,12 @@ pub struct AppState {
     pub clock: Clock<Monotonic>,
 
     pub frame_counter: u16,
+    // Set by ThreadCommand::RequestIdr (client reconnect / decoder reset),
+    // consumed once on the next captured frame to force an immediate keyframe.
+    pub pending_force_idr: bool,
+    // Keysyms for which inject_keysym synthesized a Shift press on key-down, so the
+    // matching key-up can release it (inject_keysym runs once per up/down).
+    pub synthetic_shift_keysyms: std::collections::HashSet<u32>,
     pub use_gpu: bool,
 
     pub video_encoder: Option<GpuEncoder>,
@@ -427,6 +434,8 @@ impl CompositorHandler for AppState {
                 self.pending_windows.push(window);
             } else {
                 self.space.map_element(window.clone(), (0, 0), true);
+                // Refresh the cached bbox before reading geometry() (avoids a redundant configure).
+                window.on_commit();
 
                 if let Some(output) = self.outputs.first() {
                     output.enter(surface);
@@ -527,29 +536,58 @@ impl AppState {
                         let shm_result = with_buffer_contents(&buffer, |ptr, len, spec| {
                             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
                             let mut hasher = DefaultHasher::new();
-                            slice.hash(&mut hasher);
+                            // Hash only the cursor's sub-region (and its geometry/format), not the
+                            // whole pool: multiple sprites can share one pool and differ only by
+                            // `offset`, which would otherwise collide to the same cached PNG.
+                            spec.width.hash(&mut hasher);
+                            spec.height.hash(&mut hasher);
+                            spec.stride.hash(&mut hasher);
+                            spec.offset.hash(&mut hasher);
+                            spec.format.hash(&mut hasher);
+                            let start = (spec.offset.max(0) as usize).min(len);
+                            let span = (spec.stride.max(0) as usize)
+                                .saturating_mul(spec.height.max(0) as usize);
+                            let end = start.saturating_add(span).min(len);
+                            slice[start..end].hash(&mut hasher);
                             let hash = hasher.finish();
-                            (hash, spec.width, spec.height, spec.stride, slice.to_vec())
+                            (hash, spec.width, spec.height, spec.stride, spec.format, spec.offset, slice.to_vec())
                         });
 
                         match shm_result {
-                            Ok((hash, width, height, stride, raw_bytes)) => {
+                            Ok((hash, width, height, stride, format, buf_offset, raw_bytes)) => {
                                 if let Some(cached_png) = self.cursor_cache.get(&hash) {
                                     final_png = cached_png.clone();
                                 } else {
                                     if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
                                         let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
-                                        let stride_usize = stride as usize;
-                                        
+                                        // Clamp client-supplied stride/offset to non-negative and use
+                                        // checked arithmetic: a garbage descriptor must skip pixels, not
+                                        // panic (a negative i32 cast to usize wraps; offset+4 can overflow).
+                                        let stride_usize = stride.max(0) as usize;
+                                        let base_offset = buf_offset.max(0) as usize;
+
                                         for y in 0..(height as u32) {
                                             for x in 0..(width as u32) {
-                                                let offset = (y as usize * stride_usize) + (x as usize * 4);
-                                                if offset + 4 <= raw_bytes.len() {
-                                                    img_buf.put_pixel(x, y, Rgba([
-                                                        raw_bytes[offset + 2], 
-                                                        raw_bytes[offset + 1], 
-                                                        raw_bytes[offset], 
+                                                let offset = (y as usize)
+                                                    .checked_mul(stride_usize)
+                                                    .and_then(|row| base_offset.checked_add(row))
+                                                    .and_then(|o| o.checked_add((x as usize) * 4));
+                                                let offset = match offset {
+                                                    Some(o) => o,
+                                                    None => continue,
+                                                };
+                                                if offset.checked_add(4).map_or(false, |end| end <= raw_bytes.len()) {
+                                                    // Xrgb8888 has no alpha; byte 3 is padding.
+                                                    let alpha = if format == wl_shm::Format::Xrgb8888 {
+                                                        255
+                                                    } else {
                                                         raw_bytes[offset + 3]
+                                                    };
+                                                    img_buf.put_pixel(x, y, Rgba([
+                                                        raw_bytes[offset + 2],
+                                                        raw_bytes[offset + 1],
+                                                        raw_bytes[offset],
+                                                        alpha
                                                     ]));
                                                 }
                                             }
@@ -560,7 +598,10 @@ impl AppState {
                                             self.cursor_cache.insert(hash, bytes.clone());
                                             final_png = bytes;
                                             if self.cursor_cache.len() > 100 {
-                                                self.cursor_cache.clear();
+                                                // Evict an arbitrary entry to bound the cache; content-hash
+                                                // memoization means a re-render simply re-inserts if needed.
+                                                let evict = *self.cursor_cache.keys().next().unwrap();
+                                                self.cursor_cache.remove(&evict);
                                             }
                                         }
                                     }
@@ -627,7 +668,10 @@ impl AppState {
                                                  self.cursor_cache.insert(hash, bytes.clone());
                                                  final_png = bytes;
                                                  if self.cursor_cache.len() > 100 {
-                                                     self.cursor_cache.clear();
+                                                     // Evict an arbitrary entry to bound the cache; content-hash
+                                                     // memoization means a re-render simply re-inserts if needed.
+                                                     let evict = *self.cursor_cache.keys().next().unwrap();
+                                                     self.cursor_cache.remove(&evict);
                                                  }
                                              }
                                          }

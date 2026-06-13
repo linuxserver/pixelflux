@@ -61,13 +61,16 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 install_requires = []
-is_alpine = os.path.exists("/etc/alpine-release")
-if not is_alpine:
-    install_requires.append("nvidia-cuda-nvrtc")
+# The optional CUDA (NVRTC) color-conversion path loads `libnvrtc` at runtime; not auto-installed
+# in install_requires because the correct version depends on the user's NVIDIA driver.
+# `pixelflux[cuda]` opts in: cuda-toolkit's [nvrtc] extra pulls the right nvrtc wheel
+# version-agnostically. Unpinned -> latest (CUDA 13); older drivers must pin (see README).
+extras_require = {"cuda": ["cuda-toolkit[nvrtc]"]}
 
 setup(
     name="pixelflux",
     install_requires=install_requires,
+    extras_require=extras_require,
     version="1.6.4",
     author="Linuxserver.io",
     author_email="pypi@linuxserver.io",

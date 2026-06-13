@@ -91,6 +91,21 @@ To test launching programs into this backend simply add `WAYLAND_DISPLAY=wayland
 WAYLAND_DISPLAY=wayland-1 glmark2-es2-wayland -s 1920x1080
 ```
 
+### Automatic GPU Selection
+
+Set `SELKIES_AUTO_GPU=true` (preferred, or the legacy `AUTO_GPU=true`) to let pixelflux pick a
+render node automatically instead of supplying one. It enumerates `/sys/class/drm`, pairs each
+`cardN` with its `renderD*` node by PCI device, and skips non-GPU cards (IPMI/VGA). Selection is
+**driver-aware**: NVIDIA nodes are routed to NVENC, while Intel (`i915`) and AMD (`amdgpu`) nodes
+take the VA-API path. Both the X11 and Wayland backends honor this.
+
+```bash
+export SELKIES_AUTO_GPU=true
+```
+
+When auto-selection is off and no node is supplied, an operator-set `DRINODE` (e.g.
+`/dev/dri/renderD128`) is honored before falling back to the software renderer.
+
 ### Capture Settings
 
 The `CaptureSettings` class configures both backends.
@@ -126,7 +141,7 @@ settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripe
 settings.h264_crf = 25                            # CRF value (0-51, lower is better quality/higher bitrate)
 settings.h264_paintover_crf = 18                  # CRF for H.264 paintover on static content. Must be lower than h264_crf to activate.
 settings.h264_paintover_burst_frames = 5          # Number of high-quality frames to send in a burst when a paintover is triggered.
-settings.h264_fullcolor = False                   # Use I444 (full color) instead of I420 for software encoding
+settings.h264_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Supported by software encoding and NVENC.
 settings.h264_fullframe = True                    # Encode full frames (required for HW accel) instead of just changed stripes
 settings.h264_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 settings.h264_cbr_mode = False                    # Switches to CBR mode and ignores CRF value. Used in conjunction with h264_bitrate_kbps.
@@ -138,6 +153,17 @@ settings.auto_adjust_screen_capture_size = True   # Allow pixelflux to adjust it
 # >= 0: Enable GPU Encoding on /dev/dri/renderD(128 + index)
 # -1: Disable GPU Encoding (System will try NVENC if available when using the x11 backend, Wayland needs this set to a render node)
 settings.vaapi_render_node_index = -1
+# Explicit render node path (X11). Takes precedence over the positional index above and
+# avoids the index ambiguity. Must be a bytes object, e.g. b"/dev/dri/renderD128".
+settings.vaapi_render_node_path = None
+
+# --- Wire Format / Zero-Copy (X11) ---
+# False (default): prepend the per-stripe header to each packet (the WebSocket path).
+# True: emit the raw encoded payload with no header (for a WebRTC path that frames itself).
+settings.omit_stripe_headers = False
+# Hand the encoded buffer's ownership to Python instead of freeing it in the C callback,
+# enabling the zero-copy OwnedFrame interface (see below). Python 3.12+ only.
+settings.deferred_free = False
 
 # --- Change Detection & Optimization ---
 settings.use_paint_over_quality = True  # Enable paint-over/IDR requests for static regions
@@ -195,6 +221,39 @@ def my_callback(result_ptr, user_data):
     # Send encoded_data to client...
 ```
 
+### Zero-Copy Frames (`OwnedFrame`, X11)
+
+By default the C++ callback frees each encoded buffer as soon as your callback returns, so you
+must copy the data out (e.g. `ctypes.string_at`) before sending it asynchronously. On
+**Python 3.12+** you can avoid that copy: set `deferred_free = True` and take ownership of the
+buffer with `OwnedFrame`. The buffer is then freed exactly once, when the `OwnedFrame` is
+finalized, and its `memoryview()` can be handed straight to an async socket with no copy.
+
+`OwnedFrame` is a [PEP 688](https://peps.python.org/pep-0688/) buffer exporter, so the underlying
+C buffer stays alive until every consumer — including a transport that retained a slice during a
+partial write — has released its view, making the zero-copy hand-off memory-safe.
+
+```python
+from pixelflux import OwnedFrame
+
+settings.deferred_free = True  # Python 3.12+ only
+
+def my_callback(result_ptr, user_data):
+    # Take ownership FIRST, before any step that can fail or early-return.
+    owner = OwnedFrame.take(result_ptr)   # None if there is no data
+    if owner is None:
+        return
+    # Keep `owner` referenced for the whole send; its memoryview is zero-copy. Hand BOTH
+    # the view and the owner to your sender (e.g. an asyncio.Queue) so the OwnedFrame
+    # outlives the send and the buffer is freed only after the view is released.
+    queue.put_nowait({"data": owner.memoryview(), "owner": owner})
+```
+
+On Python < 3.12 there is no buffer-protocol hook, so `memoryview()` does not keep the
+`OwnedFrame` alive; keep it referenced yourself or fall back to a copy. See
+`example/screen_to_browser.py` for a complete queue-based usage that mixes the zero-copy H.264
+path with a copying JPEG path.
+
 ## Zero-Copy Pipeline (Wayland)
 
 The Wayland backend implements a **Zero-Copy** architecture for hardware encoding.
@@ -226,18 +285,70 @@ ffmpeg -f h264 -i unix:///tmp/pixelflux_record -c:v copy test.h264
 ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p test.mp4
 ```
 
+## NVIDIA NVENC (X11)
+
+*   **Multi-GPU containers:** When several GPUs are exposed to a container, NVENC is filtered
+    in-process to the GPU you selected (no separate `LD_PRELOAD` shim is required). Verified on
+    NVIDIA drivers 570–595.
+*   **4:4:4 (High 4:4:4):** Set `h264_fullcolor = True` to encode full-chroma H.264 via NVENC
+    (`h264_fullcolor` codec), in addition to the software path.
+*   **Force a keyframe on demand:** `capture.request_idr_frame()` forces an IDR frame, e.g. when
+    a client reconnects or its decoder is reset. It routes to whichever encoder is active
+    (NVENC, VA-API, or software) and is a no-op while no capture is running.
+
+### Optional CUDA Color Conversion (NVRTC)
+
+NVENC encoding can optionally use a CUDA (NVRTC) kernel for ARGB→NV12 colorspace conversion,
+loading `libnvrtc` at runtime. If `libnvrtc` is **absent or incompatible, pixelflux silently
+falls back to the libyuv CPU conversion** — this is not a failure. Two environment kill-switches
+let you disable the GPU paths explicitly:
+
+```bash
+export PIXELFLUX_NO_CUDA_CONVERT=1     # disable the CUDA conversion kernel (use libyuv CPU path)
+export PIXELFLUX_NVENC_DEVICE_INPUT=0  # disable feeding NVENC a device buffer directly
+```
+
+#### Matching NVRTC to your NVIDIA driver
+
+NVRTC emits PTX which the driver then JIT-compiles. A **newer** NVRTC can emit a PTX ISA version
+the **older** driver cannot JIT, so the installed NVRTC must be **≤ the driver's CUDA version**.
+(The kernel is device-cc-aware and targets as low as Kepler `sm_35`, so it is broadly
+forward-compatible across GPUs; the constraint is purely the PTX ISA version the driver can JIT.)
+Read your driver's CUDA version from `nvidia-smi` (the **"CUDA Version"** field, top-right) and
+pin NVRTC to it.
+
+**Recommended (version-agnostic):** install NVIDIA's `cuda-toolkit` meta-package and let its
+`[nvrtc]` extra pull the correct nvrtc wheel for the version you pin — no need to know the
+per-CUDA package name. These resolve from the public PyPI (no extra index required):
+
+```bash
+pip install "cuda-toolkit[nvrtc]==13.3.*"   # CUDA 13
+pip install "cuda-toolkit[nvrtc]==12.9.*"   # CUDA 12
+pip install "cuda-toolkit[nvrtc]==11.8.*"   # CUDA 11 (Kepler and older / driver <= 470)
+```
+
+`pip install pixelflux[cuda]` does the same (latest/CUDA 13); pin as above for older drivers.
+
+> **Note:** plain `pip install pixelflux` does **not** auto-install NVRTC, because the right
+> version depends on your driver. Use `pixelflux[cuda]` or one of the commands above. If no
+> compatible `libnvrtc` is present, conversion just falls back to the libyuv CPU path with no
+> failure.
+
 ## Features
 
 *   **Hybrid Backend:**
     *   **X11 (C++):** Legacy support using XShm.
     *   **Wayland (Rust):** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
-    *   **Software:** libx264 (H.264) and libjpeg-turbo (JPEG) with multi-threaded striping.
-    *   **Hardware:** NVIDIA NVENC and VA-API (Intel/AMD) with Zero-Copy support.
+    *   **Software:** libx264 (H.264, incl. 4:4:4) and libjpeg-turbo (JPEG) with multi-threaded striping.
+    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, multi-GPU containers, optional CUDA conversion) and VA-API (Intel/AMD) with Zero-Copy support.
+    *   **Driver-aware GPU auto-selection** via `SELKIES_AUTO_GPU`.
+*   **Zero-Copy Frames (X11):** `deferred_free` + `OwnedFrame` hand the encoded buffer to Python with no C→Python copy (Python 3.12+).
 *   **Smart Bandwidth Management:**
     *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
     *   **Paint-Over:** Automatically improves quality for static regions.
     *   **Damage Throttling:** Limits processing during high-motion scenes.
+    *   **On-demand keyframes:** `request_idr_frame()` forces an IDR for reconnecting clients.
 *   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland).
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.

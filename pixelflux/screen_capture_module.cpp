@@ -17,6 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <cstddef>
+#include <cctype>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -47,7 +50,12 @@
 #include <x264.h>
 #include <string>
 #include <cmath>
+#include <cstdarg>
 #include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
 #include "nvEncodeAPI.h"
 #ifndef STB_IMAGE_IMPLEMENTATION_DEFINED
 #include <fcntl.h>
@@ -75,6 +83,11 @@ typedef CUresult (*tcuInit)(unsigned int);
 typedef CUresult (*tcuDeviceGet)(CUdevice*, int);
 typedef CUresult (*tcuCtxCreate)(CUcontext*, unsigned int, CUdevice);
 typedef CUresult (*tcuCtxDestroy)(CUcontext);
+// Push/pop the encoder's CUDA context onto the context-less per-frame encode thread for
+// the device-input NVENC calls (push/pop preferred over SetCurrent: saves/restores state).
+typedef CUresult (*tcuCtxPushCurrent)(CUcontext);
+typedef CUresult (*tcuCtxPopCurrent)(CUcontext*);
+typedef CUresult (*tcuCtxSetCurrent)(CUcontext);
 
 /**
  * @brief Holds function pointers for the CUDA driver API.
@@ -87,10 +100,28 @@ struct CudaFunctions {
   tcuDeviceGet pfn_cuDeviceGet = nullptr;
   tcuCtxCreate pfn_cuCtxCreate = nullptr;
   tcuCtxDestroy pfn_cuCtxDestroy = nullptr;
+  // Optional: may be null on older drivers (callers must null-check); not part of the
+  // LoadCudaApi success gate, so their absence never disables NVENC.
+  tcuCtxPushCurrent pfn_cuCtxPushCurrent = nullptr;
+  tcuCtxPopCurrent pfn_cuCtxPopCurrent = nullptr;
+  tcuCtxSetCurrent pfn_cuCtxSetCurrent = nullptr;
 };
 
 CudaFunctions g_cuda_funcs;
 static void* g_cuda_lib_handle = nullptr;
+// Guards the one-time GOT ioctl interposer install (InstallNvencGpuFilter). libcuda is
+// process-lifetime (never dlclose'd), so the patch never needs re-applying: set once, never reset.
+static std::mutex g_nv_filter_mutex;
+static bool g_nv_filter_installed = false;
+// Issue: include vs omit the per-stripe header, and whether Python defers the free.
+// Both toggles are per-ScreenCaptureModule members (emit_stripe_headers_/
+// deferred_free_) rather than process-global statics, so multiple modules in one
+// process don't clobber each other's wire format / free-ownership. The stripe
+// free-function encoders receive emit_stripe_headers_ as an explicit argument.
+// (emit_header false lets the WebRTC path skip pixelflux's header and its Python
+// [10:] strip; deferred_free true hands buffer ownership to Python -- either way
+// pixelflux's StripeEncodeResult has no data-freeing destructor, so Python always
+// owns the free.)
 
 /**
  * @brief Manages the state of an NVENC H.264 encoder session.
@@ -117,6 +148,14 @@ struct NvencEncoderState {
   int initialized_bitrate_kbps = 0;
   NV_ENC_BUFFER_FORMAT initialized_buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   CUcontext cuda_context = nullptr;
+
+  // Gated device-input (E2): cached registered CUDA device resource + the per-frame
+  // device buffer the conversion site produced. All zero/null when the gate is off.
+  NV_ENC_REGISTERED_PTR registered_resource = nullptr;
+  unsigned long long registered_base = 0;
+  int registered_w = 0, registered_h = 0, registered_pitch = 0;
+  unsigned long long dev_input_base = 0;
+  int dev_input_pitch = 0;
 
   NvencEncoderState() {
     nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
@@ -304,6 +343,9 @@ struct CaptureSettings {
   int h264_bitrate_kbps;
   int h264_vbv_buffer_size_kb;
   bool auto_adjust_screen_capture_size;
+  bool omit_stripe_headers;   // append-only; false(default)=prepend per-stripe header (WS), true=omit (WebRTC)
+  bool deferred_free;         // append-only; true=transfer buffer ownership to Python (zero-copy), false(default)=free here
+  const char* vaapi_render_node_path;  // append-only; explicit /dev/dri/renderD* path (authoritative); null/empty = use index/AUTO_GPU
 
   /**
    * @brief Default constructor for CaptureSettings.
@@ -338,7 +380,10 @@ struct CaptureSettings {
       h264_cbr_mode(false),
       h264_bitrate_kbps(4000),
       h264_vbv_buffer_size_kb(0),
-      auto_adjust_screen_capture_size(false) {}
+      auto_adjust_screen_capture_size(false),
+      omit_stripe_headers(false),
+      deferred_free(false),
+      vaapi_render_node_path(nullptr) {}
 
   /**
    * @brief Parameterized constructor for CaptureSettings.
@@ -408,7 +453,10 @@ struct CaptureSettings {
       h264_cbr_mode(cbr_mode),
       h264_bitrate_kbps(bitrate_kbps),
       h264_vbv_buffer_size_kb(vbv_buffer_size_kb),
-      auto_adjust_screen_capture_size(adjust_size) {}
+      auto_adjust_screen_capture_size(adjust_size),
+      omit_stripe_headers(false),
+      deferred_free(false),
+      vaapi_render_node_path(nullptr) {}
 };
 
 /**
@@ -528,8 +576,23 @@ bool LoadCudaApi() {
 
     g_cuda_funcs.pfn_cuInit = (tcuInit)dlsym(g_cuda_lib_handle, "cuInit");
     g_cuda_funcs.pfn_cuDeviceGet = (tcuDeviceGet)dlsym(g_cuda_lib_handle, "cuDeviceGet");
-    g_cuda_funcs.pfn_cuCtxCreate = (tcuCtxCreate)dlsym(g_cuda_lib_handle, "cuCtxCreate");
-    g_cuda_funcs.pfn_cuCtxDestroy = (tcuCtxDestroy)dlsym(g_cuda_lib_handle, "cuCtxDestroy");
+    // Prefer the v2 ABI of cuCtxCreate/cuCtxDestroy (same signature). A v1 context is NOT
+    // valid for the v2 CUDA mem ops NVENC uses for H.264 4:4:4 (-> INVALID_CONTEXT / encode
+    // error 20); _v2 fixes 4:4:4. Fall back to v1 so older drivers still load.
+    g_cuda_funcs.pfn_cuCtxCreate = (tcuCtxCreate)dlsym(g_cuda_lib_handle, "cuCtxCreate_v2");
+    if (!g_cuda_funcs.pfn_cuCtxCreate)
+        g_cuda_funcs.pfn_cuCtxCreate = (tcuCtxCreate)dlsym(g_cuda_lib_handle, "cuCtxCreate");
+    g_cuda_funcs.pfn_cuCtxDestroy = (tcuCtxDestroy)dlsym(g_cuda_lib_handle, "cuCtxDestroy_v2");
+    if (!g_cuda_funcs.pfn_cuCtxDestroy)
+        g_cuda_funcs.pfn_cuCtxDestroy = (tcuCtxDestroy)dlsym(g_cuda_lib_handle, "cuCtxDestroy");
+    // Optional context push/pop/set for the device-input path; best-effort, NOT in the gate below.
+    g_cuda_funcs.pfn_cuCtxPushCurrent = (tcuCtxPushCurrent)dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
+    if (!g_cuda_funcs.pfn_cuCtxPushCurrent)
+        g_cuda_funcs.pfn_cuCtxPushCurrent = (tcuCtxPushCurrent)dlsym(g_cuda_lib_handle, "cuCtxPushCurrent");
+    g_cuda_funcs.pfn_cuCtxPopCurrent = (tcuCtxPopCurrent)dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
+    if (!g_cuda_funcs.pfn_cuCtxPopCurrent)
+        g_cuda_funcs.pfn_cuCtxPopCurrent = (tcuCtxPopCurrent)dlsym(g_cuda_lib_handle, "cuCtxPopCurrent");
+    g_cuda_funcs.pfn_cuCtxSetCurrent = (tcuCtxSetCurrent)dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
 
     if (!g_cuda_funcs.pfn_cuInit || !g_cuda_funcs.pfn_cuDeviceGet || !g_cuda_funcs.pfn_cuCtxCreate || !g_cuda_funcs.pfn_cuCtxDestroy) {
         std::cerr << "CUDA_API_LOAD: dlsym failed for one or more CUDA functions." << std::endl;
@@ -542,18 +605,15 @@ bool LoadCudaApi() {
 }
 
 /**
- * @brief Unloads the CUDA driver library if it was previously loaded.
+ * @brief No-op: libcuda / g_cuda_funcs are deliberately process-lifetime.
  *
- * This function calls `dlclose` on the CUDA library handle and clears the global
- * function pointer struct to ensure a clean state. It should be called when
- * CUDA functionality is no longer needed.
+ * libcuda and g_cuda_funcs are process-global; with multiple ScreenCapture instances per
+ * process, dlclose'ing/zeroing them from one instance's stop would be a use-after-free while
+ * another is mid-encode. So they are never freed here (mirrors g_nvrtc_handle); per-instance
+ * GPU resources are still released by reset_nvenc_encoder(). Kept callable as an explicit hook.
  */
 void UnloadCudaApi() {
-    if (g_cuda_lib_handle) {
-        dlclose(g_cuda_lib_handle);
-        g_cuda_lib_handle = nullptr;
-        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
-    }
+    // Intentionally a no-op; see above.
 }
 
 /**
@@ -609,6 +669,475 @@ bool LoadNvencApi(NV_ENCODE_API_FUNCTION_LIST& nvenc_funcs) {
   return true;
 }
 
+// --- Multi-GPU NVENC fix (issue 8): GET_ATTACHED_IDS filter ----------------
+// On driver 570-595, libnvidia-encode enumerates every host GPU via the RM
+// GET_ATTACHED_IDS ioctl and peer-inits each; GPUs whose /dev/nvidiaX is absent
+// from the container make nvEncOpenEncodeSessionEx fail with UNSUPPORTED_DEVICE.
+// We GOT-patch ioctl in the NVIDIA libraries (kept inside PixelFlux, no separate
+// LD_PRELOAD object) and drop the unreachable GPUs from the response.
+namespace {
+constexpr unsigned long kNvEscRmControl = 0x2A;   // ioctl NR for NV_ESC_RM_CONTROL
+constexpr uint32_t kGpuGetAttachedIds = 0x0201;   // NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS
+constexpr int kMaxAttachedGpus = 32;
+constexpr uint32_t kInvalidGpuId = 0xFFFFFFFFu;
+
+struct NvRmControlParams {                         // NVOS54_PARAMETERS (32 bytes)
+  uint32_t hClient, hObject, cmd, flags;
+  uint64_t params;
+  uint32_t paramsSize, status;
+};
+
+bool nv_node_present(unsigned minor) {
+  char path[64];
+  snprintf(path, sizeof(path), "/dev/nvidia%u", minor);
+  return access(path, F_OK) == 0;
+}
+
+// Resolve a gpuId to its /dev/nvidia minor via /proc (the PCI bus is encoded in
+// gpuId >> 8). Returns -1 when no match is found.
+int nv_gpuid_to_minor(uint32_t gpu_id) {
+  unsigned want_full = gpu_id >> 8;   // encodes (domain << 8) | bus
+  DIR* dir = opendir("/proc/driver/nvidia/gpus");
+  if (!dir) return -1;
+  int minor = -1;
+  struct dirent* ent;
+  while ((ent = readdir(dir)) != nullptr) {
+    unsigned dom, bus, slot, fn;
+    if (sscanf(ent->d_name, "%x:%x:%x.%x", &dom, &bus, &slot, &fn) != 4) continue;
+    if (((dom << 8) | bus) != want_full) continue;
+    char info[512];
+    snprintf(info, sizeof(info), "/proc/driver/nvidia/gpus/%s/information", ent->d_name);
+    if (FILE* f = fopen(info, "r")) {
+      char line[256];
+      while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "Device Minor: %d", &minor) == 1) break;
+      }
+      fclose(f);
+    }
+    break;
+  }
+  closedir(dir);
+  return minor;
+}
+
+// ioctl wrapper installed into the NVIDIA libraries' GOT. Our own object's GOT
+// is left untouched, so the inner ioctl() call reaches libc normally.
+int nv_filtered_ioctl(int fd, unsigned long req, ...) {
+  va_list ap;
+  va_start(ap, req);
+  void* arg = va_arg(ap, void*);
+  va_end(ap);
+  int rc = ioctl(fd, req, arg);
+  if (rc != 0 || _IOC_NR(req) != kNvEscRmControl || !arg) return rc;
+  NvRmControlParams* ctrl = static_cast<NvRmControlParams*>(arg);
+  if (ctrl->cmd != kGpuGetAttachedIds || ctrl->status != 0 || !ctrl->params) return rc;
+  // Guard the params layout before treating it as the id array: require the EXACT size
+  // (NV0000_CTRL_GPU_GET_ATTACHED_IDS_PARAMS = kMaxAttachedGpus ids) so a lying paramsSize
+  // can't make us rewrite memory under a different layout. A future struct change must update this.
+  if (ctrl->paramsSize != sizeof(uint32_t) * kMaxAttachedGpus) return rc;
+  uint32_t* ids = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctrl->params));
+  uint32_t kept[kMaxAttachedGpus];
+  int total = 0, nkept = 0;
+  for (int i = 0; i < kMaxAttachedGpus && ids[i] != kInvalidGpuId; i++) {
+    total++;
+    int minor = nv_gpuid_to_minor(ids[i]);
+    if (minor >= 0 && nv_node_present(static_cast<unsigned>(minor))) kept[nkept++] = ids[i];
+  }
+  if (nkept > 0 && nkept < total) {
+    for (int i = 0; i < nkept; i++) ids[i] = kept[i];
+    for (int i = nkept; i < kMaxAttachedGpus; i++) ids[i] = kInvalidGpuId;
+  }
+  return rc;
+}
+
+// Current VM protection of the page holding addr, from /proc/self/maps (-1 if
+// unknown). The NVIDIA libs ship partial RELRO + lazy binding, so the PLT GOT
+// stays writable for the linker's lazy resolver; we restore that exact prot
+// after patching. (Forcing it read-only crashed the next lazy resolve.)
+int nv_page_prot(uintptr_t addr) {
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f) return -1;
+  char line[512];
+  int prot = -1;
+  while (fgets(line, sizeof(line), f)) {
+    uintptr_t lo, hi; char perm[5] = {0};
+    if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perm) != 3) continue;
+    if (addr >= lo && addr < hi) {
+      prot = ((perm[0] == 'r') ? PROT_READ : 0) |
+             ((perm[1] == 'w') ? PROT_WRITE : 0) |
+             ((perm[2] == 'x') ? PROT_EXEC : 0);
+      break;
+    }
+  }
+  fclose(f);
+  return prot;
+}
+
+void nv_patch_ioctl_got(uintptr_t base, const ElfW(Dyn)* dyn) {
+  const ElfW(Sym)* symtab = nullptr;
+  const char* strtab = nullptr;
+  ElfW(Rela)* jmprel = nullptr;
+  size_t pltrelsz = 0;
+  for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
+    if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr);
+    else if (d->d_tag == DT_STRTAB) strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
+    else if (d->d_tag == DT_JMPREL) jmprel = reinterpret_cast<ElfW(Rela)*>(d->d_un.d_ptr);
+    else if (d->d_tag == DT_PLTRELSZ) pltrelsz = d->d_un.d_val;
+  }
+  if (!symtab || !strtab || !jmprel || !pltrelsz) return;
+  long page = sysconf(_SC_PAGESIZE);
+  for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); i++) {
+    ElfW(Rela)* r = &jmprel[i];
+    if (strcmp(strtab + symtab[ELF64_R_SYM(r->r_info)].st_name, "ioctl") != 0) continue;
+    void** slot = reinterpret_cast<void**>(base + r->r_offset);
+    void* pg = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(slot) & ~(page - 1));
+    // Restore the slot's original protection (writable under partial RELRO), not a
+    // hardcoded read-only: these libs lazily bind through this page, so leaving it
+    // read-only faults the next resolve. Default to writable if maps is unreadable.
+    int orig = nv_page_prot(reinterpret_cast<uintptr_t>(slot));
+    if (orig < 0) orig = PROT_READ | PROT_WRITE;
+    if (mprotect(pg, page, PROT_READ | PROT_WRITE) == 0) {
+      *slot = reinterpret_cast<void*>(nv_filtered_ioctl);
+      mprotect(pg, page, orig);
+    }
+  }
+}
+
+int nv_patch_phdr_cb(struct dl_phdr_info* info, size_t, void*) {
+  if (!info->dlpi_name || !*info->dlpi_name) return 0;
+  // GET_ATTACHED_IDS is issued by libcuda and libnvcuvid (libnvidia-encode has no
+  // ioctl of its own and calls through libnvcuvid), so all three must be patched.
+  if (!strstr(info->dlpi_name, "libnvidia") && !strstr(info->dlpi_name, "libcuda") &&
+      !strstr(info->dlpi_name, "libnvcuvid")) return 0;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+      nv_patch_ioctl_got(info->dlpi_addr,
+                         reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr));
+    }
+  }
+  return 0;
+}
+
+// True when at least one host GPU is hidden from the container (the only case
+// the peer-init bug can trigger), so the filter is a no-op everywhere else.
+bool nv_has_hidden_gpus() {
+  int host = 0, visible = 0;
+  if (DIR* d = opendir("/proc/driver/nvidia/gpus")) {
+    for (struct dirent* e; (e = readdir(d)) != nullptr; ) {
+      if (e->d_name[0] != '.') host++;
+    }
+    closedir(d);
+  }
+  for (int m = 0; m < kMaxAttachedGpus; m++) {
+    if (nv_node_present(static_cast<unsigned>(m))) visible++;
+  }
+  return host > visible && visible > 0;
+}
+
+void InstallNvencGpuFilter() {
+  std::lock_guard<std::mutex> lock(g_nv_filter_mutex);
+  if (g_nv_filter_installed) return;
+  if (nv_has_hidden_gpus()) dl_iterate_phdr(nv_patch_phdr_cb, nullptr);
+  g_nv_filter_installed = true;
+}
+}  // namespace
+
+// --- Issue 10: optional CUDA (NVRTC) ARGB->NV12 color conversion -----------
+// When libnvrtc is present, offload NVENC-mode color conversion from CPU
+// (libyuv) to the GPU: upload ARGB, run a runtime-compiled BT.601-limited
+// kernel (matching libyuv exactly), download NV12. Returns false on absence or
+// any error so the caller falls back to libyuv -> it can never regress.
+// Verified: kernel NV12 == libyuv (Y exact, UV +/-1) and NVENC-encode->decode
+// PSNR ~55 dB. Disable with env PIXELFLUX_NO_CUDA_CONVERT=1.
+namespace cuda_convert {
+typedef unsigned long long CUdptr;
+typedef struct CUmod_st* CUmod;
+typedef struct CUfunc_st* CUfunc;
+typedef int (*tAlloc)(CUdptr*, size_t);
+typedef int (*tFree)(CUdptr);
+typedef int (*tH2D)(CUdptr, const void*, size_t);
+typedef int (*tD2H)(void*, CUdptr, size_t);
+typedef int (*tLaunch)(CUfunc, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**, void**);
+typedef int (*tModLoad)(CUmod*, const void*, unsigned, int*, void**);
+typedef int (*tModFn)(CUfunc*, CUmod, const char*);
+typedef int (*tSetCtx)(CUcontext);
+typedef int (*tSync)();
+typedef int (*tNvCreate)(void**, const char*, const char*, int, const char**, const char**);
+typedef int (*tNvCompile)(void*, int, const char**);
+typedef int (*tNvPtxSz)(void*, size_t*);
+typedef int (*tNvPtx)(void*, char*);
+typedef int (*tNvDestroy)(void**);
+// Device-compute-capability query so the kernel is compiled for the ACTUAL device's
+// virtual arch (PTX runs only on its own virtual arch and newer -- a fixed compute_52
+// PTX cannot JIT on a Kepler sm_35). Resolved best-effort via dlsym; null -> fallback list.
+typedef int (*tDevAttr)(int*, int, CUdevice);     // cuDeviceGetAttribute
+typedef int (*tCtxGetDev)(CUdevice*);             // cuCtxGetDevice
+// CUdevice attribute ids (stable CUDA-driver enum values).
+static const int CU_DEV_ATTR_CC_MAJOR = 75;       // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+static const int CU_DEV_ATTR_CC_MINOR = 76;       // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+
+static std::mutex g_mutex;
+static bool g_tried = false, g_ready = false;
+static CUcontext g_init_ctx = nullptr;   // context the cache below is bound to
+static CUfunc g_fn = nullptr;
+static CUdptr g_d_argb = 0, g_d_y = 0, g_d_uv = 0;
+static size_t g_cap_argb = 0, g_cap_y = 0, g_cap_uv = 0;
+static CUdptr g_d_nv12 = 0;       // contiguous pitched NV12 for gated device-input NVENC (E2)
+static size_t g_cap_nv12 = 0;
+static tAlloc g_alloc; static tFree g_free; static tH2D g_h2d; static tD2H g_d2h;
+static tLaunch g_launch; static tSetCtx g_setctx; static tSync g_sync;
+// libnvrtc compilation is context-independent, so cache the compiled PTX once for
+// the whole process. Re-initializing against a new context (multi-display NVENC)
+// then only re-runs cuModuleLoadDataEx instead of a full NVRTC compile every frame.
+static void* g_nvrtc_handle = nullptr;    // persistent dlopen handle (never dlclose'd)
+static std::vector<char> g_ptx;           // compiled PTX, reused across contexts
+// Virtual arch the cached g_ptx was compiled for (e.g. "compute_89"). Part of the cache
+// key: a context switch to a device with a different compute capability recompiles instead
+// of JIT-ing wrong-arch PTX. Empty until the first successful compile.
+static std::string g_ptx_arch;
+
+static const char* KERNEL = R"(extern "C" __global__ void argb_to_nv12(
+  const unsigned char* a,int aw,unsigned char* yp,int yw,unsigned char* uv,int uvw,int W,int H){
+  int x=blockIdx.x*blockDim.x+threadIdx.x, y=blockIdx.y*blockDim.y+threadIdx.y; if(x>=W||y>=H)return;
+  const unsigned char* p=a+y*aw+x*4; int B=p[0],G=p[1],R=p[2];
+  yp[y*yw+x]=(unsigned char)((66*R+129*G+25*B+0x1080)>>8);
+  if((x&1)==0&&(y&1)==0){const unsigned char* q=p+aw;
+    #define AV(s,t) (((s)+(t)+1)>>1)
+    int ab=AV(AV(p[0],q[0]),AV(p[4],q[4])),ag=AV(AV(p[1],q[1]),AV(p[5],q[5])),ar=AV(AV(p[2],q[2]),AV(p[6],q[6]));
+    unsigned char* o=uv+(y/2)*uvw+(x/2)*2;
+    o[0]=(unsigned char)((112*ab-74*ag-38*ar+0x8080)>>8);
+    o[1]=(unsigned char)((112*ar-94*ag-18*ab+0x8080)>>8);}})";
+
+// Resolve the active device's compute capability via the CUDA driver API and return its
+// virtual arch string (e.g. Kepler->"compute_35", Maxwell->"compute_52", Ada L40S->
+// "compute_89"). Best-effort: empty string on any failure so the caller uses its fallback
+// list. ctx must be current (init_locked does g_setctx(ctx) before calling). Uses
+// cuCtxGetDevice to get the device of the in-use context, then cuDeviceGetAttribute for the
+// major/minor cc. This is correct across CUDA versions because the NVRTC paired with a given
+// driver always supports that driver's own devices.
+static std::string device_compute_arch() {
+  if (!g_cuda_lib_handle) return std::string();
+  auto getDev = (tCtxGetDev)dlsym(g_cuda_lib_handle, "cuCtxGetDevice");
+  auto devAttr = (tDevAttr)dlsym(g_cuda_lib_handle, "cuDeviceGetAttribute");
+  if (!getDev || !devAttr) return std::string();
+  CUdevice dev = 0;
+  if (getDev(&dev) != 0) {
+    // Fall back to device 0 (the device NVENC's cuCtxCreate used) if no current ctx.
+    if (g_cuda_funcs.pfn_cuDeviceGet && g_cuda_funcs.pfn_cuDeviceGet(&dev, 0) != CUDA_SUCCESS)
+      return std::string();
+  }
+  int major = 0, minor = 0;
+  if (devAttr(&major, CU_DEV_ATTR_CC_MAJOR, dev) != 0) return std::string();
+  if (devAttr(&minor, CU_DEV_ATTR_CC_MINOR, dev) != 0) return std::string();
+  if (major <= 0) return std::string();
+  return "compute_" + std::to_string(major) + std::to_string(minor);
+}
+
+// Compile the kernel to PTX for the given virtual arch (e.g. "compute_35") and cache it in
+// g_ptx, keyed by arch in g_ptx_arch. Reuses the cache when the requested arch is unchanged
+// (PTX is context-independent), but recompiles when a context switch targets a different-cc
+// device so we never JIT wrong-arch PTX. Returns true with g_ptx/g_ptx_arch populated.
+static bool compile_ptx_for_arch(const std::string& arch) {
+  if (!g_ptx.empty() && g_ptx_arch == arch) return true;
+  if (!g_nvrtc_handle) {
+    g_nvrtc_handle=dlopen("libnvrtc.so.12",RTLD_NOW|RTLD_GLOBAL);
+    if(!g_nvrtc_handle) g_nvrtc_handle=dlopen("libnvrtc.so",RTLD_NOW|RTLD_GLOBAL);
+  }
+  void* rt=g_nvrtc_handle;
+  if(!rt) return false;
+  auto nvCreate=(tNvCreate)dlsym(rt,"nvrtcCreateProgram");
+  auto nvCompile=(tNvCompile)dlsym(rt,"nvrtcCompileProgram");
+  auto nvPtxSz=(tNvPtxSz)dlsym(rt,"nvrtcGetPTXSize");
+  auto nvPtx=(tNvPtx)dlsym(rt,"nvrtcGetPTX");
+  auto nvDestroy=(tNvDestroy)dlsym(rt,"nvrtcDestroyProgram");
+  if(!nvCreate||!nvCompile||!nvPtxSz||!nvPtx) return false;
+  void* prog=nullptr; if(nvCreate(&prog,KERNEL,"cc.cu",0,nullptr,nullptr)!=0) return false;
+  // Destroy the NVRTC program on every exit path below, not just success.
+  bool ok=false;
+  std::string opt = "--gpu-architecture=" + arch;
+  const char* opts[]={opt.c_str()};
+  if(nvCompile(prog,1,opts)==0) {
+    size_t psz=0;
+    if(nvPtxSz(prog,&psz)==0 && psz!=0) {
+      std::vector<char> ptx(psz);
+      if(nvPtx(prog,ptx.data())==0) { g_ptx=std::move(ptx); g_ptx_arch=arch; ok=true; }
+    }
+  }
+  if(nvDestroy) nvDestroy(&prog);
+  return ok && !g_ptx.empty();
+}
+
+// Compile the kernel for the device in use, choosing a device-compute-capability-aware
+// virtual arch so the resulting PTX JIT-compiles on THIS exact GPU (Kepler sm_35 cannot run
+// compute_52 PTX). Order: the queried device cc first, then a small descending fallback
+// (compute_89 -> compute_52 -> compute_35) so a missing/rejected arch (e.g. a CUDA 12/13
+// NVRTC rejecting compute_35, or an unusually new device) still finds a usable target.
+// Caller (init_locked) has already made ctx current, so device_compute_arch() sees it.
+static bool compile_ptx_once() {
+  std::vector<std::string> archs;
+  std::string dev_arch = device_compute_arch();
+  if (!dev_arch.empty()) archs.push_back(dev_arch);
+  // Descending fallbacks (skip a duplicate of the queried arch). compute_35 last so a
+  // Kepler target is always attempted; modern archs first so a modern device still gets
+  // an arch NVRTC accepts even if the cc query failed.
+  for (const char* fb : {"compute_89", "compute_52", "compute_35"}) {
+    if (dev_arch != fb) archs.push_back(fb);
+  }
+  for (const std::string& a : archs) {
+    if (compile_ptx_for_arch(a)) return true;
+  }
+  return false;
+}
+
+static bool init_locked(CUcontext ctx) {
+  if (!g_cuda_lib_handle) return false;
+  g_alloc=(tAlloc)dlsym(g_cuda_lib_handle,"cuMemAlloc_v2");
+  g_free=(tFree)dlsym(g_cuda_lib_handle,"cuMemFree_v2");
+  g_h2d=(tH2D)dlsym(g_cuda_lib_handle,"cuMemcpyHtoD_v2");
+  g_d2h=(tD2H)dlsym(g_cuda_lib_handle,"cuMemcpyDtoH_v2");
+  g_launch=(tLaunch)dlsym(g_cuda_lib_handle,"cuLaunchKernel");
+  g_setctx=(tSetCtx)dlsym(g_cuda_lib_handle,"cuCtxSetCurrent");
+  g_sync=(tSync)dlsym(g_cuda_lib_handle,"cuCtxSynchronize");
+  auto modLoad=(tModLoad)dlsym(g_cuda_lib_handle,"cuModuleLoadDataEx");
+  auto modFn=(tModFn)dlsym(g_cuda_lib_handle,"cuModuleGetFunction");
+  if(!g_alloc||!g_free||!g_h2d||!g_d2h||!g_launch||!g_setctx||!g_sync||!modLoad||!modFn) return false;
+  // Make ctx current BEFORE compiling so the device-cc query (cuCtxGetDevice in
+  // compile_ptx_once) targets THIS context's device and picks its exact virtual arch.
+  g_setctx(ctx);
+  if(!compile_ptx_once()) return false;
+  // The CUmod is never cuModuleUnload'd: it is context-scoped and dies with its CUcontext
+  // (teardown invalidates before cuCtxDestroy), so there is no per-module process leak.
+  CUmod mod=nullptr; if(modLoad(&mod,g_ptx.data(),0,nullptr,nullptr)!=0) return false;
+  if(modFn(&g_fn,mod,"argb_to_nv12")!=0||!g_fn) return false;
+  return true;
+}
+
+static bool ensure_buf(CUdptr& d, size_t& cap, size_t need) {
+  if (cap >= need) return true;
+  if (d) { g_free(d); d = 0; cap = 0; }
+  if (g_alloc(&d, need) != 0) { d = 0; return false; }
+  cap = need; return true;
+}
+
+// NV12 -> y/uv on success; false means the caller should use libyuv.
+bool argb_to_nv12(CUcontext ctx, const uint8_t* argb, int argb_stride,
+                  uint8_t* y, int y_stride, uint8_t* uv, int uv_stride, int w, int h) {
+  if (!ctx || w <= 0 || h <= 0 || (w & 1) || (h & 1)) return false;
+  if (y_stride != w || uv_stride != w) return false;   // padded dst -> libyuv
+  static const bool disabled = (std::getenv("PIXELFLUX_NO_CUDA_CONVERT") != nullptr);
+  if (disabled) return false;
+  std::lock_guard<std::mutex> lk(g_mutex);
+  if (g_tried && ctx != g_init_ctx) {
+    // NVENC was re-initialized (resolution/format change, error recovery): the
+    // old context was destroyed along with its module and device buffers, so
+    // drop the stale handles (do NOT free them - cuCtxDestroy already did) and
+    // re-init against the new context.
+    g_tried = false; g_ready = false; g_fn = nullptr;
+    g_d_argb = g_d_y = g_d_uv = 0; g_cap_argb = g_cap_y = g_cap_uv = 0;
+  }
+  if (!g_tried) { g_tried = true; g_init_ctx = ctx; g_ready = init_locked(ctx); }
+  if (!g_ready) return false;
+  if (g_setctx(ctx) != 0) return false;
+  size_t argb_sz = (size_t)argb_stride * h, y_sz = (size_t)w * h, uv_sz = (size_t)w * (h / 2);
+  if (!ensure_buf(g_d_argb, g_cap_argb, argb_sz) || !ensure_buf(g_d_y, g_cap_y, y_sz) || !ensure_buf(g_d_uv, g_cap_uv, uv_sz)) return false;
+  if (g_h2d(g_d_argb, argb, argb_sz) != 0) return false;
+  int aw = argb_stride, yw = w, uvw = w, ww = w, hh = h;
+  void* args[] = {&g_d_argb, &aw, &g_d_y, &yw, &g_d_uv, &uvw, &ww, &hh};
+  if (g_launch(g_fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
+  if (g_sync() != 0) return false;
+  if (g_d2h(y, g_d_y, y_sz) != 0) return false;
+  if (g_d2h(uv, g_d_uv, uv_sz) != 0) return false;
+  return true;
+}
+
+// Gated (PIXELFLUX_NVENC_DEVICE_INPUT) device-input variant. Same conversion, but writes
+// a CONTIGUOUS 256-pitch NV12 into g_d_nv12 (Y at base, UV at base+pitch*h) so NVENC can
+// register it directly (nvEncRegisterResource), avoiding the host re-upload. The host
+// y/uv planes are still filled (per-row, since the device buffer is pitched) because the
+// change-detection hash reads them. Returns the device base + pitch. Default ON
+// (disable with PIXELFLUX_NVENC_DEVICE_INPUT=0).
+bool nvenc_device_input_enabled() {
+  // Default ON; disable with PIXELFLUX_NVENC_DEVICE_INPUT=0 (or false/off/no).
+  static const bool on = []() {
+    const char* v = std::getenv("PIXELFLUX_NVENC_DEVICE_INPUT");
+    if (!v) return true;
+    std::string s(v);
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return !(s == "0" || s == "false" || s == "off" || s == "no");
+  }();
+  return on;
+}
+bool argb_to_nv12_device(CUcontext ctx, const uint8_t* argb, int argb_stride,
+                         uint8_t* y, int y_stride, uint8_t* uv, int uv_stride,
+                         int w, int h, unsigned long long* out_base, int* out_pitch) {
+  if (!ctx || w <= 0 || h <= 0 || (w & 1) || (h & 1)) return false;
+  if (y_stride != w || uv_stride != w) return false;
+  static const bool disabled = (std::getenv("PIXELFLUX_NO_CUDA_CONVERT") != nullptr);
+  if (disabled) return false;
+  std::lock_guard<std::mutex> lk(g_mutex);
+  if (g_tried && ctx != g_init_ctx) {
+    g_tried = false; g_ready = false; g_fn = nullptr;
+    g_d_argb = g_d_y = g_d_uv = g_d_nv12 = 0;
+    g_cap_argb = g_cap_y = g_cap_uv = g_cap_nv12 = 0;
+  }
+  if (!g_tried) { g_tried = true; g_init_ctx = ctx; g_ready = init_locked(ctx); }
+  if (!g_ready) return false;
+  if (g_setctx(ctx) != 0) return false;
+  int pitch = (w + 255) & ~255;
+  size_t argb_sz = (size_t)argb_stride * h;
+  size_t nv12_sz = (size_t)pitch * h + (size_t)pitch * (h / 2);
+  if (!ensure_buf(g_d_argb, g_cap_argb, argb_sz) || !ensure_buf(g_d_nv12, g_cap_nv12, nv12_sz)) return false;
+  if (g_h2d(g_d_argb, argb, argb_sz) != 0) return false;
+  CUdptr y_base = g_d_nv12;
+  CUdptr uv_base = g_d_nv12 + (CUdptr)((size_t)pitch * h);
+  int aw = argb_stride, yw = pitch, uvw = pitch, ww = w, hh = h;
+  void* args[] = {&g_d_argb, &aw, &y_base, &yw, &uv_base, &uvw, &ww, &hh};
+  if (g_launch(g_fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
+  if (g_sync() != 0) return false;
+  // Per-row download to the tight host planes for the change-detection hash.
+  for (int r = 0; r < h; ++r)
+    if (g_d2h(y + (size_t)r * y_stride, y_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
+  for (int r = 0; r < h / 2; ++r)
+    if (g_d2h(uv + (size_t)r * uv_stride, uv_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
+  *out_base = (unsigned long long)g_d_nv12;
+  *out_pitch = pitch;
+  return true;
+}
+
+
+// Clear the cached module/device buffers (assumes g_mutex already held). The handles are
+// only dropped, never freed: the underlying GPU allocations and module die with the owning
+// CUcontext (freed by cuCtxDestroy), so freeing them here would double-free.
+static void clear_cache_locked() {
+  g_tried = false; g_ready = false; g_fn = nullptr; g_init_ctx = nullptr;
+  g_d_argb = g_d_y = g_d_uv = g_d_nv12 = 0;
+  g_cap_argb = g_cap_y = g_cap_uv = g_cap_nv12 = 0;
+}
+
+// Drop the cached module/device buffers bound to the current CUDA context. MUST be called
+// by NVENC teardown BEFORE cuCtxDestroy: otherwise a later cuCtxCreate can hand back the
+// same CUcontext address (pointer-identity ABA), the staleness check in argb_to_nv12
+// (ctx == g_init_ctx) is skipped, and the kernel launches against freed GPU memory. Like
+// that staleness branch we only drop the handles -- cuCtxDestroy frees the underlying
+// allocations -- and taking g_mutex also serializes against any in-flight argb_to_nv12 so
+// the context cannot be destroyed mid-conversion.
+void invalidate() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  clear_cache_locked();
+}
+
+// Destroy a per-instance CUDA context safely w.r.t. the SHARED color-convert cache. Holding
+// g_mutex across the destroy serializes it against any in-flight convert on any context
+// (avoids an intermittent exit crash), and we clear the cache only if it is bound to THIS
+// context, so one instance's teardown doesn't nuke another's live cache. Buffers/module are
+// freed by cuCtxDestroy, never here.
+void destroy_context(CUcontext ctx) {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  if (g_init_ctx == ctx) clear_cache_locked();
+  if (ctx && g_cuda_funcs.pfn_cuCtxDestroy) g_cuda_funcs.pfn_cuCtxDestroy(ctx);
+}
+}  // namespace cuda_convert
+
 /**
  * @brief Scans the system for available VA-API compatible DRM render nodes.
  * This function searches the `/dev/dri/` directory for device files named
@@ -635,6 +1164,75 @@ std::vector<std::string> find_vaapi_render_nodes() {
     closedir(dir);
     std::sort(nodes.begin(), nodes.end());
     return nodes;
+}
+
+// True when GPU auto-selection is requested. SELKIES_AUTO_GPU takes precedence
+// over AUTO_GPU (matches the Wayland backend).
+static bool auto_gpu_enabled() {
+    const char* v = getenv("SELKIES_AUTO_GPU");
+    if (v == nullptr) v = getenv("AUTO_GPU");
+    if (v == nullptr) return false;
+    std::string s(v);
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s == "true";
+}
+
+// Walk /sys/class/drm cards in numeric order and return the first card's renderD*
+// node present in /dev/dri, skipping non-GPU cards (IPMI/VGA) a bare /dev/dri scan
+// would include. Returns "" if none. Mirrors the Wayland backend's auto-selection.
+static std::string auto_select_render_node() {
+    std::vector<std::string> cards;
+    if (DIR* d = opendir("/sys/class/drm")) {
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            std::string n = e->d_name;
+            if (n.rfind("card", 0) == 0 && n.size() > 4 &&
+                n.find_first_not_of("0123456789", 4) == std::string::npos) {
+                cards.push_back(n);
+            }
+        }
+        closedir(d);
+    }
+    std::sort(cards.begin(), cards.end(), [](const std::string& a, const std::string& b) {
+        return atoi(a.c_str() + 4) < atoi(b.c_str() + 4);
+    });
+    for (const std::string& card : cards) {
+        std::string drm_dir = "/sys/class/drm/" + card + "/device/drm";
+        std::vector<std::string> renders;
+        if (DIR* dd = opendir(drm_dir.c_str())) {
+            struct dirent* e;
+            while ((e = readdir(dd)) != nullptr) {
+                std::string en = e->d_name;
+                if (en.rfind("renderD", 0) == 0) renders.push_back(en);
+            }
+            closedir(dd);
+        }
+        std::sort(renders.begin(), renders.end());
+        for (const std::string& en : renders) {
+            std::string dev = "/dev/dri/" + en;
+            if (access(dev.c_str(), F_OK) == 0) return dev;
+        }
+    }
+    return std::string();
+}
+
+// Kernel driver bound to a /dev/dri/renderD* node (basename of the
+// /sys/class/drm/<node>/device/driver symlink, e.g. "nvidia"/"i915"/"amdgpu"; "" if unknown).
+// AUTO_GPU uses this to route NVIDIA nodes to NVENC and Intel/AMD nodes to VAAPI.
+static std::string render_node_kernel_driver(const std::string& dev_path) {
+    if (dev_path.empty()) return std::string();
+    // dev_path is like "/dev/dri/renderD128"; the matching sysfs node name is the basename.
+    size_t slash = dev_path.find_last_of('/');
+    std::string node = (slash == std::string::npos) ? dev_path : dev_path.substr(slash + 1);
+    if (node.empty()) return std::string();
+    std::string link = "/sys/class/drm/" + node + "/device/driver";
+    char buf[1024];
+    ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) return std::string();
+    buf[n] = '\0';
+    std::string target(buf);
+    size_t sl = target.find_last_of('/');
+    return (sl == std::string::npos) ? target : target.substr(sl + 1);
 }
 
 /**
@@ -668,7 +1266,8 @@ StripeEncodeResult encode_stripe_jpeg(
   int shm_stride_bytes,
   int shm_bytes_per_pixel,
   int jpeg_quality,
-  int frame_counter);
+  int frame_counter,
+  bool emit_header);
 
 /**
  * @brief Encodes a horizontal stripe of YUV data into H.264 format using x264.
@@ -715,7 +1314,8 @@ StripeEncodeResult encode_stripe_h264(
   bool force_id,
   bool is_cbr,
   int bitrate_kbps,
-  int vbv_buffer_size_kb);
+  int vbv_buffer_size_kb,
+  bool emit_header);
 
 /**
  * @brief Calculates a 64-bit XXH3 hash for a stripe of YUV data.
@@ -792,6 +1392,11 @@ public:
 
   std::atomic<bool> stop_requested;
   std::thread capture_thread;
+  // Per-module wire/ownership toggles (see CaptureSettings). Kept per-instance so
+  // multiple modules in one process don't clobber each other's settings; atomic so
+  // the capture loop and encode worker threads observe modify_settings consistently.
+  std::atomic<bool> emit_stripe_headers_{true};
+  std::atomic<bool> deferred_free_{false};
   StripeCallback stripe_callback = nullptr;
   void* user_data = nullptr;
   int frame_counter = 0;
@@ -801,6 +1406,7 @@ public:
   bool is_nvidia_system_detected = false;
   bool nvenc_operational = false;
   int vaapi_render_node_index = -1;
+  std::string vaapi_render_node_path_;  // resolved render-node path (AUTO_GPU / explicit / index)
   bool vaapi_operational = false;
 
 private:
@@ -834,7 +1440,7 @@ private:
     bool initialize_nvenc_encoder(int width, int height, int target_qp, double fps, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb);
     StripeEncodeResult encode_fullframe_nvenc(int width, int height, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
     void reset_vaapi_encoder();
-    bool initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb);
+    bool initialize_vaapi_encoder(const std::string& render_node_path, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb);
     StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
 
     void load_watermark_image();
@@ -895,6 +1501,36 @@ public:
    * @param new_settings A CaptureSettings struct containing the new settings.
    */
   void modify_settings(const CaptureSettings& new_settings) {
+    // Resolve the render-node PATH (opendir/readlink) BEFORE the lock; it depends only on
+    // new_settings, so doing it lock-free keeps that I/O off the hot lock (we lock only to
+    // store). Priority: AUTO_GPU > explicit path > legacy index. vaapi_render_node_index is
+    // the VAAPI-vs-NVENC gate (>=0 => VAAPI node; -1 => NVENC/CPU).
+    std::string resolved_node_path;
+    int resolved_node_index = new_settings.vaapi_render_node_index;
+    {
+        std::string resolved;
+        if (auto_gpu_enabled()) {
+            resolved = auto_select_render_node();
+            // NVIDIA does H.264 via NVENC, not VAAPI: only adopt the resolved node for the
+            // VAAPI path when its driver is NOT nvidia. An nvidia node is left empty (index -1)
+            // so the NVENC path is taken instead of falling back to CPU x264.
+            if (!resolved.empty()) {
+                std::string drv = render_node_kernel_driver(resolved);
+                if (drv == "nvidia") {
+                    resolved.clear();  // NVENC-capable: do not engage VAAPI
+                }
+            }
+        } else if (new_settings.vaapi_render_node_path && new_settings.vaapi_render_node_path[0]) {
+            resolved = new_settings.vaapi_render_node_path;
+        } else if (resolved_node_index >= 0) {
+            std::vector<std::string> nodes = find_vaapi_render_nodes();
+            if (resolved_node_index < (int)nodes.size()) resolved = nodes[resolved_node_index];
+            else if (!nodes.empty()) resolved = nodes[0];
+        }
+        resolved_node_path = resolved;
+        resolved_node_index = resolved.empty() ? -1 : (resolved_node_index >= 0 ? resolved_node_index : 0);
+    }
+
     std::lock_guard<std::mutex> lock(settings_mutex);
     capture_width = new_settings.capture_width;
     capture_height = new_settings.capture_height;
@@ -915,7 +1551,14 @@ public:
     h264_fullframe = new_settings.h264_fullframe;
     h264_streaming_mode = new_settings.h264_streaming_mode;
     capture_cursor = new_settings.capture_cursor;
-    vaapi_render_node_index = new_settings.vaapi_render_node_index;
+    emit_stripe_headers_.store(!new_settings.omit_stripe_headers, std::memory_order_relaxed);
+    deferred_free_.store(new_settings.deferred_free, std::memory_order_relaxed);
+    // Store the node resolved lock-free above (path is authoritative; index is the gate).
+    vaapi_render_node_path_ = resolved_node_path;
+    vaapi_render_node_index = resolved_node_index;
+    if (!resolved_node_path.empty()) {
+        std::cout << "Render node resolved: " << resolved_node_path << std::endl;
+    }
     use_cpu = new_settings.use_cpu;
     debug_logging = new_settings.debug_logging;
     std::string new_wm_path_str = new_settings.watermark_path ? new_settings.watermark_path : "";
@@ -960,6 +1603,7 @@ public:
    * encoded frame to be an IDR frame in the appropriate encoder backend.
    */
   void request_idr() {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (debug_logging) {
       const char* backend = use_cpu ? "CPU" : (nvenc_operational ? "NVENC" : (vaapi_operational ? "VAAPI" : "None"));
       std::cout << "[pixelflux] Request IDR -> " << backend << std::endl;
@@ -976,13 +1620,13 @@ public:
    * @param bitrate The new target bitrate in kbps.
    */
   void update_video_bitrate(int bitrate) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (!h264_cbr_mode) return;
 
     if (debug_logging) {
       std::cout << "[pixelflux] Updating video bitrate from " << h264_bitrate_kbps << " to " << bitrate << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     h264_bitrate_kbps = static_cast<int>(std::abs(bitrate));
   }
 
@@ -992,13 +1636,13 @@ public:
    * @param vbv_buffer_size_kb The new VBV buffer size in kb
    */
   void update_vbv_buffer_size(int vbv_buffer_size_kb) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (!h264_cbr_mode) return;
 
     if (debug_logging) {
       std::cout << "[pixelflux] Updating VBV buffer size from " << h264_vbv_buffer_size_kb << " to " << vbv_buffer_size_kb << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     h264_vbv_buffer_size_kb = static_cast<int>(std::abs(vbv_buffer_size_kb));
   }
 
@@ -1008,11 +1652,11 @@ public:
    * @param fps The new target frames per second.
    */
   void update_framerate(double fps) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (debug_logging) {
       std::cout << "[pixelflux] Updating video framerate from " << target_fps << " to " << fps << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     target_fps = static_cast<double>(std::abs(fps));
   }
 };
@@ -1054,8 +1698,8 @@ void ScreenCaptureModule::start_capture() {
  * @brief Stops the screen capture process and releases resources.
  * This function signals the background capture thread to stop. It is a
  * blocking call that waits for the thread to finish its current work and
- * join. After the thread has terminated, it cleans up any active hardware
- * encoder sessions (NVENC, VAAPI) and unloads associated dynamic libraries.
+ * join. After the thread has terminated, it cleans up this instance's hardware
+ * encoder sessions (NVENC, VAAPI) and their per-instance GPU resources.
  */
 void ScreenCaptureModule::stop_capture() {
     stop_requested = true;
@@ -1063,12 +1707,14 @@ void ScreenCaptureModule::stop_capture() {
       capture_thread.join();
     }
     if (nvenc_state_.initialized) {
-      reset_nvenc_encoder();
+      reset_nvenc_encoder();  // destroys THIS instance's CUDA context + NVENC session
     }
     if (vaapi_state_.initialized) {
       reset_vaapi_encoder();
     }
-    UnloadCudaApi();
+    // Deliberately do NOT unload the process-global CUDA driver here: with multiple
+    // instances per process, that would corrupt another instance still mid-encode.
+    // libcuda is process-lifetime (see UnloadCudaApi); per-instance state is freed above.
 }
 
 /**
@@ -1085,6 +1731,13 @@ void ScreenCaptureModule::reset_nvenc_encoder() {
   }
 
   if (nvenc_state_.encoder_session && nvenc_state_.nvenc_funcs.nvEncDestroyEncoder) {
+    // E2: unregister the cached device-input resource BEFORE destroying the session.
+    if (nvenc_state_.registered_resource && nvenc_state_.nvenc_funcs.nvEncUnregisterResource) {
+        nvenc_state_.nvenc_funcs.nvEncUnregisterResource(nvenc_state_.encoder_session, nvenc_state_.registered_resource);
+    }
+    nvenc_state_.registered_resource = nullptr;
+    nvenc_state_.registered_base = 0;
+    nvenc_state_.registered_w = nvenc_state_.registered_h = nvenc_state_.registered_pitch = 0;
     for (NV_ENC_INPUT_PTR& ptr : nvenc_state_.input_buffers) {
         if (ptr && nvenc_state_.nvenc_funcs.nvEncDestroyInputBuffer)
             nvenc_state_.nvenc_funcs.nvEncDestroyInputBuffer(nvenc_state_.encoder_session, ptr);
@@ -1104,7 +1757,9 @@ void ScreenCaptureModule::reset_nvenc_encoder() {
   }
 
   if (nvenc_state_.cuda_context && g_cuda_funcs.pfn_cuCtxDestroy) {
-    g_cuda_funcs.pfn_cuCtxDestroy(nvenc_state_.cuda_context);
+    // Destroy under cuda_convert's g_mutex (serializes vs in-flight convert; clears the
+    // shared cache only if bound to THIS context). See cuda_convert::destroy_context.
+    cuda_convert::destroy_context(nvenc_state_.cuda_context);
     nvenc_state_.cuda_context = nullptr;
   }
 
@@ -1228,6 +1883,10 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
     return false;
   }
 
+  // libcuda and libnvidia-encode are now loaded; filter hidden GPUs out of the
+  // RM enumeration before opening the session (see InstallNvencGpuFilter).
+  InstallNvencGpuFilter();
+
   CUresult cu_status = g_cuda_funcs.pfn_cuInit(0);
   if (cu_status != CUDA_SUCCESS) {
       std::cerr << "NVENC_INIT_ERROR: cuInit failed with code " << cu_status << std::endl;
@@ -1336,6 +1995,9 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   nvenc_state_.encode_config.frameIntervalP = 1;
 
   NV_ENC_CONFIG_H264* h264_cfg = &nvenc_state_.encode_config.encodeCodecConfig.h264Config;
+  // Decodable High 4:4:4 = chromaFormatIDC=3, separate_colour_plane_flag=0 (leave the default;
+  // 1 yields a stream decoders reject). 4:4:4 also requires the cuCtxCreate_v2 context (see
+  // LoadCudaApi); the v1 context makes NVENC's 4:4:4 CUDA ops fail.
   h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
   h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
   h264_cfg->repeatSPSPPS = 1;
@@ -1444,46 +2106,109 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
   NV_ENC_OUTPUT_PTR out_ptr =
     nvenc_state_.output_buffers[nvenc_state_.current_output_buffer_idx];
 
-  NV_ENC_LOCK_INPUT_BUFFER lip = {0};
-  lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-  lip.inputBuffer = in_ptr;
-  NVENCSTATUS status =
-    nvenc_state_.nvenc_funcs.nvEncLockInputBuffer(nvenc_state_.encoder_session, &lip);
-  if (status != NV_ENC_SUCCESS)
-    throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockInputBuffer FAILED: " +
-                             std::to_string(status));
-
-  unsigned char* locked_buffer = static_cast<unsigned char*>(lip.bufferDataPtr);
-  int locked_pitch = lip.pitch;
-
-  uint8_t* y_dst = locked_buffer;
-  uint8_t* uv_or_u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
-
-  if (is_i444) {
-    uint8_t* v_dst = uv_or_u_dst + static_cast<size_t>(locked_pitch) * height;
-    libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
-    libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height);
-    libyuv::CopyPlane(v_plane, v_stride, v_dst, locked_pitch, width, height);
-  } else {
-    if (v_plane) {
-        libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
-                            y_dst, locked_pitch, uv_or_u_dst, locked_pitch, width, height);
-    } else {
-        libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
-        libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height / 2);
+  // E2 gated device-input: register+map the contiguous device NV12 the conversion site
+  // produced (dev_input_base) and feed it directly, skipping the host lock+copy. Falls
+  // back to the host path on any failure. Off by default (dev_input_base == 0).
+  NVENCSTATUS status = NV_ENC_SUCCESS;
+  NV_ENC_INPUT_PTR pic_input = nullptr;
+  int pic_pitch = 0;
+  NV_ENC_INPUT_PTR mapped_resource = nullptr;
+  // This runs on a fresh per-frame thread with NO current CUDA context, but the device-input
+  // path's register/map/encode/unmap needs the encoder's context current on THIS thread. Push
+  // it for that span and pop after (best-effort: fall back to cuCtxSetCurrent, else unchanged).
+  // The host-buffer path below doesn't need it. 4:4:4 stays on the host path (gated !is_i444).
+  bool nvenc_ctx_pushed = false;
+  bool nvenc_ctx_set = false;
+  if (cuda_convert::nvenc_device_input_enabled() && nvenc_state_.dev_input_base != 0 && !is_i444 &&
+      nvenc_state_.nvenc_funcs.nvEncRegisterResource && nvenc_state_.nvenc_funcs.nvEncMapInputResource) {
+    if (nvenc_state_.cuda_context) {
+      if (g_cuda_funcs.pfn_cuCtxPushCurrent &&
+          g_cuda_funcs.pfn_cuCtxPushCurrent(nvenc_state_.cuda_context) == CUDA_SUCCESS) {
+        nvenc_ctx_pushed = true;
+      } else if (g_cuda_funcs.pfn_cuCtxSetCurrent &&
+                 g_cuda_funcs.pfn_cuCtxSetCurrent(nvenc_state_.cuda_context) == CUDA_SUCCESS) {
+        nvenc_ctx_set = true;
+      }
+    }
+    if (nvenc_state_.registered_resource &&
+        (nvenc_state_.registered_base != nvenc_state_.dev_input_base ||
+         nvenc_state_.registered_w != width || nvenc_state_.registered_h != height ||
+         nvenc_state_.registered_pitch != nvenc_state_.dev_input_pitch)) {
+      if (nvenc_state_.nvenc_funcs.nvEncUnregisterResource)
+        nvenc_state_.nvenc_funcs.nvEncUnregisterResource(nvenc_state_.encoder_session, nvenc_state_.registered_resource);
+      nvenc_state_.registered_resource = nullptr;
+    }
+    if (!nvenc_state_.registered_resource) {
+      NV_ENC_REGISTER_RESOURCE rr = {0};
+      rr.version = NV_ENC_REGISTER_RESOURCE_VER;
+      rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+      rr.width = width; rr.height = height; rr.pitch = nvenc_state_.dev_input_pitch;
+      rr.resourceToRegister = reinterpret_cast<void*>(static_cast<uintptr_t>(nvenc_state_.dev_input_base));
+      rr.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+      rr.bufferUsage = NV_ENC_INPUT_IMAGE;
+      if (nvenc_state_.nvenc_funcs.nvEncRegisterResource(nvenc_state_.encoder_session, &rr) == NV_ENC_SUCCESS) {
+        nvenc_state_.registered_resource = rr.registeredResource;
+        nvenc_state_.registered_base = nvenc_state_.dev_input_base;
+        nvenc_state_.registered_w = width; nvenc_state_.registered_h = height;
+        nvenc_state_.registered_pitch = nvenc_state_.dev_input_pitch;
+      }
+    }
+    if (nvenc_state_.registered_resource) {
+      NV_ENC_MAP_INPUT_RESOURCE mr = {0};
+      mr.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+      mr.registeredResource = nvenc_state_.registered_resource;
+      if (nvenc_state_.nvenc_funcs.nvEncMapInputResource(nvenc_state_.encoder_session, &mr) == NV_ENC_SUCCESS) {
+        mapped_resource = mr.mappedResource;
+        pic_input = mapped_resource;
+        pic_pitch = nvenc_state_.dev_input_pitch;
+      }
     }
   }
 
-  nvenc_state_.nvenc_funcs.nvEncUnlockInputBuffer(nvenc_state_.encoder_session, in_ptr);
+  if (!pic_input) {
+    NV_ENC_LOCK_INPUT_BUFFER lip = {0};
+    lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+    lip.inputBuffer = in_ptr;
+    status =
+      nvenc_state_.nvenc_funcs.nvEncLockInputBuffer(nvenc_state_.encoder_session, &lip);
+    if (status != NV_ENC_SUCCESS)
+      throw std::runtime_error("NVENC_ENCODE_ERROR: nvEncLockInputBuffer FAILED: " +
+                               std::to_string(status));
+
+    unsigned char* locked_buffer = static_cast<unsigned char*>(lip.bufferDataPtr);
+    int locked_pitch = lip.pitch;
+
+    uint8_t* y_dst = locked_buffer;
+    uint8_t* uv_or_u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
+
+    if (is_i444) {
+      uint8_t* v_dst = uv_or_u_dst + static_cast<size_t>(locked_pitch) * height;
+      libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
+      libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height);
+      libyuv::CopyPlane(v_plane, v_stride, v_dst, locked_pitch, width, height);
+    } else {
+      if (v_plane) {
+          libyuv::I420ToNV12(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+                              y_dst, locked_pitch, uv_or_u_dst, locked_pitch, width, height);
+      } else {
+          libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
+          libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height / 2);
+      }
+    }
+
+    nvenc_state_.nvenc_funcs.nvEncUnlockInputBuffer(nvenc_state_.encoder_session, in_ptr);
+    pic_input = in_ptr;
+    pic_pitch = locked_pitch;
+  }
 
   NV_ENC_PIC_PARAMS pp = {0};
   pp.version = NV_ENC_PIC_PARAMS_VER;
-  pp.inputBuffer = in_ptr;
+  pp.inputBuffer = pic_input;
   pp.outputBitstream = out_ptr;
   pp.bufferFmt = nvenc_state_.initialized_buffer_format;
   pp.inputWidth = width;
   pp.inputHeight = height;
-  pp.inputPitch = locked_pitch;
+  pp.inputPitch = pic_pitch;
   pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
   pp.inputTimeStamp = frame_counter;
   pp.frameIdx = frame_counter;
@@ -1496,6 +2221,22 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
   if (status != NV_ENC_SUCCESS) {
     std::string err_msg = "NVENC_ENCODE_ERROR: nvEncEncodePicture FAILED: " + std::to_string(status);
     throw std::runtime_error(err_msg);
+  }
+
+  // Device-input was consumed by the (synchronous) encode; unmap it. A throw above
+  // leaves it mapped, but the encoder reset on that error path destroys the session.
+  if (mapped_resource && nvenc_state_.nvenc_funcs.nvEncUnmapInputResource) {
+    nvenc_state_.nvenc_funcs.nvEncUnmapInputResource(nvenc_state_.encoder_session, mapped_resource);
+    mapped_resource = nullptr;
+  }
+
+  // Restore the thread's prior context now the device-input span is done (pop balances push,
+  // else unset SetCurrent). A throw before here leaks the push, but only on this ending thread.
+  if (nvenc_ctx_pushed && g_cuda_funcs.pfn_cuCtxPopCurrent) {
+    CUcontext popped = nullptr;
+    g_cuda_funcs.pfn_cuCtxPopCurrent(&popped);
+  } else if (nvenc_ctx_set && g_cuda_funcs.pfn_cuCtxSetCurrent) {
+    g_cuda_funcs.pfn_cuCtxSetCurrent(nullptr);
   }
 
   NV_ENC_LOCK_BITSTREAM lbs = {0};
@@ -1513,19 +2254,21 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
     if (lbs.pictureType == NV_ENC_PIC_TYPE_IDR) type_hdr = 0x01;
     else if (lbs.pictureType == NV_ENC_PIC_TYPE_I) type_hdr = 0x02;
 
-    int header_sz = 10;
+    int header_sz = emit_stripe_headers_.load(std::memory_order_relaxed) ? 10 : 0;
     result.data = new unsigned char[lbs.bitstreamSizeInBytes + header_sz];
     result.size = lbs.bitstreamSizeInBytes + header_sz;
-    result.data[0] = TAG;
-    result.data[1] = type_hdr;
-    uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-    std::memcpy(result.data + 2, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-    std::memcpy(result.data + 4, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(width));
-    std::memcpy(result.data + 6, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(height));
-    std::memcpy(result.data + 8, &net_val, 2);
+    if (header_sz) {
+      result.data[0] = TAG;
+      result.data[1] = type_hdr;
+      uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+      std::memcpy(result.data + 2, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+      std::memcpy(result.data + 4, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(width));
+      std::memcpy(result.data + 6, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(height));
+      std::memcpy(result.data + 8, &net_val, 2);
+    }
     std::memcpy(result.data + header_sz, lbs.bitstreamBufferPtr, lbs.bitstreamSizeInBytes);
   } else {
     result.size = 0;
@@ -1593,7 +2336,7 @@ void ScreenCaptureModule::reset_vaapi_encoder() {
  * @param vbv_buffer_size_kb VBV buffer size in kb for CBR mode (0 for auto/default).
  * @return True if the encoder was successfully initialized, false otherwise.
  */
-bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb) {
+bool ScreenCaptureModule::initialize_vaapi_encoder(const std::string& render_node_path, int width, int height, int qp, bool use_yuv444, bool is_cbr, int bitrate_kbps, int vbv_buffer_size_kb) {
     std::unique_lock<std::mutex> lock(vaapi_mutex_);
     if (vaapi_state_.initialized && vaapi_state_.initialized_width == width &&
         vaapi_state_.initialized_height == height &&
@@ -1621,7 +2364,7 @@ bool ScreenCaptureModule::initialize_vaapi_encoder(int render_node_idx, int widt
         std::cerr << "VAAPI_INIT: No /dev/dri/renderD nodes found." << std::endl;
         return false;
     }
-    std::string node_to_use = (render_node_idx >= 0 && render_node_idx < (int)nodes.size()) ? nodes[render_node_idx] : nodes[0];
+    std::string node_to_use = !render_node_path.empty() ? render_node_path : nodes[0];
     if (debug_logging) {
         std::cout << "VAAPI_INIT: Using render node: " << node_to_use << std::endl;
     }
@@ -1801,19 +2544,21 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_vaapi(int width, int he
         if (vaapi_state_.packet->size > 0) {
             const unsigned char TAG = 0x04;
             unsigned char type_hdr = (vaapi_state_.packet->flags & AV_PKT_FLAG_KEY) ? 0x01 : 0x00;
-            int header_sz = 10;
+            int header_sz = emit_stripe_headers_.load(std::memory_order_relaxed) ? 10 : 0;
             result.data = new unsigned char[vaapi_state_.packet->size + header_sz];
             result.size = vaapi_state_.packet->size + header_sz;
-            result.data[0] = TAG;
-            result.data[1] = type_hdr;
-            uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-            std::memcpy(result.data + 2, &net_val, 2);
-            net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-            std::memcpy(result.data + 4, &net_val, 2);
-            net_val = htons(static_cast<uint16_t>(width));
-            std::memcpy(result.data + 6, &net_val, 2);
-            net_val = htons(static_cast<uint16_t>(height));
-            std::memcpy(result.data + 8, &net_val, 2);
+            if (header_sz) {
+              result.data[0] = TAG;
+              result.data[1] = type_hdr;
+              uint16_t net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+              std::memcpy(result.data + 2, &net_val, 2);
+              net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+              std::memcpy(result.data + 4, &net_val, 2);
+              net_val = htons(static_cast<uint16_t>(width));
+              std::memcpy(result.data + 6, &net_val, 2);
+              net_val = htons(static_cast<uint16_t>(height));
+              std::memcpy(result.data + 8, &net_val, 2);
+            }
             std::memcpy(result.data + header_sz, vaapi_state_.packet->data, vaapi_state_.packet->size);
         }
         av_packet_unref(vaapi_state_.packet);
@@ -1990,6 +2735,7 @@ void ScreenCaptureModule::capture_loop() {
     OutputMode local_current_output_mode;
     bool local_current_capture_cursor;
     int local_vaapi_render_node_index;
+    std::string local_vaapi_render_node_path;
     int xfixes_event_base = 0;
     int xfixes_error_base = 0;
     std::string local_watermark_path_setting;
@@ -2023,6 +2769,7 @@ void ScreenCaptureModule::capture_loop() {
       local_current_h264_streaming_mode = h264_streaming_mode;
       local_current_capture_cursor = capture_cursor;
       local_vaapi_render_node_index = vaapi_render_node_index;
+      local_vaapi_render_node_path = vaapi_render_node_path_;
       local_use_cpu = use_cpu;
       local_debug_logging = debug_logging;
       local_watermark_path_setting = watermark_path_internal;
@@ -2050,7 +2797,7 @@ void ScreenCaptureModule::capture_loop() {
 
     if (!local_use_cpu && local_vaapi_render_node_index >= 0 &&
         local_current_output_mode == OutputMode::H264 && local_current_h264_fullframe) {
-        if (this->initialize_vaapi_encoder(local_vaapi_render_node_index,
+        if (this->initialize_vaapi_encoder(local_vaapi_render_node_path,
                                       local_capture_width_actual,
                                       local_capture_height_actual,
                                       local_current_h264_crf,
@@ -2095,7 +2842,7 @@ void ScreenCaptureModule::capture_loop() {
     }
 
     std::chrono::duration < double > target_frame_duration_seconds =
-      std::chrono::duration < double > (1.0 / local_current_target_fps);
+      std::chrono::duration < double > (1.0 / (local_current_target_fps > 0.0 ? local_current_target_fps : 1.0));
 
     auto next_frame_time =
       std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
@@ -2368,6 +3115,11 @@ void ScreenCaptureModule::capture_loop() {
       auto intended_current_frame_time = next_frame_time;
       next_frame_time += target_frame_duration_seconds;
 
+      // Re-anchor if we fell behind, so lateness can't accumulate into a burst.
+      if (next_frame_time < current_loop_iter_start_time) {
+        next_frame_time = current_loop_iter_start_time + target_frame_duration_seconds;
+      }
+
       int old_w = local_capture_width_actual;
       int old_h = local_capture_height_actual;
       bool yuv_config_changed = false;
@@ -2382,8 +3134,14 @@ void ScreenCaptureModule::capture_loop() {
 
         if (local_current_target_fps != target_fps) {
           local_current_target_fps = target_fps;
-          target_frame_duration_seconds = std::chrono::duration < double > (1.0 / local_current_target_fps);
+          target_frame_duration_seconds = std::chrono::duration < double > (1.0 / (local_current_target_fps > 0.0 ? local_current_target_fps : 1.0));
           next_frame_time = intended_current_frame_time + target_frame_duration_seconds;
+          // intended_current_frame_time predates the lateness re-anchor above, so on a
+          // behind-schedule frame this could rewind next_frame_time into the past and
+          // trigger a catch-up burst. Re-apply the same re-anchor to preserve it.
+          if (next_frame_time < current_loop_iter_start_time) {
+            next_frame_time = current_loop_iter_start_time + target_frame_duration_seconds;
+          }
         }
         local_current_jpeg_quality = jpeg_quality;
         local_current_paint_over_jpeg_quality = paint_over_jpeg_quality;
@@ -2405,6 +3163,7 @@ void ScreenCaptureModule::capture_loop() {
         local_current_h264_streaming_mode = h264_streaming_mode;
         local_current_capture_cursor = capture_cursor;
         local_vaapi_render_node_index = vaapi_render_node_index;
+      local_vaapi_render_node_path = vaapi_render_node_path_;
         local_watermark_path_setting = watermark_path_internal;
         local_watermark_location_setting = watermark_location_internal;
         local_use_cpu = use_cpu;
@@ -2479,6 +3238,12 @@ void ScreenCaptureModule::capture_loop() {
         }
       }
 
+      // H.264 4:2:0 needs even dimensions; clamp before SHM/plane (re)allocation.
+      if (local_current_output_mode == OutputMode::H264) {
+        local_capture_width_actual &= ~1;
+        local_capture_height_actual &= ~1;
+      }
+
       if (old_w != local_capture_width_actual || old_h != local_capture_height_actual ||
           yuv_config_changed) {
         std::cout << "Capture parameters changed. Re-initializing XShm and YUV planes."
@@ -2532,8 +3297,9 @@ void ScreenCaptureModule::capture_loop() {
 
         this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
         if (local_current_output_mode == OutputMode::H264) {
-            bool use_nv12_planes = !local_use_cpu && this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor;
-            
+            bool use_nv12_planes = !local_use_cpu && local_current_h264_fullframe && !local_current_h264_fullcolor &&
+                           ((this->is_nvidia_system_detected && local_vaapi_render_node_index < 0) || (local_vaapi_render_node_index >= 0));
+
             size_t y_plane_size = static_cast<size_t>(local_capture_width_actual) *
                                   local_capture_height_actual;
             full_frame_y_plane_.assign(y_plane_size, 0);
@@ -2696,10 +3462,33 @@ void ScreenCaptureModule::capture_loop() {
             bool use_nv12_for_hw_encoder = (this->nvenc_operational || this->vaapi_operational) && !this->yuv_planes_are_i444_;
 
             if (use_nv12_for_hw_encoder) {
-                libyuv::ARGBToNV12(shm_data_ptr, shm_stride_bytes,
-                                   full_frame_y_plane_.data(), full_frame_y_stride_,
-                                   full_frame_u_plane_.data(), full_frame_u_stride_,
-                                   local_capture_width_actual, local_capture_height_actual);
+                // Default to GPU (CUDA/NVRTC) color conversion in NVENC mode when
+                // libnvrtc is present; fall back to libyuv on absence or any error.
+                bool converted = false;
+                nvenc_state_.dev_input_base = 0;  // host path unless device conversion sets it
+                if (this->nvenc_operational) {
+                    if (cuda_convert::nvenc_device_input_enabled()) {
+                        unsigned long long dev_base = 0; int dev_pitch = 0;
+                        converted = cuda_convert::argb_to_nv12_device(
+                            nvenc_state_.cuda_context, shm_data_ptr, shm_stride_bytes,
+                            full_frame_y_plane_.data(), full_frame_y_stride_,
+                            full_frame_u_plane_.data(), full_frame_u_stride_,
+                            local_capture_width_actual, local_capture_height_actual, &dev_base, &dev_pitch);
+                        if (converted) { nvenc_state_.dev_input_base = dev_base; nvenc_state_.dev_input_pitch = dev_pitch; }
+                    } else {
+                        converted = cuda_convert::argb_to_nv12(
+                            nvenc_state_.cuda_context, shm_data_ptr, shm_stride_bytes,
+                            full_frame_y_plane_.data(), full_frame_y_stride_,
+                            full_frame_u_plane_.data(), full_frame_u_stride_,
+                            local_capture_width_actual, local_capture_height_actual);
+                    }
+                }
+                if (!converted) {
+                    libyuv::ARGBToNV12(shm_data_ptr, shm_stride_bytes,
+                                       full_frame_y_plane_.data(), full_frame_y_stride_,
+                                       full_frame_u_plane_.data(), full_frame_u_stride_,
+                                       local_capture_width_actual, local_capture_height_actual);
+                }
             } else if (this->yuv_planes_are_i444_) {
                 libyuv::ARGBToI444(shm_data_ptr, shm_stride_bytes,
                                    full_frame_y_plane_.data(), full_frame_y_stride_,
@@ -2707,6 +3496,17 @@ void ScreenCaptureModule::capture_loop() {
                                    full_frame_v_plane_.data(), full_frame_v_stride_,
                                    local_capture_width_actual, local_capture_height_actual);
             } else {
+                // A runtime HW-encoder fallback can leave NV12-sized planes (empty V)
+                // while we take the I420 path; re-size to I420 before converting.
+                if (full_frame_v_plane_.empty()) {
+                    size_t chroma_plane_size =
+                        (static_cast<size_t>(local_capture_width_actual) / 2) *
+                        (static_cast<size_t>(local_capture_height_actual) / 2);
+                    full_frame_u_plane_.assign(chroma_plane_size, 0);
+                    full_frame_v_plane_.assign(chroma_plane_size, 0);
+                    full_frame_u_stride_ = local_capture_width_actual / 2;
+                    full_frame_v_stride_ = local_capture_width_actual / 2;
+                }
                 libyuv::ARGBToI420(shm_data_ptr, shm_stride_bytes,
                                    full_frame_y_plane_.data(), full_frame_y_stride_,
                                    full_frame_u_plane_.data(), full_frame_u_stride_,
@@ -2996,7 +3796,7 @@ void ScreenCaptureModule::capture_loop() {
               }
 
               std::packaged_task<StripeEncodeResult(
-                int, int, int, int, const unsigned char*, int, int, int, int)>
+                int, int, int, int, const unsigned char*, int, int, int, int, bool)>
                 task(encode_stripe_jpeg);
               futures.push_back(task.get_future());
               threads.push_back(std::thread(
@@ -3006,7 +3806,8 @@ void ScreenCaptureModule::capture_loop() {
                 shm_stride_bytes,
                 shm_bytes_per_pixel,
                 quality_to_use,
-                this->frame_counter));
+                this->frame_counter,
+                this->emit_stripe_headers_.load(std::memory_order_relaxed)));
             } else {
               if (this->vaapi_operational) {
                 std::packaged_task<StripeEncodeResult()> task([=, this]() {
@@ -3076,7 +3877,7 @@ void ScreenCaptureModule::capture_loop() {
                 std::packaged_task<StripeEncodeResult(
                   MinimalEncoderStore&, int, int, int, int, const uint8_t*, int,
                   const uint8_t*, int, const uint8_t*, int, bool, int, int, int,
-                  bool, int, bool, bool, int, int)>
+                  bool, int, bool, bool, int, int, bool)>
                   task(encode_stripe_h264);
                 futures.push_back(task.get_future());
                 threads.push_back(std::thread(
@@ -3094,7 +3895,8 @@ void ScreenCaptureModule::capture_loop() {
                   force_idr,
                   local_current_h264_cbr_mode,
                   local_current_h264_bitrate_kbps,
-                  local_current_h264_vbv_buffer_size_kb
+                  local_current_h264_vbv_buffer_size_kb,
+                  this->emit_stripe_headers_.load(std::memory_order_relaxed)
                   ));
               }
             }
@@ -3131,6 +3933,20 @@ void ScreenCaptureModule::capture_loop() {
         for (StripeEncodeResult& result : stripe_results) {
           if (stripe_callback != nullptr && result.data != nullptr && result.size > 0) {
             stripe_callback(&result, user_data);
+            if (deferred_free_.load(std::memory_order_relaxed)) {
+              // Ownership handed to Python, which frees the buffer after its async
+              // send completes. Detach defensively; clear() below does not free
+              // data anyway (StripeEncodeResult has no data-freeing destructor).
+              result.data = nullptr;
+              result.size = 0;
+            }
+          } else if (result.data != nullptr) {
+            // No callback consumed this buffer (callback==nullptr, or empty result):
+            // StripeEncodeResult has no data-freeing destructor and clear() below
+            // won't release it, so free the new[]'d buffer here to avoid a leak.
+            delete[] result.data;
+            result.data = nullptr;
+            result.size = 0;
           }
         }
         stripe_results.clear();
@@ -3265,7 +4081,8 @@ StripeEncodeResult encode_stripe_jpeg(
   int shm_stride_bytes,
   int shm_bytes_per_pixel,
   int jpeg_quality,
-  int frame_counter) {
+  int frame_counter,
+  bool emit_header) {
   StripeEncodeResult result;
   result.type = StripeDataType::JPEG;
   result.stripe_y_start = stripe_y_start;
@@ -3273,7 +4090,7 @@ StripeEncodeResult encode_stripe_jpeg(
   result.frame_id = frame_counter;
 
   if (!shm_data_base || stripe_height <= 0 || capture_width_actual <= 0 ||
-      shm_bytes_per_pixel <= 0) {
+      (shm_bytes_per_pixel != 3 && shm_bytes_per_pixel != 4)) {
     std::cerr << "JPEG T" << thread_id
               << ": Invalid input for JPEG encoding from SHM." << std::endl;
     result.type = StripeDataType::UNKNOWN;
@@ -3316,7 +4133,7 @@ StripeEncodeResult encode_stripe_jpeg(
   jpeg_finish_compress(&cinfo);
 
   if (jpeg_size_temp > 0 && jpeg_buffer) {
-    int padding_size = 4;
+    int padding_size = emit_header ? 4 : 0;
     result.data = new (std::nothrow) unsigned char[jpeg_size_temp + padding_size];
     if (!result.data) {
       std::cerr << "JPEG T" << thread_id
@@ -3328,11 +4145,12 @@ StripeEncodeResult encode_stripe_jpeg(
       return result;
     }
 
-    uint16_t frame_counter_net = htons(static_cast<uint16_t>(frame_counter % 65536));
-    uint16_t stripe_y_start_net = htons(static_cast<uint16_t>(stripe_y_start));
-
-    std::memcpy(result.data, &frame_counter_net, 2);
-    std::memcpy(result.data + 2, &stripe_y_start_net, 2);
+    if (padding_size) {
+      uint16_t frame_counter_net = htons(static_cast<uint16_t>(frame_counter % 65536));
+      uint16_t stripe_y_start_net = htons(static_cast<uint16_t>(stripe_y_start));
+      std::memcpy(result.data, &frame_counter_net, 2);
+      std::memcpy(result.data + 2, &stripe_y_start_net, 2);
+    }
     std::memcpy(result.data + padding_size, jpeg_buffer, jpeg_size_temp);
     result.size = static_cast<int>(jpeg_size_temp) + padding_size;
   } else {
@@ -3402,7 +4220,8 @@ StripeEncodeResult encode_stripe_h264(
   bool force_idr,
   bool is_cbr,
   int h264_bitrate_kbps,
-  int vbv_buffer_size_kb) {
+  int vbv_buffer_size_kb,
+  bool emit_header) {
 
   StripeEncodeResult result;
   result.type = StripeDataType::H264;
@@ -3654,7 +4473,7 @@ StripeEncodeResult encode_stripe_h264(
     if (pic_out.i_type == X264_TYPE_IDR) frame_type_header_byte = 0x01;
     else if (pic_out.i_type == X264_TYPE_I) frame_type_header_byte = 0x02;
 
-    int header_sz = 10;
+    int header_sz = emit_header ? 10 : 0;
     int total_sz = frame_size + header_sz;
     result.data = new (std::nothrow) unsigned char[total_sz];
     if (!result.data) {
@@ -3663,17 +4482,19 @@ StripeEncodeResult encode_stripe_h264(
       result.type = StripeDataType::UNKNOWN; return result;
     }
 
-    result.data[0] = DATA_TYPE_H264_STRIPED_TAG;
-    result.data[1] = frame_type_header_byte;
-    uint16_t net_val;
-    net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
-    std::memcpy(result.data + 2, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
-    std::memcpy(result.data + 4, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(capture_width_actual));
-    std::memcpy(result.data + 6, &net_val, 2);
-    net_val = htons(static_cast<uint16_t>(result.stripe_height));
-    std::memcpy(result.data + 8, &net_val, 2);
+    if (header_sz) {
+      result.data[0] = DATA_TYPE_H264_STRIPED_TAG;
+      result.data[1] = frame_type_header_byte;
+      uint16_t net_val;
+      net_val = htons(static_cast<uint16_t>(result.frame_id % 65536));
+      std::memcpy(result.data + 2, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(result.stripe_y_start));
+      std::memcpy(result.data + 4, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(capture_width_actual));
+      std::memcpy(result.data + 6, &net_val, 2);
+      net_val = htons(static_cast<uint16_t>(result.stripe_height));
+      std::memcpy(result.data + 8, &net_val, 2);
+    }
 
     unsigned char* payload_ptr = result.data + header_sz;
     size_t bytes_copied = 0;
@@ -3810,6 +4631,79 @@ uint64_t calculate_bgr_stripe_hash_from_shm(const unsigned char* shm_start_ptr,
 extern "C" {
 
   typedef void* ScreenCaptureModuleHandle;
+
+  // Exposes the C++ struct size so Python can assert ctypes/C ABI agreement.
+  int pixelflux_capture_settings_size() {
+    return static_cast<int>(sizeof(CaptureSettings));
+  }
+
+  // FNV-1a-64 over each field's (name, offset, size) in declaration order, so
+  // Python can catch a same-size field reorder/rename the size-only guard misses.
+  // Declared metadata only (not a memory dump) and LE-explicit, so it matches the
+  // pure-stdlib Python computation in __init__.py byte-for-byte.
+  uint64_t pixelflux_capture_settings_layout_hash() {
+    const uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
+    const uint64_t FNV_PRIME  = 0x100000001b3ULL;
+    uint64_t h = FNV_OFFSET;
+    auto mix = [&](const unsigned char* p, size_t n) {
+      for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= FNV_PRIME; }
+    };
+    auto mix_str = [&](const char* s) {
+      size_t n = 0; while (s[n]) ++n;
+      mix(reinterpret_cast<const unsigned char*>(s), n);
+      unsigned char z = 0; mix(&z, 1);  // 0x00 delimiter between name and numbers
+    };
+    auto mix_u32 = [&](uint32_t v) {     // little-endian, matches Python struct.pack("<I")
+      unsigned char b[4] = {
+        static_cast<unsigned char>(v & 0xFF),
+        static_cast<unsigned char>((v >> 8) & 0xFF),
+        static_cast<unsigned char>((v >> 16) & 0xFF),
+        static_cast<unsigned char>((v >> 24) & 0xFF),
+      };
+      mix(b, 4);
+    };
+    // #NAME makes the hashed string literal and the offsetof/sizeof target the
+    // SAME token, so a field rename can never desync the literal from the field.
+    #define PF_FIELD(NAME) do {                                                   \
+        mix_str(#NAME);                                                           \
+        mix_u32(static_cast<uint32_t>(offsetof(CaptureSettings, NAME)));          \
+        mix_u32(static_cast<uint32_t>(sizeof(static_cast<CaptureSettings*>(nullptr)->NAME))); \
+      } while (0)
+    PF_FIELD(capture_width);
+    PF_FIELD(capture_height);
+    PF_FIELD(scale);
+    PF_FIELD(capture_x);
+    PF_FIELD(capture_y);
+    PF_FIELD(target_fps);
+    PF_FIELD(jpeg_quality);
+    PF_FIELD(paint_over_jpeg_quality);
+    PF_FIELD(use_paint_over_quality);
+    PF_FIELD(paint_over_trigger_frames);
+    PF_FIELD(damage_block_threshold);
+    PF_FIELD(damage_block_duration);
+    PF_FIELD(output_mode);
+    PF_FIELD(h264_crf);
+    PF_FIELD(h264_paintover_crf);
+    PF_FIELD(h264_paintover_burst_frames);
+    PF_FIELD(h264_fullcolor);
+    PF_FIELD(h264_fullframe);
+    PF_FIELD(h264_streaming_mode);
+    PF_FIELD(capture_cursor);
+    PF_FIELD(watermark_path);
+    PF_FIELD(watermark_location_enum);
+    PF_FIELD(vaapi_render_node_index);
+    PF_FIELD(use_cpu);
+    PF_FIELD(debug_logging);
+    PF_FIELD(h264_cbr_mode);
+    PF_FIELD(h264_bitrate_kbps);
+    PF_FIELD(h264_vbv_buffer_size_kb);
+    PF_FIELD(auto_adjust_screen_capture_size);
+    PF_FIELD(omit_stripe_headers);
+    PF_FIELD(deferred_free);
+    PF_FIELD(vaapi_render_node_path);
+    #undef PF_FIELD
+    return h;
+  }
 
   /**
    * @brief Creates a new instance of the ScreenCaptureModule.
