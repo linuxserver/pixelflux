@@ -23,6 +23,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::delegate_viewporter;
 use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::input::pointer::PointerHandle;
@@ -427,6 +428,8 @@ impl CompositorHandler for AppState {
                 self.pending_windows.push(window);
             } else {
                 self.space.map_element(window.clone(), (0, 0), true);
+                // Refresh the cached bbox before reading geometry() (avoids a redundant configure).
+                window.on_commit();
 
                 if let Some(output) = self.outputs.first() {
                     output.enter(surface);
@@ -529,11 +532,11 @@ impl AppState {
                             let mut hasher = DefaultHasher::new();
                             slice.hash(&mut hasher);
                             let hash = hasher.finish();
-                            (hash, spec.width, spec.height, spec.stride, slice.to_vec())
+                            (hash, spec.width, spec.height, spec.stride, spec.format, spec.offset, slice.to_vec())
                         });
 
                         match shm_result {
-                            Ok((hash, width, height, stride, raw_bytes)) => {
+                            Ok((hash, width, height, stride, format, buf_offset, raw_bytes)) => {
                                 if let Some(cached_png) = self.cursor_cache.get(&hash) {
                                     final_png = cached_png.clone();
                                 } else {
@@ -543,13 +546,19 @@ impl AppState {
                                         
                                         for y in 0..(height as u32) {
                                             for x in 0..(width as u32) {
-                                                let offset = (y as usize * stride_usize) + (x as usize * 4);
+                                                let offset = buf_offset as usize + (y as usize * stride_usize) + (x as usize * 4);
                                                 if offset + 4 <= raw_bytes.len() {
-                                                    img_buf.put_pixel(x, y, Rgba([
-                                                        raw_bytes[offset + 2], 
-                                                        raw_bytes[offset + 1], 
-                                                        raw_bytes[offset], 
+                                                    // Xrgb8888 has no alpha; byte 3 is padding.
+                                                    let alpha = if format == wl_shm::Format::Xrgb8888 {
+                                                        255
+                                                    } else {
                                                         raw_bytes[offset + 3]
+                                                    };
+                                                    img_buf.put_pixel(x, y, Rgba([
+                                                        raw_bytes[offset + 2],
+                                                        raw_bytes[offset + 1],
+                                                        raw_bytes[offset],
+                                                        alpha
                                                     ]));
                                                 }
                                             }
@@ -560,7 +569,8 @@ impl AppState {
                                             self.cursor_cache.insert(hash, bytes.clone());
                                             final_png = bytes;
                                             if self.cursor_cache.len() > 100 {
-                                                self.cursor_cache.clear();
+                                                let oldest = *self.cursor_cache.keys().next().unwrap();
+                                                self.cursor_cache.remove(&oldest);
                                             }
                                         }
                                     }
@@ -627,7 +637,8 @@ impl AppState {
                                                  self.cursor_cache.insert(hash, bytes.clone());
                                                  final_png = bytes;
                                                  if self.cursor_cache.len() > 100 {
-                                                     self.cursor_cache.clear();
+                                                     let oldest = *self.cursor_cache.keys().next().unwrap();
+                                                     self.cursor_cache.remove(&oldest);
                                                  }
                                              }
                                          }

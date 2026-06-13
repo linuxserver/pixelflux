@@ -57,8 +57,6 @@ _legacy_lib = None
 try:
     if os.path.exists(lib_path):
         _legacy_lib = ctypes.CDLL(lib_path)
-    else:
-        _legacy_lib = ctypes.CDLL('screen_capture_module.so')
 except OSError:
     pass
 
@@ -106,20 +104,14 @@ class ScreenCapture:
         self._c_callback = None
 
     def __del__(self):
-        if hasattr(self, '_module') and self._module:
-            try:
+        try:
+            if getattr(self, '_is_capturing', False):
                 self.stop_capture()
+            if getattr(self, '_module', None):
                 destroy_module(self._module)
-            except:
-                pass
-            self._module = None
-
-    def start_capture(self, settings: CaptureSettings, stripe_callback):
-        if self._is_capturing:
-            raise ValueError("Capture already started.")
-
-        self._python_stripe_callback = stripe_callback
-        mode = getattr(settings, 'mode', 'x11')
+                self._module = None
+        except Exception:
+            pass
 
     def start_capture(self, settings: CaptureSettings, stripe_callback):
         if self._is_capturing:
@@ -147,7 +139,7 @@ class ScreenCapture:
                 result_struct.size = size
                 result_struct.data = ctypes.cast(c_buffer, ctypes.POINTER(ctypes.c_ubyte))
                 if is_h264:
-                    result_struct.type = 0
+                    result_struct.type = 2
                     if size >= 4:
                         result_struct.frame_id = int.from_bytes(data_bytes[2:4], 'big')
                     else:
@@ -156,7 +148,11 @@ class ScreenCapture:
                          result_struct.stripe_y_start = int.from_bytes(data_bytes[4:6], 'big')
                     else:
                          result_struct.stripe_y_start = 0
-                    result_struct.stripe_height = settings.capture_height
+                    # Real per-stripe height is in the packet header (bytes 8:10).
+                    if size >= 10:
+                        result_struct.stripe_height = int.from_bytes(data_bytes[8:10], 'big')
+                    else:
+                        result_struct.stripe_height = settings.capture_height
                 else:
                     result_struct.type = 1
                     if size >= 2:
@@ -180,8 +176,15 @@ class ScreenCapture:
             raise TypeError("stripe_callback must be callable.")
         
         self._c_callback = StripeCallback(self._internal_c_callback)
-        start_capture_c(self._module, settings, self._c_callback, None)
+        # Publish _is_capturing before the producer thread starts so its first
+        # callbacks aren't dropped (and their buffers leaked).
         self._is_capturing = True
+        try:
+            start_capture_c(self._module, settings, self._c_callback, None)
+        except Exception:
+            self._is_capturing = False
+            self._c_callback = None
+            raise
 
     def stop_capture(self):
         if not self._is_capturing:

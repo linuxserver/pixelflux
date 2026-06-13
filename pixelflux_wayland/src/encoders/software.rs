@@ -264,22 +264,8 @@ pub fn encode_cpu(
         stripes.resize_with(n_processing_stripes, StripeState::default);
     }
 
-    let mut stripe_geometries = Vec::with_capacity(n_processing_stripes);
-    let mut current_y = 0;
-    let h_usize = height as usize;
-    let n = n_processing_stripes;
-    let base_h = (h_usize / n) & !1; 
-    
-    let total_used = base_h * n;
-    let remainder = h_usize - total_used;
-    let stripes_with_extra = remainder / 2;
-
-    for i in 0..n {
-        let extra = if i < stripes_with_extra { 2 } else { 0 };
-        let s_h = base_h + extra;
-        stripe_geometries.push((current_y, s_h));
-        current_y += s_h;
-    }
+    let stripe_geometries =
+        compute_stripe_geometries(height as usize, n_processing_stripes, settings.output_mode);
     let mut stripe_is_dirty = vec![false; n_processing_stripes];
     if !damage_rects.is_empty() {
         for rect in damage_rects {
@@ -457,46 +443,55 @@ pub fn encode_cpu(
                             height: actual_height as u32,
                         };
 
-                        if h264_fullcolor {
+                        let conversion_result = if h264_fullcolor {
                             if use_gpu {
-                                let _ = yuv::rgba_to_yuv444(
+                                yuv::rgba_to_yuv444(
                                     &mut planar_image,
                                     stripe_bytes,
                                     (width_usize * 4) as u32,
                                     YuvRange::Full,
                                     YuvStandardMatrix::Bt709,
                                     YuvConversionMode::Balanced,
-                                );
+                                )
                             } else {
-                                let _ = yuv::bgra_to_yuv444(
+                                yuv::bgra_to_yuv444(
                                     &mut planar_image,
                                     stripe_bytes,
                                     (width_usize * 4) as u32,
                                     YuvRange::Full,
                                     YuvStandardMatrix::Bt709,
                                     YuvConversionMode::Balanced,
-                                );
+                                )
                             }
                         } else {
                             if use_gpu {
-                                let _ = yuv::rgba_to_yuv420(
+                                yuv::rgba_to_yuv420(
                                     &mut planar_image,
                                     stripe_bytes,
                                     (width_usize * 4) as u32,
                                     YuvRange::Limited,
                                     YuvStandardMatrix::Bt709,
                                     YuvConversionMode::Balanced,
-                                );
+                                )
                             } else {
-                                let _ = yuv::bgra_to_yuv420(
+                                yuv::bgra_to_yuv420(
                                     &mut planar_image,
                                     stripe_bytes,
                                     (width_usize * 4) as u32,
                                     YuvRange::Limited,
                                     YuvStandardMatrix::Bt709,
                                     YuvConversionMode::Balanced,
-                                );
+                                )
                             }
+                        };
+
+                        // Skip the stripe on conversion failure instead of encoding garbage.
+                        if let Err(e) = conversion_result {
+                            eprintln!(
+                                "[software] YUV conversion failed for {}x{} stripe: {:?}; skipping",
+                                width_usize, actual_height, e
+                            );
+                            return None;
                         }
 
                         let mut fixed_header = [0u8; 8];
@@ -536,4 +531,75 @@ pub fn encode_cpu(
             }
         })
         .collect()
+}
+
+/// Splits `height` rows into `n` stripes. JPEG (output_mode 0) covers every row;
+/// H.264 keeps even stripe heights for 4:2:0, leaving any trailing odd row uncovered.
+fn compute_stripe_geometries(height: usize, n: usize, output_mode: i32) -> Vec<(usize, usize)> {
+    let mut geoms = Vec::with_capacity(n);
+    let mut current_y = 0;
+    if output_mode == 0 {
+        let base_h = height / n;
+        let remainder = height - base_h * n;
+        for i in 0..n {
+            let s_h = base_h + if i < remainder { 1 } else { 0 };
+            geoms.push((current_y, s_h));
+            current_y += s_h;
+        }
+    } else {
+        let base_h = (height / n) & !1;
+        let remainder = height - base_h * n;
+        let stripes_with_extra = remainder / 2;
+        for i in 0..n {
+            let s_h = base_h + if i < stripes_with_extra { 2 } else { 0 };
+            geoms.push((current_y, s_h));
+            current_y += s_h;
+        }
+    }
+    geoms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_stripe_geometries;
+
+    fn covered(geoms: &[(usize, usize)]) -> usize {
+        geoms.iter().map(|&(_, h)| h).sum()
+    }
+
+    fn assert_contiguous(geoms: &[(usize, usize)]) {
+        let mut y = 0;
+        for &(sy, sh) in geoms {
+            assert_eq!(sy, y, "stripes must be contiguous");
+            y += sh;
+        }
+    }
+
+    #[test]
+    fn jpeg_covers_every_row_including_odd() {
+        for &h in &[1usize, 63, 720, 721, 1079, 1080, 1081] {
+            for &n in &[1usize, 2, 3, 8, 16] {
+                let g = compute_stripe_geometries(h, n, 0);
+                assert_eq!(g.len(), n);
+                assert_eq!(covered(&g), h, "JPEG must cover full height h={} n={}", h, n);
+                assert_contiguous(&g);
+            }
+        }
+    }
+
+    #[test]
+    fn h264_stripes_even_and_within_bounds() {
+        for &h in &[64usize, 720, 721, 1080, 1081] {
+            for &n in &[1usize, 2, 8] {
+                let g = compute_stripe_geometries(h, n, 1);
+                assert_eq!(g.len(), n);
+                for &(_, sh) in &g {
+                    assert_eq!(sh % 2, 0, "H.264 stripe heights must be even h={} n={}", h, n);
+                }
+                assert_contiguous(&g);
+                assert!(covered(&g) <= h);
+                assert!(h - covered(&g) <= 1, "at most one trailing odd row uncovered");
+            }
+        }
+    }
 }

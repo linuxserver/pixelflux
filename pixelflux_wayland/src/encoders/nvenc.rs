@@ -482,7 +482,9 @@ impl NvencEncoder {
                 version: NV_ENCODE_API_FUNCTION_LIST_VER,
                 ..Default::default()
             };
-            (nvenc_lib.create_instance)(&mut function_list);
+            if (nvenc_lib.create_instance)(&mut function_list) != NVENCSTATUS::NV_ENC_SUCCESS {
+                return Err("NvEncodeAPICreateInstance failed".into());
+            }
 
             let mut session_params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
                 version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
@@ -564,6 +566,9 @@ impl NvencEncoder {
             if init_fn(encoder_session, &mut init_params) != NVENCSTATUS::NV_ENC_SUCCESS {
                 return Err("Failed to initialize encoder".into());
             }
+
+            // null the pointer to the soon-to-be-moved local `config`; reconfigure repoints it.
+            init_params.encodeConfig = ptr::null_mut();
 
             let mut reg_res = NV_ENC_REGISTER_RESOURCE {
                 version: NV_ENC_REGISTER_RESOURCE_VER,
@@ -679,6 +684,7 @@ impl NvencEncoder {
     unsafe fn submit_frame(
         &mut self,
         mapped_buffer: NV_ENC_INPUT_PTR,
+        buffer_format: NV_ENC_BUFFER_FORMAT,
         frame_number: u64,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
@@ -691,7 +697,7 @@ impl NvencEncoder {
             inputHeight: self.height,
             inputBuffer: mapped_buffer,
             outputBitstream: output_bitstream,
-            bufferFmt: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFmt: buffer_format,
             pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
             encodePicFlags: if force_idr {
                 NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
@@ -700,14 +706,6 @@ impl NvencEncoder {
             },
             ..Default::default()
         };
-
-        if mapped_buffer == self.nv12_mapped_buffer.unwrap_or(ptr::null_mut()) {
-            if self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3 {
-                pic_params.bufferFmt = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444;
-            } else {
-                pic_params.bufferFmt = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
-            }
-        }
 
         let encode_fn = self.nvenc_funcs.nvEncEncodePicture.unwrap();
         let res = encode_fn(self.encoder_session, &mut pic_params);
@@ -765,8 +763,10 @@ impl NvencEncoder {
     ) -> Result<Vec<u8>, String> {
         unsafe {
             self.reconfigure_if_needed(target_qp);
-            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            // Extract fd before pushing the context so the `?` can't return with
+            // the context left pushed (stack imbalance).
             let fd = dmabuf.handles().next().ok_or("No handles")?.as_raw_fd();
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
 
             if !self.dmabuf_cache.contains_key(&fd) {
                 let stride = dmabuf.strides().next().unwrap_or(0) as i32;
@@ -870,7 +870,12 @@ impl NvencEncoder {
                 return Err("Sanitization copy failed".into());
             }
 
-            let result = self.submit_frame(self.mapped_input_buffer, frame_number, force_idr);
+            let result = self.submit_frame(
+                self.mapped_input_buffer,
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+                frame_number,
+                force_idr,
+            );
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
@@ -938,6 +943,7 @@ impl NvencEncoder {
 
                 let register_fn = self.nvenc_funcs.nvEncRegisterResource.unwrap();
                 if register_fn(self.encoder_session, &mut reg_res) != NVENCSTATUS::NV_ENC_SUCCESS {
+                    (self.cuda.cuMemFree_v2)(d_ptr);
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     return Err("Failed to register raw input buffer".into());
                 }
@@ -949,6 +955,11 @@ impl NvencEncoder {
                 };
                 let map_fn = self.nvenc_funcs.nvEncMapInputResource.unwrap();
                 if map_fn(self.encoder_session, &mut map_params) != NVENCSTATUS::NV_ENC_SUCCESS {
+                    (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
+                        self.encoder_session,
+                        reg_res.registeredResource,
+                    );
+                    (self.cuda.cuMemFree_v2)(d_ptr);
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     return Err("Failed to map raw input buffer".into());
                 }
@@ -1055,8 +1066,13 @@ impl NvencEncoder {
                 }
             }
 
+            let raw_format = if self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3 {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
+            };
             let result =
-                self.submit_frame(self.nv12_mapped_buffer.unwrap(), frame_number, force_idr);
+                self.submit_frame(self.nv12_mapped_buffer.unwrap(), raw_format, frame_number, force_idr);
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
