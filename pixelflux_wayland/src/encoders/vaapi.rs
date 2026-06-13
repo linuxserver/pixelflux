@@ -60,10 +60,15 @@ struct DmabufResources {
 }
 
 /// @brief Callback function used by FFmpeg to release custom DRM frames.
-unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, _data: *mut u8) {
+unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
     let resources = Box::from_raw(opaque as *mut DmabufResources);
     for &fd in &resources.fds {
         close(fd);
+    }
+    // Free the descriptor FFmpeg owns now (null only on the error path, where
+    // the caller frees it).
+    if !data.is_null() {
+        ff::av_free(data as *mut c_void);
     }
 }
 
@@ -116,7 +121,6 @@ pub struct VaapiEncoder {
 }
 
 unsafe impl Send for VaapiEncoder {}
-unsafe impl Sync for VaapiEncoder {}
 
 impl Drop for VaapiEncoder {
     fn drop(&mut self) {
@@ -237,6 +241,9 @@ impl VaapiEncoder {
             let aligned_height = (height + 31) & !31;
 
             let mut enc_frames_ref = ff::av_hwframe_ctx_alloc(hw_device_ctx);
+            if enc_frames_ref.is_null() {
+                return Err("Failed to allocate encoder frames ctx".into());
+            }
             let enc_frames = (*enc_frames_ref).data as *mut ff::AVHWFramesContext;
             (*enc_frames).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
             (*enc_frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
@@ -252,6 +259,9 @@ impl VaapiEncoder {
             let saved_enc_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
 
             let encoder_ctx = ff::avcodec_alloc_context3(codec);
+            if encoder_ctx.is_null() {
+                return Err("Failed to allocate encoder context".into());
+            }
             (*encoder_ctx).width = width;
             (*encoder_ctx).height = height;
             (*encoder_ctx).time_base = ff::AVRational { num: 1, den: fps };
@@ -278,10 +288,10 @@ impl VaapiEncoder {
             set_opt(&mut opts, "level", "4.1");
 
             let ret = ff::avcodec_open2(encoder_ctx, codec, &mut opts);
+            ff::av_dict_free(&mut opts);
             if ret < 0 {
                 return Err(format!("Failed to open encoder: {}", ff_err_str(ret)));
             }
-            ff::av_dict_free(&mut opts);
 
             let filter_graph = ff::avfilter_graph_alloc();
             let buffersrc = ff::avfilter_get_by_name(CString::new("buffer").unwrap().as_ptr());
@@ -294,6 +304,9 @@ impl VaapiEncoder {
                 ff::avfilter_graph_alloc_filter(filter_graph, buffersrc, name_in.as_ptr());
 
             let par = ff::av_buffersrc_parameters_alloc();
+            if par.is_null() {
+                return Err("Failed to alloc buffersrc parameters".into());
+            }
             (*par).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             (*par).hw_frames_ctx = ff::av_buffer_ref(drm_frames_ref);
             (*par).width = width;
@@ -536,6 +549,9 @@ impl VaapiEncoder {
             for (i, (handle, _)) in dmabuf.handles().zip(dmabuf.offsets()).enumerate() {
                 let fd = dup(handle.as_raw_fd());
                 if fd < 0 {
+                    for &dup_fd in &resources.fds {
+                        close(dup_fd);
+                    }
                     ff::av_free(desc_ptr as *mut c_void);
                     return Err("Failed to dup fd".into());
                 }
@@ -589,6 +605,8 @@ impl VaapiEncoder {
             (*self.video_frame).hw_frames_ctx = ff::av_buffer_ref(self.drm_frames_ctx);
 
             if ff::av_buffersrc_add_frame(self.buffersrc_ctx, self.video_frame) < 0 {
+                // add_frame doesn't take ownership on failure; release the refs.
+                ff::av_frame_unref(self.video_frame);
                 return Err("Failed to feed filter graph".into());
             }
 
@@ -650,6 +668,8 @@ impl VaapiEncoder {
             (*self.sw_frame).data[1] = nv12_pixels.as_ptr().add(width * height) as *mut u8;
             (*self.sw_frame).linesize[1] = self.width;
 
+            // get_buffer needs an empty frame; without this the prior surface leaks.
+            ff::av_frame_unref(self.hw_frame);
             if ff::av_hwframe_get_buffer((*self.encoder_ctx).hw_frames_ctx, self.hw_frame, 0) < 0 {
                 return Err("Failed to allocate HW frame for NV12 path".into());
             }
@@ -663,12 +683,11 @@ impl VaapiEncoder {
             ff::av_frame_unref(self.sw_frame);
 
             (*self.hw_frame).pts = frame_number as i64;
+            // Force keyframes via pict_type (AV_PKT_FLAG_KEY is a packet flag, not a frame flag).
             if force_idr {
                 (*self.hw_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
-                (*self.hw_frame).flags |= ff::AV_PKT_FLAG_KEY;
             } else {
                 (*self.hw_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
-                (*self.hw_frame).flags &= !ff::AV_PKT_FLAG_KEY;
             }
 
             if ff::avcodec_send_frame(self.encoder_ctx, self.hw_frame) < 0 {

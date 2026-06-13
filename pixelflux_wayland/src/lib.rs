@@ -128,9 +128,11 @@ fn get_shm_usage_bytes() -> u64 {
 }
 
 fn calculate_memory_threshold(width: i32, height: i32) -> usize {
-    let frame_size = (width * height * 4) as usize;
+    let frame_size = (width.max(0) as usize)
+        .saturating_mul(height.max(0) as usize)
+        .saturating_mul(4);
     let base_app_memory = 300 * 1024 * 1024;
-    let buffer_allowance = frame_size * 20;
+    let buffer_allowance = frame_size.saturating_mul(20);
     let min_threshold = 1536 * 1024 * 1024;
     (base_app_memory + buffer_allowance).max(min_threshold)
 }
@@ -545,6 +547,12 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         }
                     }
 
+                    // H.264 4:2:0 needs even dimensions.
+                    if settings.output_mode == 1 {
+                        settings.width &= !1;
+                        settings.height &= !1;
+                    }
+
                     state.recording_sink =
                         crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
 
@@ -583,11 +591,6 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
 
                             let pixel_count = (settings.width * settings.height) as usize;
                             state.frame_buffer = vec![0u8; pixel_count * 4];
-                            if settings.h264_fullcolor {
-                                state.nv12_buffer = vec![0u8; pixel_count * 3];
-                            } else {
-                                state.nv12_buffer = vec![0u8; pixel_count * 3 / 2];
-                            }
 
                             if state.use_gpu {
                                 if let Some(gbm) = state.gbm_device.as_mut() {
@@ -604,6 +607,18 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                     state.offscreen_buffer = Some((bo, dmabuf));
                                 }
                             }
+                        }
+
+                        // Size depends on fullcolor too, so (re)size unconditionally,
+                        // not only on a resolution change.
+                        let nv12_pixel_count = (settings.width * settings.height) as usize;
+                        let nv12_needed = if settings.h264_fullcolor {
+                            nv12_pixel_count * 3
+                        } else {
+                            nv12_pixel_count * 3 / 2
+                        };
+                        if state.nv12_buffer.len() != nv12_needed {
+                            state.nv12_buffer = vec![0u8; nv12_needed];
                         }
 
                         for window in state.space.elements() {
@@ -834,7 +849,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     let serial = next_serial();
                     let time = wayland_time();
                     if let Some(keyboard) = state.seat.get_keyboard() {
-                        keyboard.input(state, Keycode::new(scancode), key_state, serial, time, |_, _, _| {
+                        // scancode is an evdev keycode; xkb/smithay want X11 keycodes (evdev + 8).
+                        keyboard.input(state, Keycode::new(scancode.saturating_add(8)), key_state, serial, time, |_, _, _| {
                             FilterResult::<()>::Forward
                         });
                     }
@@ -956,7 +972,14 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                 }
                             }
                         }
-                        pointer.button(state, &ButtonEvent { button: btn, state: button_state, serial, time });
+                        // Map documented X11 button numbers (1=L,2=M,3=R) to evdev BTN_ codes.
+                        let button = match btn {
+                            1 => 0x110,
+                            2 => 0x112,
+                            3 => 0x111,
+                            other => other,
+                        };
+                        pointer.button(state, &ButtonEvent { button, state: button_state, serial, time });
                         pointer.frame(state);
                     }
                 }
@@ -1272,12 +1295,9 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if needs_readback {
-                                        let (read_w, read_h) = if is_memory_throttling {
-                                            (1, 1)
-                                        } else {
-                                            (width, height)
-                                        };
-                                        
+                                        // Throttling skips readback entirely, so this is always full-size.
+                                        let (read_w, read_h) = (width, height);
+
                                         if !is_memory_throttling {
                                             let _ = renderer.with_context(|gl| unsafe {
                                                 gl.ReadPixels(
@@ -1586,10 +1606,10 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             send_frame = true;
                         }
 
-                        if is_dirty || state.encoded_frame_count == 0 {
+                        if is_dirty || state.frame_counter == 0 {
                             send_frame = true;
                             
-                            if state.encoded_frame_count == 0 {
+                            if state.frame_counter == 0 {
                                 force_idr = true;
                             }
 
@@ -1600,7 +1620,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                         } else if !send_frame {
                             st.no_motion_frame_count += 1;
 
-                            if use_paint_over && st.no_motion_frame_count >= trigger_frames && !st.paint_over_sent {
+                            if use_paint_over && st.no_motion_frame_count >= trigger_frames && !st.paint_over_sent && paint_qp < normal_qp {
                                 send_frame = true;
                                 st.paint_over_sent = true;
                                 force_idr = true;
@@ -1692,7 +1712,8 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 }
             }
             let work_elapsed = loop_start_time.elapsed();
-            let fps = if is_memory_throttling { 5.0 } else { state.settings.target_fps };
+            // Clamp to a positive, finite fps; Duration::from_secs_f64 panics on inf/negative.
+            let fps = (if is_memory_throttling { 5.0 } else { state.settings.target_fps }).max(1.0);
             let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
             let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };

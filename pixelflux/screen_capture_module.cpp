@@ -960,6 +960,7 @@ public:
    * encoded frame to be an IDR frame in the appropriate encoder backend.
    */
   void request_idr() {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (debug_logging) {
       const char* backend = use_cpu ? "CPU" : (nvenc_operational ? "NVENC" : (vaapi_operational ? "VAAPI" : "None"));
       std::cout << "[pixelflux] Request IDR -> " << backend << std::endl;
@@ -976,13 +977,13 @@ public:
    * @param bitrate The new target bitrate in kbps.
    */
   void update_video_bitrate(int bitrate) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (!h264_cbr_mode) return;
 
     if (debug_logging) {
       std::cout << "[pixelflux] Updating video bitrate from " << h264_bitrate_kbps << " to " << bitrate << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     h264_bitrate_kbps = static_cast<int>(std::abs(bitrate));
   }
 
@@ -992,13 +993,13 @@ public:
    * @param vbv_buffer_size_kb The new VBV buffer size in kb
    */
   void update_vbv_buffer_size(int vbv_buffer_size_kb) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (!h264_cbr_mode) return;
 
     if (debug_logging) {
       std::cout << "[pixelflux] Updating VBV buffer size from " << h264_vbv_buffer_size_kb << " to " << vbv_buffer_size_kb << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     h264_vbv_buffer_size_kb = static_cast<int>(std::abs(vbv_buffer_size_kb));
   }
 
@@ -1008,11 +1009,11 @@ public:
    * @param fps The new target frames per second.
    */
   void update_framerate(double fps) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
     if (debug_logging) {
       std::cout << "[pixelflux] Updating video framerate from " << target_fps << " to " << fps << std::endl;
     }
-     
-    std::lock_guard<std::mutex> lock(settings_mutex);
+
     target_fps = static_cast<double>(std::abs(fps));
   }
 };
@@ -2095,7 +2096,7 @@ void ScreenCaptureModule::capture_loop() {
     }
 
     std::chrono::duration < double > target_frame_duration_seconds =
-      std::chrono::duration < double > (1.0 / local_current_target_fps);
+      std::chrono::duration < double > (1.0 / (local_current_target_fps > 0.0 ? local_current_target_fps : 1.0));
 
     auto next_frame_time =
       std::chrono::high_resolution_clock::now() + target_frame_duration_seconds;
@@ -2368,6 +2369,11 @@ void ScreenCaptureModule::capture_loop() {
       auto intended_current_frame_time = next_frame_time;
       next_frame_time += target_frame_duration_seconds;
 
+      // Re-anchor if we fell behind, so lateness can't accumulate into a burst.
+      if (next_frame_time < current_loop_iter_start_time) {
+        next_frame_time = current_loop_iter_start_time + target_frame_duration_seconds;
+      }
+
       int old_w = local_capture_width_actual;
       int old_h = local_capture_height_actual;
       bool yuv_config_changed = false;
@@ -2382,7 +2388,7 @@ void ScreenCaptureModule::capture_loop() {
 
         if (local_current_target_fps != target_fps) {
           local_current_target_fps = target_fps;
-          target_frame_duration_seconds = std::chrono::duration < double > (1.0 / local_current_target_fps);
+          target_frame_duration_seconds = std::chrono::duration < double > (1.0 / (local_current_target_fps > 0.0 ? local_current_target_fps : 1.0));
           next_frame_time = intended_current_frame_time + target_frame_duration_seconds;
         }
         local_current_jpeg_quality = jpeg_quality;
@@ -2479,6 +2485,12 @@ void ScreenCaptureModule::capture_loop() {
         }
       }
 
+      // H.264 4:2:0 needs even dimensions; clamp before SHM/plane (re)allocation.
+      if (local_current_output_mode == OutputMode::H264) {
+        local_capture_width_actual &= ~1;
+        local_capture_height_actual &= ~1;
+      }
+
       if (old_w != local_capture_width_actual || old_h != local_capture_height_actual ||
           yuv_config_changed) {
         std::cout << "Capture parameters changed. Re-initializing XShm and YUV planes."
@@ -2532,8 +2544,9 @@ void ScreenCaptureModule::capture_loop() {
 
         this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
         if (local_current_output_mode == OutputMode::H264) {
-            bool use_nv12_planes = !local_use_cpu && this->is_nvidia_system_detected && local_current_h264_fullframe && !local_current_h264_fullcolor;
-            
+            bool use_nv12_planes = !local_use_cpu && local_current_h264_fullframe && !local_current_h264_fullcolor &&
+                           ((this->is_nvidia_system_detected && local_vaapi_render_node_index < 0) || (local_vaapi_render_node_index >= 0));
+
             size_t y_plane_size = static_cast<size_t>(local_capture_width_actual) *
                                   local_capture_height_actual;
             full_frame_y_plane_.assign(y_plane_size, 0);
@@ -2707,6 +2720,17 @@ void ScreenCaptureModule::capture_loop() {
                                    full_frame_v_plane_.data(), full_frame_v_stride_,
                                    local_capture_width_actual, local_capture_height_actual);
             } else {
+                // A runtime HW-encoder fallback can leave NV12-sized planes (empty V)
+                // while we take the I420 path; re-size to I420 before converting.
+                if (full_frame_v_plane_.empty()) {
+                    size_t chroma_plane_size =
+                        (static_cast<size_t>(local_capture_width_actual) / 2) *
+                        (static_cast<size_t>(local_capture_height_actual) / 2);
+                    full_frame_u_plane_.assign(chroma_plane_size, 0);
+                    full_frame_v_plane_.assign(chroma_plane_size, 0);
+                    full_frame_u_stride_ = local_capture_width_actual / 2;
+                    full_frame_v_stride_ = local_capture_width_actual / 2;
+                }
                 libyuv::ARGBToI420(shm_data_ptr, shm_stride_bytes,
                                    full_frame_y_plane_.data(), full_frame_y_stride_,
                                    full_frame_u_plane_.data(), full_frame_u_stride_,
@@ -3273,7 +3297,7 @@ StripeEncodeResult encode_stripe_jpeg(
   result.frame_id = frame_counter;
 
   if (!shm_data_base || stripe_height <= 0 || capture_width_actual <= 0 ||
-      shm_bytes_per_pixel <= 0) {
+      (shm_bytes_per_pixel != 3 && shm_bytes_per_pixel != 4)) {
     std::cerr << "JPEG T" << thread_id
               << ": Invalid input for JPEG encoding from SHM." << std::endl;
     result.type = StripeDataType::UNKNOWN;

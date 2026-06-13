@@ -1,10 +1,12 @@
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use crossbeam_channel::{bounded, Sender, TrySendError};
 
 /// Core settings and state for the out-of-band H.264 recording sink.
 ///
@@ -16,9 +18,17 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const RECORDING_SOCKET_ENV: &str = "PIXELFLUX_RECORDING_SOCKET";
 const DEFAULT_KEYINT_FRAMES: u32 = 60;
 
+/// Per-client buffered-frame cap; a client that exceeds it is dropped as too slow.
+const CLIENT_QUEUE_CAP: usize = 256;
+
+/// A connected client; bytes are drained to its socket by a dedicated thread.
+struct ClientHandle {
+    tx: Sender<Arc<Vec<u8>>>,
+}
+
 pub struct RecordingSink {
     path: String,
-    clients: Arc<Mutex<Vec<UnixStream>>>,
+    clients: Arc<Mutex<Vec<ClientHandle>>>,
     shutdown: Arc<AtomicBool>,
     frames_since_idr: Arc<AtomicU32>,
     keyint_frames: u32,
@@ -58,7 +68,7 @@ impl RecordingSink {
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
 
-        let clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let clients: Arc<Mutex<Vec<ClientHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let frames_since_idr = Arc::new(AtomicU32::new(u32::MAX));
@@ -77,8 +87,20 @@ impl RecordingSink {
                             eprintln!("[recording_sink] set_write_timeout failed: {:?}", e);
                             continue;
                         }
+
+                        // Writer thread owns the stream; exits when tx drops or a write fails.
+                        let (tx, rx) = bounded::<Arc<Vec<u8>>>(CLIENT_QUEUE_CAP);
+                        thread::spawn(move || {
+                            let mut stream = stream;
+                            for buf in rx.iter() {
+                                if stream.write_all(&buf).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
                         let mut guard = clients_acc.lock().unwrap();
-                        guard.push(stream);
+                        guard.push(ClientHandle { tx });
 
                         frames_since_idr_acc.store(u32::MAX, Ordering::Relaxed);
                         eprintln!(
@@ -112,7 +134,7 @@ impl RecordingSink {
     /// @return True if the next frame should be a keyframe.
     pub fn should_force_idr(&self) -> bool {
         let prev = self.frames_since_idr.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.keyint_frames - 1 {
+        if idr_due(prev, self.keyint_frames) {
             self.frames_since_idr.store(0, Ordering::Relaxed);
             true
         } else {
@@ -120,7 +142,10 @@ impl RecordingSink {
         }
     }
 
-    /// @brief Fans a chunk of encoded bytes out to every connected client.
+    /// @brief Fans encoded bytes out to every client without blocking the caller.
+    ///
+    /// Bytes go to each client's bounded queue; a full (too slow) or disconnected
+    /// client is dropped.
     ///
     /// @input data: The raw Annex-B H.264 byte slice.
     pub fn write_frame(&self, data: &[u8]) {
@@ -128,13 +153,23 @@ impl RecordingSink {
             return;
         }
 
+        // One copy, shared across clients via Arc.
+        let buf = Arc::new(data.to_vec());
+
         let mut clients = self.clients.lock().unwrap();
         let mut to_remove: Vec<usize> = Vec::new();
 
-        for (idx, client) in clients.iter_mut().enumerate() {
-            if let Err(e) = client.write_all(data) {
-                eprintln!("[recording_sink] dropping client (idx {}): {:?}", idx, e);
-                to_remove.push(idx);
+        for (idx, client) in clients.iter().enumerate() {
+            match client.tx.try_send(buf.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    eprintln!("[recording_sink] dropping slow client (idx {})", idx);
+                    to_remove.push(idx);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    eprintln!("[recording_sink] dropping disconnected client (idx {})", idx);
+                    to_remove.push(idx);
+                }
             }
         }
 
@@ -148,5 +183,38 @@ impl Drop for RecordingSink {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// True when a keyframe is due. saturating_sub avoids underflow if keyint is 0.
+fn idr_due(frames_since_idr: u32, keyint_frames: u32) -> bool {
+    frames_since_idr >= keyint_frames.saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idr_due;
+
+    #[test]
+    fn first_frame_forces_idr() {
+        // frames_since_idr is initialized to u32::MAX, so the first call is due.
+        assert!(idr_due(u32::MAX, 60));
+    }
+
+    #[test]
+    fn cadence_matches_keyint() {
+        let keyint = 60;
+        assert!(!idr_due(0, keyint));
+        assert!(!idr_due(58, keyint));
+        assert!(idr_due(59, keyint));
+        assert!(idr_due(60, keyint));
+    }
+
+    #[test]
+    fn keyint_zero_and_one_do_not_underflow() {
+        assert!(idr_due(0, 0));
+        assert!(idr_due(u32::MAX, 0));
+        assert!(idr_due(0, 1));
+        assert!(idr_due(1, 1));
     }
 }
