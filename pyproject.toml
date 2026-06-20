@@ -6,6 +6,11 @@ build-backend = "setuptools.build_meta"
 archs = [ "x86_64", "aarch64" ]
 manylinux-x86_64-image = "manylinux_2_34"
 manylinux-aarch64-image = "manylinux_2_34"
+# Build CPython 3.9-3.14 only. Skip free-threaded (cp3XXt) builds: _capture is a
+# full-API (GIL) extension, not a free-threaded one. Skip PyPy (no C-API ext).
+# musllinux is kept (the Alpine `before-all` branch below provisions it).
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*t-* pp*"
 
 [tool.cibuildwheel.environment]
 LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"
@@ -72,7 +77,7 @@ before-all = """
             make install) && \
         \
         (cd /tmp && \
-            git clone --branch n8.0 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
+            git clone --branch n8.1 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
             cd ffmpeg && \
             ./configure \
                 --prefix=/usr/local \
@@ -89,6 +94,8 @@ before-all = """
         ldconfig
 
     # --- ALPINE (APK-based) ---
+    # NOTE: ffmpeg-dev must be >= 8.1 (the Rust ext's ffmpeg-next 8.1.0 needs
+    # FFmpeg 8.1 symbols). manylinux_2_34's Alpine ships 8.x; pin a newer base if not.
     elif command -v apk; then
         apk add --no-cache \
             build-base \

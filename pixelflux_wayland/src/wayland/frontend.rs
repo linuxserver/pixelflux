@@ -201,9 +201,14 @@ pub struct AppState {
     // Set by ThreadCommand::RequestIdr (client reconnect / decoder reset),
     // consumed once on the next captured frame to force an immediate keyframe.
     pub pending_force_idr: bool,
-    // Keysyms for which inject_keysym synthesized a Shift press on key-down, so the
-    // matching key-up can release it (inject_keysym runs once per up/down).
-    pub synthetic_shift_keysyms: std::collections::HashSet<u32>,
+    // Keycodes injected on key-down by inject_keysym, recorded so the matching key-up
+    // releases the SAME keycodes (and synthetic modifiers) even if the xkb layout changed
+    // mid-keystroke. Maps keysym -> (main keycode, modifier keycodes used: Shift and/or AltGr).
+    pub synthetic_shift_keysyms: std::collections::HashMap<u32, (u32, Vec<u32>)>,
+    // Ref-count of currently-held synthetic modifier keycodes (Shift_L / ISO_Level3_Shift)
+    // so a modifier is released only when the LAST keysym using it is released (releasing one
+    // of two simultaneously-held shifted/AltGr keys must not drop the modifier for the other).
+    pub synthetic_mod_refcounts: std::collections::HashMap<u32, u32>,
     pub use_gpu: bool,
 
     pub video_encoder: Option<GpuEncoder>,
@@ -647,7 +652,7 @@ impl AppState {
                                      } else {
                                          if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
                                              let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
-                                             let stride_usize = (width * 4) as usize;
+                                             let stride_usize = rgba_readback_stride(raw_bytes.len(), height as usize, width as usize);
                                              
                                              for y in 0..(height as u32) {
                                                  for x in 0..(width as u32) {
@@ -693,8 +698,7 @@ impl AppState {
             };
 
             if !data.is_empty() || msg_type == "hide" || msg_type == "surface" {
-                #[allow(deprecated)]
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let py_bytes = PyBytes::new(py, &data);
                     let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
                 });
@@ -1403,3 +1407,65 @@ delegate_viewporter!(AppState);
 delegate_presentation!(AppState);
 delegate_xdg_activation!(AppState);
 delegate_primary_selection!(AppState);
+
+/// Row stride (bytes) of a tightly-mapped RGBA8 GPU readback. Derived from the mapping
+/// length rather than assuming width*4, so a padded readback can't skew the cursor image;
+/// never returns less than one full row.
+fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
+    let row = width.saturating_mul(4);
+    if height == 0 {
+        return row;
+    }
+    (buf_len / height).max(row)
+}
+
+#[cfg(test)]
+mod stride_tests {
+    use super::rgba_readback_stride;
+
+    #[test]
+    fn packed_readback_is_width_times_four() {
+        assert_eq!(rgba_readback_stride(64 * 4 * 48, 48, 64), 64 * 4);
+        assert_eq!(rgba_readback_stride(3 * 4 * 2, 2, 3), 12);
+    }
+
+    #[test]
+    fn padded_readback_recovers_real_stride() {
+        let (w, h, pad) = (3usize, 2usize, 4usize);
+        let stride = w * 4 + pad;
+        assert_eq!(rgba_readback_stride(stride * h, h, w), stride);
+    }
+
+    #[test]
+    fn padded_extraction_has_no_skew() {
+        let (w, h) = (3usize, 2usize);
+        let stride = 16usize; // w*4 == 12, padded to 16
+        let mut buf = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                buf[o] = x as u8 + 1;
+                buf[o + 1] = y as u8 + 1;
+            }
+        }
+        let s = rgba_readback_stride(buf.len(), h, w);
+        assert_eq!(s, stride);
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * s + x * 4;
+                assert_eq!(buf[o], x as u8 + 1);
+                assert_eq!(buf[o + 1], y as u8 + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_height_no_divide_by_zero() {
+        assert_eq!(rgba_readback_stride(0, 0, 10), 40);
+    }
+
+    #[test]
+    fn truncated_buffer_keeps_full_row() {
+        assert_eq!(rgba_readback_stride(10, 5, 64), 64 * 4);
+    }
+}

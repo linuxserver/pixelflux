@@ -25,8 +25,14 @@ libloading = "0.8"
 libva-sys = "0.1.2"
 xcursor = "0.3.1"
 image = "=0.25.9"
-ffmpeg-next = "8.0"
-ffmpeg-sys-next = "8.0"
+# Pinned EXACT (not caret "8.0", which would float to a future 8.2 that may
+# break). Each ffmpeg-next minor tracks ONE FFmpeg release: 8.0.0 needs FFmpeg
+# 7.x (FF_PROFILE_* names), 8.1.0 needs FFmpeg 8.1 (AV_PROFILE_*, JPEGXS,
+# AV_PKT_DATA_EXIF). Build REQUIRES FFmpeg 8.1: point PKG_CONFIG_PATH at an env
+# providing it (conda `flux` has 8.1.2; the cibuildwheel before-all must build
+# n8.1, not n8.0). Verified: 8.1.0 compiles clean against FFmpeg 8.1.2.
+ffmpeg-next = "=8.1.0"
+ffmpeg-sys-next = "=8.1.0"
 
 [dependencies.nvenc-sys]
 git = "https://github.com/legion-labs/nvenc-sys"

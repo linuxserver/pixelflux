@@ -118,6 +118,7 @@ pub struct VaapiEncoder {
     qp_hysteresis_counter: u32,
 
     recording_sink: Option<Arc<RecordingSink>>,
+    omit_stripe_headers: bool,
 }
 
 unsafe impl Send for VaapiEncoder {}
@@ -494,6 +495,7 @@ impl VaapiEncoder {
                 current_qp: settings.h264_crf as u32,
                 qp_hysteresis_counter: 0,
                 recording_sink,
+                omit_stripe_headers: settings.omit_stripe_headers,
             })
         }
     }
@@ -578,13 +580,16 @@ impl VaapiEncoder {
             let data = (*self.packet).data;
             let is_key = ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0;
 
-            output.reserve(10 + size);
-            output.push(0x04);
-            output.push(if is_key { 0x01 } else { 0x00 });
-            output.extend_from_slice(&(frame_number as u16).to_be_bytes());
-            output.extend_from_slice(&0u16.to_be_bytes());
-            output.extend_from_slice(&(self.width as u16).to_be_bytes());
-            output.extend_from_slice(&(self.height as u16).to_be_bytes());
+            let header_sz = if self.omit_stripe_headers { 0 } else { 10 };
+            output.reserve(header_sz + size);
+            if !self.omit_stripe_headers {
+                output.push(0x04);
+                output.push(if is_key { 0x01 } else { 0x00 });
+                output.extend_from_slice(&(frame_number as u16).to_be_bytes());
+                output.extend_from_slice(&0u16.to_be_bytes());
+                output.extend_from_slice(&(self.width as u16).to_be_bytes());
+                output.extend_from_slice(&(self.height as u16).to_be_bytes());
+            }
 
             let slice = std::slice::from_raw_parts(data, size);
             output.extend_from_slice(slice);

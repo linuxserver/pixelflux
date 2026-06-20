@@ -161,8 +161,9 @@ settings.vaapi_render_node_path = None
 # False (default): prepend the per-stripe header to each packet (the WebSocket path).
 # True: emit the raw encoded payload with no header (for a WebRTC path that frames itself).
 settings.omit_stripe_headers = False
-# Hand the encoded buffer's ownership to Python instead of freeing it in the C callback,
-# enabling the zero-copy OwnedFrame interface (see below). Python 3.12+ only.
+# Deprecated/ignored: the native frame handed to your callback always owns its buffer
+# (zero-copy on every Python version, see below), so this flag no longer has any effect.
+# Kept only for backward compatibility.
 settings.deferred_free = False
 
 # --- Change Detection & Optimization ---
@@ -204,55 +205,39 @@ capture.inject_key(scancode=17, state=1)
 
 ### Stripe Callback
 
-Your callback receives a `ctypes.POINTER(StripeEncodeResult)`.
+Your callback receives a single **frame object** (`StripeFrame` on X11, `WaylandFrame` on
+Wayland). Both support the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)`
+— and expose the stripe metadata as attributes:
 
 ```python
-def my_callback(result_ptr, user_data):
-    result = result_ptr.contents
-    
-    # Access data
-    # result.type (0=H264, 1=JPEG)
-    # result.frame_id
-    # result.stripe_y_start
-    
-    # Copy data to Python bytes
-    encoded_data = ctypes.string_at(result.data, result.size)
-    
-    # Send encoded_data to client...
+def my_callback(frame):
+    # frame.data_type      (0=Unknown, 1=JPEG, 2=H.264)
+    # frame.frame_id
+    # frame.stripe_y_start
+    # frame.stripe_height
+    encoded_data = bytes(frame)          # copy out, or use memoryview(frame) zero-copy (below)
+    # Send encoded_data to the client...
 ```
 
-### Zero-Copy Frames (`OwnedFrame`, X11)
+### Zero-Copy Frames
 
-By default the C++ callback frees each encoded buffer as soon as your callback returns, so you
-must copy the data out (e.g. `ctypes.string_at`) before sending it asynchronously. On
-**Python 3.12+** you can avoid that copy: set `deferred_free = True` and take ownership of the
-buffer with `OwnedFrame`. The buffer is then freed exactly once, when the `OwnedFrame` is
-finalized, and its `memoryview()` can be handed straight to an async socket with no copy.
-
-`OwnedFrame` is a [PEP 688](https://peps.python.org/pep-0688/) buffer exporter, so the underlying
-C buffer stays alive until every consumer — including a transport that retained a slice during a
-partial write — has released its view, making the zero-copy hand-off memory-safe.
+`memoryview(frame)` aliases the native encoder buffer with **no copy**, on **every supported
+Python version (3.9–3.14)**. The frame object owns its buffer and keeps it alive until every
+consumer — including a transport that retained a slice during a partial write — has released its
+view, so the hand-off is memory-safe. (The old `deferred_free` / `OwnedFrame` / PEP 688 /
+Python-3.12-only path is gone; the native buffer protocol does this on all versions.) Hand the
+view straight to an async socket; keep the frame referenced for the duration of the send.
 
 ```python
-from pixelflux import OwnedFrame
-
-settings.deferred_free = True  # Python 3.12+ only
-
-def my_callback(result_ptr, user_data):
-    # Take ownership FIRST, before any step that can fail or early-return.
-    owner = OwnedFrame.take(result_ptr)   # None if there is no data
-    if owner is None:
+def my_callback(frame):
+    if frame.data_type == 0 or len(frame) == 0:   # nothing to send
         return
-    # Keep `owner` referenced for the whole send; its memoryview is zero-copy. Hand BOTH
-    # the view and the owner to your sender (e.g. an asyncio.Queue) so the OwnedFrame
-    # outlives the send and the buffer is freed only after the view is released.
-    queue.put_nowait({"data": owner.memoryview(), "owner": owner})
+    # Hand BOTH the view and the frame to your sender (e.g. an asyncio.Queue) so the buffer
+    # outlives the send: the view pins the frame, which frees the buffer once the view drops.
+    queue.put_nowait({"data": memoryview(frame), "owner": frame})
 ```
 
-On Python < 3.12 there is no buffer-protocol hook, so `memoryview()` does not keep the
-`OwnedFrame` alive; keep it referenced yourself or fall back to a copy. See
-`example/screen_to_browser.py` for a complete queue-based usage that mixes the zero-copy H.264
-path with a copying JPEG path.
+See `example/screen_to_browser.py` for a complete queue-based usage.
 
 ## Zero-Copy Pipeline (Wayland)
 
@@ -343,7 +328,7 @@ pip install "cuda-toolkit[nvrtc]==11.8.*"   # CUDA 11 (Kepler and older / driver
     *   **Software:** libx264 (H.264, incl. 4:4:4) and libjpeg-turbo (JPEG) with multi-threaded striping.
     *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, multi-GPU containers, optional CUDA conversion) and VA-API (Intel/AMD) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via `SELKIES_AUTO_GPU`.
-*   **Zero-Copy Frames (X11):** `deferred_free` + `OwnedFrame` hand the encoded buffer to Python with no C→Python copy (Python 3.12+).
+*   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**
     *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
     *   **Paint-Over:** Automatically improves quality for static regions.

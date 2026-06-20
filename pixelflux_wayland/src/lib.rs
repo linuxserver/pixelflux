@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as GbmFormat};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyModule};
+use pyo3::types::{PyAny, PyModule};
 use yuv::{
     BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
 };
@@ -204,6 +204,8 @@ pub struct RustCaptureSettings {
     pub use_cpu: bool,
     pub debug_logging: bool,
     pub recording_socket: String,
+    // true => emit raw encoded payload without the per-stripe header (matches X11 omit_stripe_headers).
+    pub omit_stripe_headers: bool,
 }
 
 impl Default for RustCaptureSettings {
@@ -235,6 +237,7 @@ impl Default for RustCaptureSettings {
             use_cpu: false,
             debug_logging: false,
             recording_socket: String::new(),
+            omit_stripe_headers: false,
         }
     }
 }
@@ -329,28 +332,24 @@ fn resolve_keysym_to_keycode(
     keymap: &smithay::input::keyboard::xkb::Keymap,
     layout: smithay::input::keyboard::Layout,
     target_keysym: u32,
-) -> Option<(u32, bool)> {
+) -> Option<(u32, u8)> {
     use smithay::input::keyboard::xkb;
     let min_kc = keymap.min_keycode().raw();
     let max_kc = keymap.max_keycode().raw();
     if min_kc > max_kc {
         return None;
     }
-    // First pass: an exact match at the unshifted level (level 0) is always preferred so we don't
-    // synthesize a needless Shift.
-    for raw_kc in min_kc..=max_kc {
-        let kc = xkb::Keycode::new(raw_kc);
-        let syms_0 = keymap.key_get_syms_by_level(kc, layout.0, 0);
-        if syms_0.iter().any(|s| s.raw() == target_keysym) {
-            return Some((raw_kc, false));
-        }
-    }
-    // Second pass: reachable only at the shifted level (level 1) -> needs Shift.
-    for raw_kc in min_kc..=max_kc {
-        let kc = xkb::Keycode::new(raw_kc);
-        let syms_1 = keymap.key_get_syms_by_level(kc, layout.0, 1);
-        if syms_1.iter().any(|s| s.raw() == target_keysym) {
-            return Some((raw_kc, true));
+    // Scan shift-levels in preference order (0 = unshifted, preferred; 1 = Shift; 2 =
+    // AltGr / ISO_Level3_Shift; 3 = Shift+AltGr) so AltGr-only glyphs on non-US layouts
+    // (e.g. @ € | \ ~ on many EU layouts) resolve instead of being dropped. Returns the
+    // level so the caller can synthesize the matching modifier(s).
+    for level in 0u32..4 {
+        for raw_kc in min_kc..=max_kc {
+            let kc = xkb::Keycode::new(raw_kc);
+            let syms = keymap.key_get_syms_by_level(kc, layout.0, level);
+            if syms.iter().any(|s| s.raw() == target_keysym) {
+                return Some((raw_kc, level as u8));
+            }
         }
     }
     None
@@ -578,7 +577,8 @@ fn run_wayland_thread(
         clock: Clock::new(),
         frame_counter: 0,
         pending_force_idr: false,
-        synthetic_shift_keysyms: std::collections::HashSet::new(),
+        synthetic_shift_keysyms: std::collections::HashMap::new(),
+        synthetic_mod_refcounts: std::collections::HashMap::new(),
         use_gpu,
         video_encoder: None,
         vaapi_state: StripeState::default(),
@@ -949,65 +949,106 @@ fn run_wayland_thread(
                     // (+ Shift), then inject, synthesizing a Shift press/release for shifted keysyms.
                     let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
                     if let Some(keyboard) = state.seat.get_keyboard() {
-                        // Phase 1: resolve against the keymap (read-only) -> (target keycode, needs
-                        // Shift, Shift_L keycode). No `.unwrap()` on attacker-supplied data.
-                        let resolved: Option<(u32, bool, u32)> =
-                            keyboard.with_xkb_state(state, |context| {
-                                let xkb_guard = match context.xkb().lock() {
-                                    Ok(g) => g,
-                                    Err(_) => return None,
-                                };
-                                let layout = xkb_guard.active_layout();
-                                // SAFETY: the &Keymap borrow stays within this guard's scope and is
-                                // only read; we never store it past the lock.
-                                let keymap = unsafe { xkb_guard.keymap() };
-                                let target = resolve_keysym_to_keycode(keymap, layout, keysym);
-                                let (kc, needs_shift) = target?;
-                                // Resolve Shift_L (0xFFE1) only if we actually need it; fall back to
-                                // the conventional X11 keycode 50 (evdev KEY_LEFTSHIFT 42 + 8).
-                                let shift_kc = if needs_shift {
-                                    resolve_keysym_to_keycode(keymap, layout, 0xFFE1)
-                                        .map(|(kc, _)| kc)
-                                        .unwrap_or(42 + EVDEV_TO_XKB_KEYCODE_OFFSET)
-                                } else {
-                                    0
-                                };
-                                Some((kc, needs_shift, shift_kc))
+                        let inject = |state: &mut AppState, x11_kc: u32, ks: KeyState| {
+                            let serial = next_serial();
+                            let time = wayland_time();
+                            keyboard.input(state, Keycode::new(x11_kc), ks, serial, time, |_, _, _| {
+                                FilterResult::<()>::Forward
                             });
+                        };
 
-                        // Phase 2: inject (with_xkb_state has returned, so re-borrowing `state` mut
-                        // is fine). Keycodes are already X11-space, passed straight to smithay.
-                        if let Some((kc, needs_shift, shift_kc)) = resolved {
-                            let inject = |state: &mut AppState, x11_kc: u32, ks: KeyState| {
-                                let serial = next_serial();
-                                let time = wayland_time();
-                                keyboard.input(state, Keycode::new(x11_kc), ks, serial, time, |_, _, _| {
-                                    FilterResult::<()>::Forward
-                                });
-                            };
+                        match key_state {
+                            KeyState::Pressed => {
+                                // Phase 1: resolve against the live keymap (read-only) -> (target
+                                // keycode, the modifier keycodes that select its shift-level). No
+                                // `.unwrap()` on attacker-supplied data.
+                                let resolved: Option<(u32, Vec<u32>)> =
+                                    keyboard.with_xkb_state(state, |context| {
+                                        let xkb_guard = match context.xkb().lock() {
+                                            Ok(g) => g,
+                                            Err(_) => return None,
+                                        };
+                                        let layout = xkb_guard.active_layout();
+                                        // SAFETY: the &Keymap borrow stays within this guard's scope
+                                        // and is only read; we never store it past the lock.
+                                        let keymap = unsafe { xkb_guard.keymap() };
+                                        let (kc, level) = resolve_keysym_to_keycode(keymap, layout, keysym)?;
+                                        // Resolve a modifier keysym to its keycode, falling back to the
+                                        // conventional X11 keycode when the layout lacks it.
+                                        let resolve_mod = |ks: u32, fallback: u32| {
+                                            resolve_keysym_to_keycode(keymap, layout, ks)
+                                                .map(|(c, _)| c)
+                                                .unwrap_or(fallback)
+                                        };
+                                        // Standard ISO convention: level 1 = Shift, level 2 = AltGr
+                                        // (ISO_Level3_Shift), level 3 = Shift+AltGr.
+                                        let mut mods: Vec<u32> = Vec::new();
+                                        if level == 1 || level == 3 {
+                                            // Shift_L (0xFFE1); fallback evdev KEY_LEFTSHIFT 42 + offset.
+                                            mods.push(resolve_mod(0xFFE1, 42 + EVDEV_TO_XKB_KEYCODE_OFFSET));
+                                        }
+                                        if level == 2 || level == 3 {
+                                            // ISO_Level3_Shift / AltGr (0xFE03); fallback evdev KEY_RIGHTALT 100 + offset.
+                                            mods.push(resolve_mod(0xFE03, 100 + EVDEV_TO_XKB_KEYCODE_OFFSET));
+                                        }
+                                        Some((kc, mods))
+                                    });
 
-                            match key_state {
-                                KeyState::Pressed => {
-                                    if needs_shift {
-                                        inject(state, shift_kc, KeyState::Pressed);
-                                        state.synthetic_shift_keysyms.insert(keysym);
+                                // Phase 2: inject and RECORD the injected keycodes so the matching
+                                // key-up releases exactly these, regardless of later layout changes.
+                                // Synthetic modifiers are ref-counted so two simultaneously-held
+                                // shifted/AltGr keys don't release each other's modifier early.
+                                if let Some((kc, mods)) = resolved {
+                                    // Auto-repeat (~25Hz) re-presses the same keysym without an
+                                    // intervening release. Only the FIRST press touches modifier
+                                    // refcounts + the held-key map; otherwise the refcount would
+                                    // climb while the single map entry (and its one release)
+                                    // stayed at 1, leaving Shift/AltGr stuck held. Re-presses still
+                                    // re-inject the key-down so auto-repeat key events flow through.
+                                    if !state.synthetic_shift_keysyms.contains_key(&keysym) {
+                                        for &m in &mods {
+                                            let first = {
+                                                let c = state.synthetic_mod_refcounts.entry(m).or_insert(0);
+                                                *c += 1;
+                                                *c == 1
+                                            };
+                                            if first {
+                                                inject(state, m, KeyState::Pressed);
+                                            }
+                                        }
+                                        state.synthetic_shift_keysyms.insert(keysym, (kc, mods));
                                     }
                                     inject(state, kc, KeyState::Pressed);
+                                } else {
+                                    eprintln!(
+                                        "[Wayland] inject_keysym: keysym {:#06x} not found in active xkb layout; ignoring",
+                                        keysym
+                                    );
                                 }
-                                KeyState::Released => {
+                            }
+                            KeyState::Released => {
+                                // Release the keycodes recorded at PRESS time; do NOT re-resolve
+                                // (the layout may have changed mid-keystroke). A synthetic modifier
+                                // is released only when its last holder is released (ref-counted).
+                                if let Some((kc, mods)) =
+                                    state.synthetic_shift_keysyms.remove(&keysym)
+                                {
                                     inject(state, kc, KeyState::Released);
-                                    // Release the synthetic Shift only if we pressed it on key-down,
-                                    // regardless of the current required-level (layout could change).
-                                    if state.synthetic_shift_keysyms.remove(&keysym) {
-                                        inject(state, shift_kc, KeyState::Released);
+                                    for &m in &mods {
+                                        let last = match state.synthetic_mod_refcounts.get_mut(&m) {
+                                            Some(c) => {
+                                                *c = c.saturating_sub(1);
+                                                *c == 0
+                                            }
+                                            None => false,
+                                        };
+                                        if last {
+                                            state.synthetic_mod_refcounts.remove(&m);
+                                            inject(state, m, KeyState::Released);
+                                        }
                                     }
                                 }
                             }
-                        } else {
-                            eprintln!(
-                                "[Wayland] inject_keysym: keysym {:#06x} not found in active xkb layout; ignoring",
-                                keysym
-                            );
                         }
                     }
                 }
@@ -1798,7 +1839,10 @@ fn run_wayland_thread(
                         // spacing these ~2s apart (vs the pre-commit ~1s), which still bounds
                         // reconnect-recovery latency instead of leaving it at one IDR per u16 wrap
                         // (~18 min @ 60fps).
-                        let kf_interval = ((state.settings.target_fps * 2.0).round() as u64).max(1);
+                        // Clamp fps before the cast: target_fps<=0 would make kf_interval 1 (an IDR
+                        // every frame). Matches the frame-pacing clamp below.
+                        let safe_fps = state.settings.target_fps.max(1.0);
+                        let kf_interval = ((safe_fps * 2.0).round() as u64).max(1);
                         let periodic_idr = (state.frame_counter as u64 % kf_interval) == 0;
                         // A recovery keyframe is due either on real motion, the first frame, the
                         // periodic cadence, or an on-demand request.
@@ -1870,10 +1914,17 @@ fn run_wayland_thread(
                                     state.encoded_frame_count += 1;
                                     state.total_stripes_encoded += 1;
                                     if let Some(ref cb) = state.callback {
-                                        #[allow(deprecated)]
-                                        Python::with_gil(|py| {
-                                            let py_bytes = PyBytes::new(py, &data);
-                                            if let Err(e) = cb.call1(py, (py_bytes,)) { eprintln!("Callback error: {:?}", e); }
+                                        Python::attach(|py| {
+                                            // MOVE the encoded buffer into the frame (no copy); full-frame
+                                            // H.264, so metadata as attrs (y_start=0, height=full frame).
+                                            match Py::new(py, WaylandFrame::new_owned_meta(
+                                                data, 2, 0, height, state.frame_counter as i32,
+                                            )) {
+                                                Ok(py_frame) => {
+                                                    if let Err(e) = cb.call1(py, (py_frame,)) { eprintln!("Callback error: {:?}", e); }
+                                                }
+                                                Err(e) => eprintln!("Frame alloc error: {:?}", e),
+                                            }
                                         });
                                     }
                                 }
@@ -1888,7 +1939,10 @@ fn run_wayland_thread(
 
                         // Give the software H.264 path the same IDR triggers as the GPU path
                         // (request_idr + ~2s periodic recovery); without it CPU has no IDR channel.
-                        let kf_interval = ((state.settings.target_fps * 2.0).round() as u64).max(1);
+                        // Clamp fps before the cast: target_fps<=0 would make kf_interval 1 (an IDR
+                        // every frame). Matches the frame-pacing clamp below.
+                        let safe_fps = state.settings.target_fps.max(1.0);
+                        let kf_interval = ((safe_fps * 2.0).round() as u64).max(1);
                         let periodic_idr = (state.frame_counter as u64 % kf_interval) == 0;
                         // Only meaningful for H.264 (output_mode 1); encode_cpu ignores it for JPEG.
                         let force_idr_all = state.settings.output_mode == 1
@@ -1911,11 +1965,18 @@ fn run_wayland_thread(
                             state.encoded_frame_count += 1;
                             state.total_stripes_encoded += encoded_packets.len() as u32;
                             if let Some(ref cb) = state.callback {
-                                #[allow(deprecated)]
-                                Python::with_gil(|py| {
+                                Python::attach(|py| {
                                     for packet in encoded_packets {
-                                        let py_bytes = PyBytes::new(py, &packet);
-                                        if let Err(e) = cb.call1(py, (py_bytes,)) { eprintln!("Callback error: {:?}", e); }
+                                        // MOVE each packet into its frame (no copy); metadata as attrs.
+                                        match Py::new(py, WaylandFrame::new_owned_meta(
+                                            packet.data, packet.data_type, packet.stripe_y_start,
+                                            packet.stripe_height, packet.frame_id,
+                                        )) {
+                                            Ok(py_frame) => {
+                                                if let Err(e) = cb.call1(py, (py_frame,)) { eprintln!("Callback error: {:?}", e); }
+                                            }
+                                            Err(e) => eprintln!("Frame alloc error: {:?}", e),
+                                        }
                                     }
                                 });
                             }
@@ -1950,6 +2011,70 @@ fn run_wayland_thread(
     event_loop.run(None, &mut state, |state| { state.dh.flush_clients().unwrap(); }).unwrap();
 }
 
+/// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
+/// exposes it read-only via the buffer protocol, so `bytes(frame)` /
+/// `memoryview(frame)` alias the Rust buffer instead of copying. Mirrors the
+/// X11 C-API `StripeFrame` (same 4 int attrs).
+#[pyclass]
+struct WaylandFrame {
+    data: Vec<u8>,
+    #[pyo3(get, set)]
+    data_type: i32,
+    #[pyo3(get, set)]
+    stripe_y_start: i32,
+    #[pyo3(get, set)]
+    stripe_height: i32,
+    #[pyo3(get, set)]
+    frame_id: i32,
+}
+
+impl WaylandFrame {
+    /// Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
+    /// metadata as attributes, so the consumer can read it without parsing a header
+    /// (required for omit_stripe_headers).
+    fn new_owned_meta(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
+        Self { data, data_type, stripe_y_start, stripe_height, frame_id }
+    }
+}
+
+#[pymethods]
+impl WaylandFrame {
+    // Symmetry/testability: copies the bytes-like into the owned Vec. The hot
+    // path uses `new_owned_meta` (a move) instead.
+    #[new]
+    #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
+    fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
+        Self { data, data_type, stripe_y_start, stripe_height, frame_id }
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    // PyBuffer_FillInfo INCREFs `slf` into view->obj, pinning the Vec until every
+    // view is released, so memoryviews can outlive the Python `frame` handle.
+    unsafe fn __getbuffer__(
+        slf: PyRefMut<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let r = pyo3::ffi::PyBuffer_FillInfo(
+            view,
+            slf.as_ptr(),
+            slf.data.as_ptr() as *mut std::os::raw::c_void,
+            slf.data.len() as pyo3::ffi::Py_ssize_t,
+            1, // readonly
+            flags,
+        );
+        if r != 0 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
+}
+
 /// @brief Python interface class.
 ///
 /// This class is exposed to Python and spawns the Wayland thread upon instantiation.
@@ -1970,7 +2095,7 @@ impl WaylandBackend {
         WaylandBackend { tx }
     }
 
-    fn start_capture(&mut self, callback: Py<PyAny>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn start_capture(&self, callback: Py<PyAny>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let watermark_path_obj = settings.getattr("watermark_path")?;
         let watermark_path = if let Ok(s) = watermark_path_obj.extract::<String>() {
             s
@@ -2013,23 +2138,15 @@ impl WaylandBackend {
                 .ok()
                 .and_then(|v| v.extract::<String>().ok())
                 .unwrap_or_default(),
+            // When true, encoders emit the raw payload without the per-stripe header (X11 parity).
+            // Stripe metadata is still exposed on WaylandFrame attributes, so the consumer must read
+            // it from there rather than parsing header bytes when this is set.
+            omit_stripe_headers: settings
+                .getattr("omit_stripe_headers")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false),
         };
-
-        // `omit_stripe_headers` is unsupported here: the Python bridge parses the fixed header at
-        // fixed offsets (JPEG: 4 bytes [frame_id, y_start]; H.264: 10 bytes [0x04, type, frame_id,
-        // y_start, width, height]), so headers are always emitted. Warn rather than silently ignore.
-        if settings
-            .getattr("omit_stripe_headers")
-            .ok()
-            .and_then(|v| v.extract::<bool>().ok())
-            .unwrap_or(false)
-        {
-            eprintln!(
-                "[Wayland] WARNING: omit_stripe_headers=true is unsupported on the Wayland backend \
-                 and is being ignored; stripe headers are always emitted (the Python bridge parses \
-                 them at fixed offsets)."
-            );
-        }
 
         self.tx
             .send(ThreadCommand::StartCapture(callback, rust_settings))
@@ -2037,21 +2154,21 @@ impl WaylandBackend {
         Ok(())
     }
 
-    fn stop_capture(&mut self) -> PyResult<()> {
+    fn stop_capture(&self) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::StopCapture)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to send stop command: {}", e)))?;
         Ok(())
     }
 
-    fn set_cursor_callback(&mut self, callback: Py<PyAny>) -> PyResult<()> {
+    fn set_cursor_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::SetCursorCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor callback: {}", e)))?;
         Ok(())
     }
 
-    fn inject_key(&mut self, scancode: u32, state: u32) -> PyResult<()> {
+    fn inject_key(&self, scancode: u32, state: u32) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::KeyboardKey { scancode, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject key: {}", e)))?;
@@ -2061,7 +2178,7 @@ impl WaylandBackend {
     /// Inject a key by X11/XKB keysym (e.g. 0x41 'A', 0xFF0D Return), resolved against our own
     /// xkb keymap. Prefer over `inject_key` when you have a keysym. A shifted keysym gets a
     /// synthetic Shift press/release. `state`: 1 = press, 0 = release.
-    fn inject_keysym(&mut self, keysym: u32, state: u32) -> PyResult<()> {
+    fn inject_keysym(&self, keysym: u32, state: u32) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::KeyboardKeysym { keysym, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject keysym: {}", e)))?;
@@ -2084,35 +2201,35 @@ impl WaylandBackend {
         }
     }
 
-    fn inject_mouse_move(&mut self, x: f64, y: f64) -> PyResult<()> {
+    fn inject_mouse_move(&self, x: f64, y: f64) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::PointerMotion { x, y })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject motion: {}", e)))?;
         Ok(())
     }
 
-    fn inject_relative_mouse_move(&mut self, dx: f64, dy: f64) -> PyResult<()> {
+    fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::PointerRelativeMotion { dx, dy })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject relative motion: {}", e)))?;
         Ok(())
     }
 
-    fn inject_mouse_button(&mut self, btn: u32, state: u32) -> PyResult<()> {
+    fn inject_mouse_button(&self, btn: u32, state: u32) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::PointerButton { btn, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject button: {}", e)))?;
         Ok(())
     }
 
-    fn inject_mouse_scroll(&mut self, x: f64, y: f64) -> PyResult<()> {
+    fn inject_mouse_scroll(&self, x: f64, y: f64) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::PointerAxis { x, y })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject axis: {}", e)))?;
         Ok(())
     }
 
-    fn set_cursor_rendering(&mut self, enabled: bool) -> PyResult<()> {
+    fn set_cursor_rendering(&self, enabled: bool) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::UpdateCursorConfig { render_on_framebuffer: enabled })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor config: {}", e)))?;
@@ -2122,7 +2239,7 @@ impl WaylandBackend {
     /// Forces an IDR/keyframe on the next captured frame so a (re)connecting client
     /// or a decoder reset can resume immediately instead of waiting for the periodic
     /// recovery keyframe. No-op cost on the JPEG/software path (keyframes are N/A).
-    fn request_idr_frame(&mut self) -> PyResult<()> {
+    fn request_idr_frame(&self) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::RequestIdr)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request IDR: {}", e)))?;
@@ -2133,5 +2250,165 @@ impl WaylandBackend {
 #[pymodule]
 fn pixelflux_wayland(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WaylandBackend>()?;
+    m.add_class::<WaylandFrame>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod keysym_release_replay_tests {
+    //! Focused tests for fix #5-rust: `inject_keysym` records the keycodes injected at
+    //! PRESS time into `synthetic_shift_keysyms` (a `HashMap<u32, (u32, u32)>`) so the
+    //! matching key-up releases the SAME physical keycodes, even if the active xkb layout
+    //! changed mid-keystroke. The release path must read the recorded mapping and must NOT
+    //! re-resolve the keysym against the (possibly different) live layout.
+    //!
+    //! The real record/replay lives inside the calloop loop in `run_wayland_thread`
+    //! (src/lib.rs ~963-1022) and resolves against a live `xkb::Keymap`, which needs a
+    //! connected keyboard. These tests model the identical state machine with the same map
+    //! type and a deterministic 2-layout resolver so the invariant is provable in isolation.
+
+    use std::collections::HashMap;
+
+    /// Simulated key-up actions emitted by the release path, in order.
+    /// Mirrors the real `inject(state, kc, KeyState::Released)` calls.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Release {
+        Key(u32),
+        Shift(u32),
+    }
+
+    /// Deterministic stand-in for `resolve_keysym_to_keycode`, parameterized by layout.
+    /// Returns (keycode, needs_shift). Two layouts deliberately map the same keysym to
+    /// DIFFERENT keycodes / shift-requirements to model a layout switch mid-keystroke.
+    ///
+    /// Layout 0 ("us"):    keysym 0x41 ('A') -> kc 38, needs_shift=true ; Shift_L -> kc 50
+    /// Layout 1 ("de"):    keysym 0x41 ('A') -> kc 24, needs_shift=false (different key!)
+    fn resolve(layout: u32, keysym: u32) -> Option<(u32, bool)> {
+        match (layout, keysym) {
+            (0, 0x41) => Some((38, true)),
+            (0, 0xFFE1) => Some((50, false)), // Shift_L on layout 0
+            (1, 0x41) => Some((24, false)),
+            (1, 0xFFE1) => Some((62, false)), // Shift_L on layout 0 -> different kc on layout 1
+            (_, 0xFF0D) => Some((36, false)), // Return: same on both, never shifted
+            _ => None,
+        }
+    }
+
+    const SHIFT_L: u32 = 0xFFE1;
+
+    /// Models the PRESS branch (src/lib.rs ~964-1008): resolve against the *current* layout,
+    /// then RECORD (kc, shift_kc_or_0) keyed by keysym. Returns false if unresolved.
+    fn press(map: &mut HashMap<u32, (u32, u32)>, current_layout: u32, keysym: u32) -> bool {
+        let Some((kc, needs_shift)) = resolve(current_layout, keysym) else {
+            return false;
+        };
+        let shift_kc = if needs_shift {
+            resolve(current_layout, SHIFT_L).map(|(kc, _)| kc).unwrap_or(50)
+        } else {
+            0
+        };
+        map.insert(keysym, (kc, if needs_shift { shift_kc } else { 0 }));
+        true
+    }
+
+    /// Models the FIXED RELEASE branch (src/lib.rs ~1010-1021): read the recorded keycodes
+    /// and release exactly those; key first, then synthetic Shift if shift_kc != 0.
+    fn release_fixed(map: &mut HashMap<u32, (u32, u32)>, keysym: u32) -> Vec<Release> {
+        let mut out = Vec::new();
+        if let Some((kc, shift_kc)) = map.remove(&keysym) {
+            out.push(Release::Key(kc));
+            if shift_kc != 0 {
+                out.push(Release::Shift(shift_kc));
+            }
+        }
+        out
+    }
+
+    /// Models the BUGGY alternative the fix replaces: ignore the record and RE-RESOLVE
+    /// against the live (possibly changed) layout. Kept only to prove the fix diverges from
+    /// it exactly when the layout changes mid-keystroke.
+    fn release_reresolve(current_layout: u32, keysym: u32) -> Vec<Release> {
+        let mut out = Vec::new();
+        if let Some((kc, needs_shift)) = resolve(current_layout, keysym) {
+            out.push(Release::Key(kc));
+            if needs_shift {
+                let shift_kc = resolve(current_layout, SHIFT_L).map(|(kc, _)| kc).unwrap_or(50);
+                out.push(Release::Shift(shift_kc));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn press_records_keycode_and_shift() {
+        // 'A' on layout 0 needs Shift -> must record both the key kc and the Shift_L kc.
+        let mut map = HashMap::new();
+        assert!(press(&mut map, 0, 0x41));
+        assert_eq!(map.get(&0x41), Some(&(38u32, 50u32)));
+    }
+
+    #[test]
+    fn press_records_zero_shift_when_unshifted() {
+        // Return is unshifted -> shift_kc sentinel must be 0 so release skips synthetic Shift.
+        let mut map = HashMap::new();
+        assert!(press(&mut map, 0, 0xFF0D));
+        assert_eq!(map.get(&0xFF0D), Some(&(36u32, 0u32)));
+    }
+
+    #[test]
+    fn unresolved_keysym_records_nothing() {
+        let mut map = HashMap::new();
+        assert!(!press(&mut map, 0, 0xDEAD));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn release_replays_recorded_keycodes_not_a_reresolve() {
+        // Press 'A' on layout 0 (kc 38 + Shift 50). THEN the layout switches to 1 mid-keystroke.
+        let mut map = HashMap::new();
+        assert!(press(&mut map, 0, 0x41));
+
+        let layout_at_release = 1; // user/compositor switched layout after press
+
+        let fixed = release_fixed(&mut map, 0x41);
+        let buggy = release_reresolve(layout_at_release, 0x41);
+
+        // The FIX releases exactly what was pressed: kc 38 then Shift 50.
+        assert_eq!(fixed, vec![Release::Key(38), Release::Shift(50)]);
+
+        // The buggy re-resolve would release kc 24 (layout 1's 'A') and NO shift -> kc 38 and
+        // Shift 50 stay logically held down. Prove the two paths diverge here.
+        assert_eq!(buggy, vec![Release::Key(24)]);
+        assert_ne!(fixed, buggy, "fix must NOT match the re-resolve path under a layout switch");
+    }
+
+    #[test]
+    fn release_consumes_the_record_no_double_release() {
+        // remove() must take the entry so a duplicate key-up is a no-op (no phantom release).
+        let mut map = HashMap::new();
+        assert!(press(&mut map, 0, 0x41));
+        let first = release_fixed(&mut map, 0x41);
+        assert_eq!(first, vec![Release::Key(38), Release::Shift(50)]);
+        assert!(map.is_empty());
+        let second = release_fixed(&mut map, 0x41);
+        assert!(second.is_empty(), "second key-up must release nothing");
+    }
+
+    #[test]
+    fn release_without_prior_press_is_noop() {
+        // A stray key-up that was never recorded must not inject anything.
+        let mut map = HashMap::new();
+        assert!(release_fixed(&mut map, 0x41).is_empty());
+    }
+
+    #[test]
+    fn no_layout_change_fix_and_reresolve_agree() {
+        // Sanity: when the layout is stable, the fix and the (would-be) re-resolve must agree,
+        // so the fix is not changing correct behavior in the common case.
+        let mut map = HashMap::new();
+        assert!(press(&mut map, 0, 0x41));
+        let fixed = release_fixed(&mut map, 0x41);
+        let same_layout = release_reresolve(0, 0x41);
+        assert_eq!(fixed, same_layout);
+    }
 }

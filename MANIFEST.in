@@ -1,5 +1,9 @@
 graft pixelflux
+recursive-exclude pixelflux *.so *.pyc
+prune pixelflux/__pycache__
 include pixelflux_wayland/Cargo.toml
 recursive-include pixelflux_wayland/src *
+recursive-exclude pixelflux_wayland *.so
+prune pixelflux_wayland/target
 include pyproject.toml
 include README.md

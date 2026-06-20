@@ -9,16 +9,14 @@ screen capture session. The capture region can be controlled via the URL hash.
 
 # Standard library imports
 import asyncio
-import ctypes
 import os
-import sys
 import mimetypes
 import websockets
 import websockets.asyncio.server as ws_async
 import threading
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback, OwnedFrame
+from pixelflux import CaptureSettings, ScreenCapture
 
 # ==============================================================================
 # --- BASE CONFIGURATION SETTINGS ---
@@ -49,12 +47,13 @@ base_capture_settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
 base_capture_settings.use_cpu = False
 
-# --- Zero-copy deferred free ---
-# On Py 3.12+ pixelflux can hand the buffer's ownership to Python (OwnedFrame), so we
-# send its memoryview with no copy. H.264 only: the JPEG path re-frames with a 2-byte
-# prefix and needs a fresh bytes object. Below 3.12 there's no PEP 688 pin, so we copy.
-DEFERRED_FREE = sys.version_info >= (3, 12) and base_capture_settings.output_mode != 0
-base_capture_settings.deferred_free = DEFERRED_FREE
+# --- Zero-copy frames ---
+# The native callback delivers a StripeFrame (buffer-protocol object owning the C
+# buffer). We send memoryview(frame) with no copy on the H.264 path; the JPEG path
+# re-frames with a 2-byte prefix and needs a fresh bytes object. The StripeFrame's
+# buffer protocol pins the buffer alive across every Python version (no PEP 688).
+ZERO_COPY = base_capture_settings.output_mode != 0
+base_capture_settings.deferred_free = True  # ignored by the C-API; kept for parity
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
@@ -136,8 +135,8 @@ async def send_stripes_task(websocket, queue):
         while True:
             item = await queue.get()
             try:
-                # item == {'data': <memoryview|bytes>, 'owner': <OwnedFrame|None>}. Keeping
-                # `item` (hence the OwnedFrame) referenced for the whole send keeps the C
+                # item == {'data': <memoryview|bytes>, 'owner': <StripeFrame|None>}. Keeping
+                # `item` (hence the StripeFrame) referenced for the whole send keeps the C
                 # buffer alive until the send releases the view, so zero-copy is safe.
                 await websocket.send(item['data'])
             finally:
@@ -168,8 +167,8 @@ async def websocket_handler(websocket):
 
     client_module = None
     send_task = None
-    # Keep a reference to the callback object to prevent it from being garbage collected
-    c_callback = None
+    # Keep a reference to the callback to prevent it from being garbage collected
+    on_stripe = None
 
     try:
         # --- 1. Configure Capture for this Specific Client ---
@@ -189,37 +188,27 @@ async def websocket_handler(websocket):
         # --- 3. Create a unique callback (closure) for this client ---
         # This function "closes over" client_queue and g_loop, giving it access
         # without needing global lookups or user_data.
-        def client_specific_callback(result_ptr, user_data_ptr):
-            """Callback invoked by pixelflux when a new video stripe is ready."""
-            if not result_ptr:
-                return
-            result = result_ptr.contents
-            if not (result.data and result.size > 0 and g_loop and not g_loop.is_closed()):
+        def on_stripe(frame):
+            """Callback invoked by pixelflux with a StripeFrame per video stripe."""
+            if not (len(frame) > 0 and g_loop and not g_loop.is_closed()):
                 return
 
-            if DEFERRED_FREE:
-                # Zero-copy: take ownership FIRST (before any early-return). The queued
-                # item holds both the memoryview and the owner, so the OwnedFrame outlives
-                # the send and its buffer stays alive until the view is released.
-                owner = OwnedFrame.take(result_ptr)
-                if owner is None:
-                    return
-                item_to_queue = {'data': owner.memoryview(), 'owner': owner}
+            if ZERO_COPY:
+                # Zero-copy: memoryview aliases the C buffer and pins the StripeFrame
+                # alive. The queued item holds both, so the frame (hence its buffer)
+                # outlives the send until the view is released.
+                item_to_queue = {'data': memoryview(frame), 'owner': frame}
             else:
-                # Fallback (Py < 3.12, or JPEG re-framing): copy, since pixelflux frees
-                # the buffer when this callback returns, before the coroutine sends it.
-                raw_data_from_cpp = ctypes.string_at(result.data, result.size)
-                final_payload = raw_data_from_cpp
+                # JPEG re-framing needs a fresh bytes object with the 2-byte prefix.
+                raw_data = bytes(frame)
+                final_payload = raw_data
                 if client_settings.output_mode == 0:
-                    final_payload = b"\x03\x00" + raw_data_from_cpp
+                    final_payload = b"\x03\x00" + raw_data
                 item_to_queue = {'data': final_payload, 'owner': None}
 
             asyncio.run_coroutine_threadsafe(
                 client_queue.put(item_to_queue), g_loop
             )
-        
-        # Convert the Python closure into a C-compatible function pointer
-        c_callback = StripeCallback(client_specific_callback)
 
         # --- 4. Register and Start Resources for this Client ---
         send_task = asyncio.create_task(send_stripes_task(websocket, client_queue))
@@ -227,13 +216,13 @@ async def websocket_handler(websocket):
             "module": client_module,
             "queue": client_queue,
             "task": send_task,
-            "callback": c_callback # Store reference to prevent GC
+            "callback": on_stripe # Store reference to prevent GC
         }
 
-        # --- 5. Start the Capture with the correct 3 arguments ---
+        # --- 5. Start the Capture with the settings and callback ---
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, client_module.start_capture, client_settings, c_callback
+            None, client_module.start_capture, client_settings, on_stripe
         )
         print(f"Capture started for client {client_id}.")
 

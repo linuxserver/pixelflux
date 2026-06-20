@@ -8,8 +8,12 @@
   ▘    ▜ ▐▘▜     
 ▛▌▌▚▘█▌▐ ▜▘▐ ▌▌▚▘
 ▙▌▌▞▖▙▖▐▖▐ ▐▖▙▌▞▖
-▌                
+▌
 */
+
+// Python.h must be first so its feature macros win over libc/libstdc++ headers.
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
 
 #include <atomic>
 #include <chrono>
@@ -24,8 +28,10 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <numeric>
 #include <queue>
 #include <sstream>
@@ -109,6 +115,12 @@ struct CudaFunctions {
 
 CudaFunctions g_cuda_funcs;
 static void* g_cuda_lib_handle = nullptr;
+// One-time, thread-safe resolution of the process-global CUDA driver handle/func-pointers
+// (LoadCudaApi): concurrent multi-instance NVENC init otherwise races g_cuda_funcs (a thread
+// could observe a torn struct and call a null/garbage fn-ptr). call_once publishes the fully
+// populated struct before any waiter returns.
+static std::once_flag g_cuda_load_once;
+static bool g_cuda_load_ok = false;
 // Guards the one-time GOT ioctl interposer install (InstallNvencGpuFilter). libcuda is
 // process-lifetime (never dlclose'd), so the patch never needs re-applying: set once, never reset.
 static std::mutex g_nv_filter_mutex;
@@ -122,6 +134,25 @@ static bool g_nv_filter_installed = false;
 // [10:] strip; deferred_free true hands buffer ownership to Python -- either way
 // pixelflux's StripeEncodeResult has no data-freeing destructor, so Python always
 // owns the free.)
+
+// NVENC API version negotiated against the DRIVER (NVENCAPI_VERSION format: major|(minor<<24)).
+// Following GStreamer's nvcodec approach: a build against a newer SDK header runs on older
+// drivers (down to NVENC 10.0 / ~driver R445, covering CUDA 11 / 470) by (a) probing a list of
+// API versions with nvEncodeAPICreateInstance until one <= the driver's max succeeds, and (b)
+// tagging every struct with a DELIBERATELY-OLD, widely-supported revision + the negotiated
+// version (NVENC structs are append-only, so an old-rev struct is the prefix an old driver
+// expects). Defaults to the compiled version so pre-negotiation uses are unchanged.
+static std::atomic<uint32_t> g_nvenc_api_version{NVENCAPI_VERSION};
+// .version = negotiated api | (old struct revision << 16) | (0x7<<28) | extra-bits.
+static inline uint32_t nvenc_struct_ver(uint32_t rev, uint32_t extra) {
+  return g_nvenc_api_version.load(std::memory_order_relaxed) | (rev << 16) | (0x7u << 28) | extra;
+}
+// NV_ENC_CONFIG gained fields in SDK 12.0 (rev 7 -> 8). Use rev 8 only when the negotiated
+// major is >= 12 (matches GStreamer; needed for AV1 later), else the universally-accepted rev 7.
+static inline uint32_t nvenc_config_ver() {
+  uint32_t major = g_nvenc_api_version.load(std::memory_order_relaxed) & 0xFFu;
+  return nvenc_struct_ver(major >= 12 ? 8 : 7, (1u << 31));
+}
 
 /**
  * @brief Manages the state of an NVENC H.264 encoder session.
@@ -149,7 +180,7 @@ struct NvencEncoderState {
   NV_ENC_BUFFER_FORMAT initialized_buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   CUcontext cuda_context = nullptr;
 
-  // Gated device-input (E2): cached registered CUDA device resource + the per-frame
+  // Gated device-input: cached registered CUDA device resource + the per-frame
   // device buffer the conversion site produced. All zero/null when the gate is off.
   NV_ENC_REGISTERED_PTR registered_resource = nullptr;
   unsigned long long registered_base = 0;
@@ -158,14 +189,21 @@ struct NvencEncoderState {
   int dev_input_pitch = 0;
 
   NvencEncoderState() {
-    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-    init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    nvenc_funcs.version = nvenc_struct_ver(2, 0);
+    init_params.version = nvenc_struct_ver(5, (1u << 31));
   }
 };
 
 static void* g_nvenc_lib_handle = nullptr;
 typedef NVENCSTATUS(NVENCAPI* PFN_NvEncodeAPICreateInstance)(
   NV_ENCODE_API_FUNCTION_LIST*);
+// One-time, thread-safe resolution of the process-global NVENC handle + API-version
+// negotiation: concurrent multi-instance init otherwise races g_nvenc_lib_handle and the
+// version probe. The per-instance function list is still populated per call (each instance
+// owns its own), but only AFTER the negotiated version is published.
+static std::once_flag g_nvenc_load_once;
+static bool g_nvenc_load_ok = false;
+static PFN_NvEncodeAPICreateInstance g_nvenc_create_instance = nullptr;
 
 /**
  * @brief Manages the state of a VA-API H.264 encoder session using libavcodec.
@@ -203,6 +241,65 @@ static int shm_attach_error_handler(Display* dpy, XErrorEvent* ev) {
     g_shm_attach_failed = true;
     return 0;
 }
+// Reader/writer lock serializing X Display connection setup/teardown across instances while
+// keeping per-frame grabs concurrent. Each ScreenCapture instance opens/closes its own Display
+// (XOpenDisplay/XCloseDisplay) from its capture thread; libxcb's global connection state is not
+// safe against concurrent open/close even with per-Display locking enabled, so multi-instance
+// churn corrupts the glibc heap ("tcache_thread_shutdown unaligned" / "[xcb] Aborting"). A plain
+// mutex around the per-frame XShmGetImage would serialize every instance's grab (throughput cost);
+// a shared_mutex lets grabs run in parallel yet still excludes them while any open/close runs.
+//
+//   WRITER (exclusive, std::unique_lock): connection setup/teardown. The initial-setup writer and
+//     the reinit (resolution-change) setup writer each span the WHOLE setup phase as ONE exclusive
+//     critical section -- XOpenDisplay, XGetWindowAttributes, XShmQueryExtension,
+//     XFixesQueryExtension, the XShmCreateImage/shmget/shmat/XShmAttach+XSync retry, and the
+//     XSetErrorHandler swap + g_shm_attach_failed read. Every libxcb-touching setup call (not just
+//     the attach) is thus exclusive vs other instances' open/close AND vs grabs, because the
+//     post-open setup-phase calls also mutate libxcb global state and otherwise race. Holding the
+//     process-global writer across the whole setup also serializes the XSetErrorHandler swap, so
+//     g_xshm_setup_mutex is removed and only ONE lock governs connection lifecycle. Teardown
+//     (XShmDetach, XSync, XCloseDisplay) likewise runs under the writer.
+//   READER (shared, std::shared_lock): the per-frame XShmGetImage only. Concurrent capture threads
+//     grab in parallel, but every grab is blocked while any instance holds the writer.
+//
+// Lock-ordering invariant: this lock is NEVER acquired while any other lock is held, and no other
+// lock is acquired while this is held -- so it can never participate in a deadlock cycle. The
+// setup writer keeps this invariant by holding ONLY stack-local work inside the scope: the
+// auto-adjust settings_mutex publish and load_watermark_image()/YUV-plane allocation are done
+// AFTER the writer releases. CRITICAL: neither the reader nor the writer is ever held across a
+// blocking encode, a capture-thread join, the per-frame loop, or the frame-pacing sleep:
+//   - the reader scope is exactly the XShmGetImage call (result captured into a bool); all decode/
+//     encode/cursor work happens AFTER the reader is released;
+//   - the teardown/reinit writer scopes are exactly the bare open/close/attach/detach call(s); the
+//     setup writer adds the contiguous setup-phase X calls + flag-read, no encode and no join.
+//     Because the setup writer is held across the whole setup, every failure-path XCloseDisplay
+//     inside it is a BARE call (the non-recursive mutex is already held) and the RAII lock
+//     releases exactly once on every path.
+// Anti-starvation: glibc's shared_mutex has no writer priority, so the grab loop yields on any
+// iteration where the per-frame pacing sleep does not fire -- otherwise saturating readers could
+// starve a concurrent stop_capture writer (XCloseDisplay) indefinitely.
+// XInitThreads() (called once in PyInit__capture before any XOpenDisplay) adds the per-Display
+// locking; this lock covers the connection-lifecycle gap XInitThreads alone does not.
+static std::shared_mutex g_x_display_lifecycle_mutex;
+// Writer-preference layer over g_x_display_lifecycle_mutex: glibc's std::shared_mutex is
+// reader-preference, so a continuous stream of per-frame grabs (readers) at high/unbounded fps
+// can starve a stopping instance's XCloseDisplay (writer) indefinitely, hanging stop_capture.
+// Every writer increments this flag BEFORE blocking on the unique_lock (signaling intent) and
+// decrements it the instant it acquires; each per-frame reader spins yield() while this is
+// nonzero before taking its shared_lock, so readers back off the moment any writer is waiting
+// and the writer acquires within one reader-drain. Steady state (no writer) costs readers one
+// relaxed-fenced atomic load -- grab-vs-grab parallelism is preserved.
+static std::atomic<unsigned> g_x_display_writers_waiting{0};
+// Process-global serialization of libx264 session lifecycle. x264_encoder_open()/
+// x264_encoder_close() touch libx264-internal process-global state (e.g. its CPU/thread
+// setup); with multiple ScreenCapture instances churning CPU H264 (use_cpu=True) start/stop
+// concurrently, unserialized open/close from different instances corrupts the glibc heap.
+// Held (lock_guard) ONLY around the open/close calls -- never around x264_encoder_encode --
+// so per-frame encoding stays fully parallel. Mirrors g_nv_filter_mutex / the connection-lifecycle
+// writer (g_x_display_lifecycle_mutex): serialize lifecycle, leave the per-frame hot path parallel.
+// Lock ordering: always acquired INSIDE MinimalEncoderStore::store_mutex (store_mutex first,
+// then this global), which is consistent at every site so no deadlock is possible.
+static std::mutex g_x264_lifecycle_mutex;
 
 /**
  * @brief Manages a pool of H.264 encoders and associated picture buffers.
@@ -258,7 +355,12 @@ struct MinimalEncoderStore {
     std::lock_guard<std::mutex> lock(store_mutex);
     for (size_t i = 0; i < encoders.size(); ++i) {
       if (encoders[i]) {
-        x264_encoder_close(encoders[i]);
+        // Serialize the close against any other instance's concurrent open/close
+        // (process-global libx264 heap-corruption fix). Tight scope: close only.
+        {
+          std::lock_guard<std::mutex> x264_lock(g_x264_lifecycle_mutex);
+          x264_encoder_close(encoders[i]);
+        }
         encoders[i] = nullptr;
       }
     }
@@ -564,14 +666,15 @@ StripeEncodeResult& StripeEncodeResult::operator=(StripeEncodeResult&& other) no
  *         successfully resolved, false otherwise.
  */
 bool LoadCudaApi() {
-    if (g_cuda_lib_handle) {
-        return true;
-    }
-
-    g_cuda_lib_handle = dlopen("libcuda.so", RTLD_LAZY);
+  // Resolve once (process-global); waiters block until the struct is fully published.
+  std::call_once(g_cuda_load_once, []() {
+    // libcuda.so.1 is the driver's runtime soname (present with any driver, 470-595);
+    // libcuda.so (unversioned) is the dev symlink and is absent on runtime-only installs.
+    g_cuda_lib_handle = dlopen("libcuda.so.1", RTLD_LAZY);
+    if (!g_cuda_lib_handle) g_cuda_lib_handle = dlopen("libcuda.so", RTLD_LAZY);
     if (!g_cuda_lib_handle) {
-        std::cerr << "CUDA_API_LOAD: dlopen failed for libcuda.so" << std::endl;
-        return false;
+        std::cerr << "CUDA_API_LOAD: dlopen failed for libcuda.so.1 / libcuda.so" << std::endl;
+        return;
     }
 
     g_cuda_funcs.pfn_cuInit = (tcuInit)dlsym(g_cuda_lib_handle, "cuInit");
@@ -598,10 +701,12 @@ bool LoadCudaApi() {
         std::cerr << "CUDA_API_LOAD: dlsym failed for one or more CUDA functions." << std::endl;
         dlclose(g_cuda_lib_handle);
         g_cuda_lib_handle = nullptr;
-        memset(&g_cuda_funcs, 0, sizeof(CudaFunctions));
-        return false;
+        g_cuda_funcs = CudaFunctions{};  // value-init; CudaFunctions is non-trivial (no memset)
+        return;
     }
-    return true;
+    g_cuda_load_ok = true;
+  });
+  return g_cuda_load_ok;
 }
 
 /**
@@ -631,45 +736,85 @@ bool LoadNvencApi(NV_ENCODE_API_FUNCTION_LIST& nvenc_funcs) {
   if (nvenc_funcs.nvEncOpenEncodeSessionEx != nullptr) {
     return true;
   }
-  if (!g_nvenc_lib_handle) {
-      const char* lib_names[] = {"libnvidia-encode.so.1", "libnvidia-encode.so"};
-      for (const char* name : lib_names) {
-        g_nvenc_lib_handle = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
-        if (g_nvenc_lib_handle) {
-          break;
-        }
+  // Resolve the handle + negotiate the API version ONCE for the whole process; concurrent
+  // multi-instance init would otherwise race g_nvenc_lib_handle / g_nvenc_api_version. The
+  // per-instance function list (nvenc_funcs) is filled per call AFTER negotiation completes.
+  std::call_once(g_nvenc_load_once, []() {
+    const char* lib_names[] = {"libnvidia-encode.so.1", "libnvidia-encode.so"};
+    for (const char* name : lib_names) {
+      g_nvenc_lib_handle = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
+      if (g_nvenc_lib_handle) {
+        break;
       }
-  }
+    }
+    if (!g_nvenc_lib_handle) {
+      return;
+    }
 
-  if (!g_nvenc_lib_handle) {
+    PFN_NvEncodeAPICreateInstance create_instance =
+      (PFN_NvEncodeAPICreateInstance)dlsym(g_nvenc_lib_handle, "NvEncodeAPICreateInstance");
+    if (!create_instance) {
+      return;
+    }
+
+    // Negotiate the API version against the driver (GStreamer nvcodec approach): probe known API
+    // versions newest-first and use the highest the driver accepts, so a newer-SDK build still runs
+    // on older drivers down to NVENC 10.0 (~R445), covering CUDA 11 / driver 470. The struct
+    // .version helpers tag every struct with old, widely-supported revisions + the chosen version.
+    typedef NVENCSTATUS(NVENCAPI * PFN_GetMaxVer)(uint32_t*);
+    auto get_max = (PFN_GetMaxVer)dlsym(g_nvenc_lib_handle, "NvEncodeAPIGetMaxSupportedVersion");
+    uint32_t drv_max = 0;
+    if (get_max) get_max(&drv_max);   // (major<<4)|minor; 0 -> rely on createInstance probing
+    // Optional cap for testing/pinning a lower version, e.g. PIXELFLUX_NVENC_MAX_API="11.0".
+    if (const char* cap = std::getenv("PIXELFLUX_NVENC_MAX_API")) {
+      unsigned cmaj = 0, cmin = 0;
+      if (sscanf(cap, "%u.%u", &cmaj, &cmin) == 2) {
+        uint32_t capv = (cmaj << 4) | (cmin & 0xf);
+        if (capv && (drv_max == 0 || capv < drv_max)) drv_max = capv;
+      }
+    }
+    static const uint32_t kVersions[][2] = {   // {major, minor}, newest-first, floor NVENC 10.0
+      {NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION},
+      {12, 1}, {12, 0}, {11, 1}, {11, 0}, {10, 0},
+    };
+    NV_ENCODE_API_FUNCTION_LIST probe;   // local probe list; per-instance lists filled below
+    NVENCSTATUS status = NV_ENC_ERR_INVALID_VERSION;
+    for (const auto& v : kVersions) {
+      uint32_t vv = (v[0] << 4) | v[1];
+      if (drv_max != 0 && vv > drv_max) continue;   // driver can't support this version; skip
+      g_nvenc_api_version.store(v[0] | (v[1] << 24), std::memory_order_relaxed);
+      memset(&probe, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
+      probe.version = nvenc_struct_ver(2, 0);
+      status = create_instance(&probe);
+      if (status == NV_ENC_SUCCESS && probe.nvEncOpenEncodeSessionEx) break;
+      status = NV_ENC_ERR_INVALID_VERSION;
+    }
+    if (status != NV_ENC_SUCCESS) {
+      g_nvenc_api_version.store(NVENCAPI_VERSION, std::memory_order_relaxed);
+      return;
+    }
+    g_nvenc_create_instance = create_instance;
+    g_nvenc_load_ok = true;
+    uint32_t a = g_nvenc_api_version.load(std::memory_order_relaxed);
+    std::cerr << "[pixelflux] NVENC API version negotiated: " << (a & 0xFFu) << "."
+              << ((a >> 24) & 0xFFu) << std::endl;
+  });
+
+  if (!g_nvenc_load_ok || !g_nvenc_create_instance) {
     return false;
   }
-
+  // Populate THIS instance's function list with the negotiated version (set-once above).
   memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-  nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-
-  PFN_NvEncodeAPICreateInstance NvEncodeAPICreateInstance_func_ptr =
-    (PFN_NvEncodeAPICreateInstance)dlsym(g_nvenc_lib_handle, "NvEncodeAPICreateInstance");
-
-  if (!NvEncodeAPICreateInstance_func_ptr) {
-    return false;
-  }
-
-  NVENCSTATUS status = NvEncodeAPICreateInstance_func_ptr(&nvenc_funcs);
-  if (status != NV_ENC_SUCCESS) {
+  nvenc_funcs.version = nvenc_struct_ver(2, 0);
+  NVENCSTATUS status = g_nvenc_create_instance(&nvenc_funcs);
+  if (status != NV_ENC_SUCCESS || !nvenc_funcs.nvEncOpenEncodeSessionEx) {
     memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-    return false;
-  }
-  if (!nvenc_funcs.nvEncOpenEncodeSessionEx) {
-    memset(&nvenc_funcs, 0, sizeof(NV_ENCODE_API_FUNCTION_LIST));
-    nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
     return false;
   }
   return true;
 }
 
-// --- Multi-GPU NVENC fix (issue 8): GET_ATTACHED_IDS filter ----------------
+// --- Multi-GPU NVENC fix: GET_ATTACHED_IDS filter ----------------
 // On driver 570-595, libnvidia-encode enumerates every host GPU via the RM
 // GET_ATTACHED_IDS ioctl and peer-inits each; GPUs whose /dev/nvidiaX is absent
 // from the container make nvEncOpenEncodeSessionEx fail with UNSUPPORTED_DEVICE.
@@ -696,7 +841,8 @@ bool nv_node_present(unsigned minor) {
 // Resolve a gpuId to its /dev/nvidia minor via /proc (the PCI bus is encoded in
 // gpuId >> 8). Returns -1 when no match is found.
 int nv_gpuid_to_minor(uint32_t gpu_id) {
-  unsigned want_full = gpu_id >> 8;   // encodes (domain << 8) | bus
+  unsigned want_bus = (gpu_id >> 8) & 0xFFu;  // bus number (most common encoding)
+  unsigned want_full = gpu_id >> 8;           // some gpuIds encode (domain << 8) | bus
   DIR* dir = opendir("/proc/driver/nvidia/gpus");
   if (!dir) return -1;
   int minor = -1;
@@ -704,7 +850,10 @@ int nv_gpuid_to_minor(uint32_t gpu_id) {
   while ((ent = readdir(dir)) != nullptr) {
     unsigned dom, bus, slot, fn;
     if (sscanf(ent->d_name, "%x:%x:%x.%x", &dom, &bus, &slot, &fn) != 4) continue;
-    if (((dom << 8) | bus) != want_full) continue;
+    // Match the bus number (most common case) OR the domain:bus combined value (larger
+    // gpuIds), mirroring the reference interposer's dual strategy so a gpuId whose high bits
+    // don't cleanly carry the domain still resolves instead of dropping a valid GPU.
+    if (bus != want_bus && ((dom << 8) | bus) != want_full) continue;
     char info[512];
     snprintf(info, sizeof(info), "/proc/driver/nvidia/gpus/%s/information", ent->d_name);
     if (FILE* f = fopen(info, "r")) {
@@ -773,18 +922,33 @@ int nv_page_prot(uintptr_t addr) {
   return prot;
 }
 
+// Resolve a DT_ d_ptr to an absolute address. On glibc the loader rewrites these to
+// absolute; on musl/Alpine they stay FILE-RELATIVE -> add dlpi_addr (base). Heuristic:
+// values below base are relative offsets; values at/above base are already absolute.
+static inline uintptr_t nv_dyn_addr(uintptr_t base, ElfW(Addr) v) {
+  return (static_cast<uintptr_t>(v) < base) ? base + static_cast<uintptr_t>(v)
+                                            : static_cast<uintptr_t>(v);
+}
+
 void nv_patch_ioctl_got(uintptr_t base, const ElfW(Dyn)* dyn) {
   const ElfW(Sym)* symtab = nullptr;
   const char* strtab = nullptr;
   ElfW(Rela)* jmprel = nullptr;
   size_t pltrelsz = 0;
   for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
-    if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr);
-    else if (d->d_tag == DT_STRTAB) strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
-    else if (d->d_tag == DT_JMPREL) jmprel = reinterpret_cast<ElfW(Rela)*>(d->d_un.d_ptr);
+    if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<const ElfW(Sym)*>(nv_dyn_addr(base, d->d_un.d_ptr));
+    else if (d->d_tag == DT_STRTAB) strtab = reinterpret_cast<const char*>(nv_dyn_addr(base, d->d_un.d_ptr));
+    else if (d->d_tag == DT_JMPREL) jmprel = reinterpret_cast<ElfW(Rela)*>(nv_dyn_addr(base, d->d_un.d_ptr));
     else if (d->d_tag == DT_PLTRELSZ) pltrelsz = d->d_un.d_val;
   }
   if (!symtab || !strtab || !jmprel || !pltrelsz) return;
+  // Best-effort: bail if any resolved table isn't in a readable mapping (a bad
+  // relative/absolute guess would otherwise fault on the first dereference below).
+  auto readable = [](const void* p) {
+    int prot = nv_page_prot(reinterpret_cast<uintptr_t>(p));
+    return prot < 0 || (prot & PROT_READ);
+  };
+  if (!readable(symtab) || !readable(strtab) || !readable(jmprel)) return;
   long page = sysconf(_SC_PAGESIZE);
   for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); i++) {
     ElfW(Rela)* r = &jmprel[i];
@@ -842,7 +1006,7 @@ void InstallNvencGpuFilter() {
 }
 }  // namespace
 
-// --- Issue 10: optional CUDA (NVRTC) ARGB->NV12 color conversion -----------
+// --- optional CUDA (NVRTC) ARGB->NV12 color conversion -----------
 // When libnvrtc is present, offload NVENC-mode color conversion from CPU
 // (libyuv) to the GPU: upload ARGB, run a runtime-compiled BT.601-limited
 // kernel (matching libyuv exactly), download NV12. Returns false on absence or
@@ -867,6 +1031,19 @@ typedef int (*tNvCompile)(void*, int, const char**);
 typedef int (*tNvPtxSz)(void*, size_t*);
 typedef int (*tNvPtx)(void*, char*);
 typedef int (*tNvDestroy)(void**);
+// Strided 2D copy (cuMemcpy2D_v2) to download the pitched device NV12 to tight host planes
+// in one call per plane instead of a per-row loop. Layout matches the CUDA driver ABI
+// (CUDA_MEMCPY2D, stable since CUDA 3.x); CUarray is never used here (left null).
+typedef struct CUarray_st* CUarray;
+enum { CU_MEMORYTYPE_HOST_ = 1, CU_MEMORYTYPE_DEVICE_ = 2 };
+struct CUDA_MEMCPY2D {
+  size_t srcXInBytes, srcY;
+  unsigned int srcMemoryType; const void* srcHost; CUdptr srcDevice; CUarray srcArray; size_t srcPitch;
+  size_t dstXInBytes, dstY;
+  unsigned int dstMemoryType; void* dstHost; CUdptr dstDevice; CUarray dstArray; size_t dstPitch;
+  size_t WidthInBytes, Height;
+};
+typedef int (*tMemcpy2D)(const CUDA_MEMCPY2D*);   // cuMemcpy2D_v2
 // Device-compute-capability query so the kernel is compiled for the ACTUAL device's
 // virtual arch (PTX runs only on its own virtual arch and newer -- a fixed compute_52
 // PTX cannot JIT on a Kepler sm_35). Resolved best-effort via dlsym; null -> fallback list.
@@ -877,15 +1054,24 @@ static const int CU_DEV_ATTR_CC_MAJOR = 75;       // CU_DEVICE_ATTRIBUTE_COMPUTE
 static const int CU_DEV_ATTR_CC_MINOR = 76;       // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
 
 static std::mutex g_mutex;
-static bool g_tried = false, g_ready = false;
-static CUcontext g_init_ctx = nullptr;   // context the cache below is bound to
-static CUfunc g_fn = nullptr;
-static CUdptr g_d_argb = 0, g_d_y = 0, g_d_uv = 0;
-static size_t g_cap_argb = 0, g_cap_y = 0, g_cap_uv = 0;
-static CUdptr g_d_nv12 = 0;       // contiguous pitched NV12 for gated device-input NVENC (E2)
-static size_t g_cap_nv12 = 0;
+// Per-CUcontext cache. Each ScreenCaptureModule instance owns its OWN CUcontext, so the
+// compiled module function and device buffers must be keyed by context: a single global
+// cache shared across instances leaked GPU memory (it zeroed the outgoing context's live
+// handles on every context flip without freeing them) and thrashed the module every frame
+// with 2+ concurrent NVENC instances. The entry's GPU allocations + module are reclaimed
+// by cuCtxDestroy when the owning context is destroyed (destroy_context erases the entry).
+struct CacheEntry {
+  bool ready = false;
+  CUfunc fn = nullptr;
+  CUdptr d_argb = 0, d_y = 0, d_uv = 0;
+  size_t cap_argb = 0, cap_y = 0, cap_uv = 0;
+  CUdptr d_nv12 = 0;              // contiguous pitched NV12 for gated device-input NVENC
+  size_t cap_nv12 = 0;
+};
+static std::map<CUcontext, CacheEntry> g_cache;
 static tAlloc g_alloc; static tFree g_free; static tH2D g_h2d; static tD2H g_d2h;
 static tLaunch g_launch; static tSetCtx g_setctx; static tSync g_sync;
+static tMemcpy2D g_memcpy2d = nullptr;  // optional fast path; null -> per-row download fallback
 // libnvrtc compilation is context-independent, so cache the compiled PTX once for
 // the whole process. Re-initializing against a new context (multi-display NVENC)
 // then only re-runs cuModuleLoadDataEx instead of a full NVRTC compile every frame.
@@ -940,16 +1126,25 @@ static std::string device_compute_arch() {
 static bool compile_ptx_for_arch(const std::string& arch) {
   if (!g_ptx.empty() && g_ptx_arch == arch) return true;
   if (!g_nvrtc_handle) {
-    g_nvrtc_handle=dlopen("libnvrtc.so.12",RTLD_NOW|RTLD_GLOBAL);
-    if(!g_nvrtc_handle) g_nvrtc_handle=dlopen("libnvrtc.so",RTLD_NOW|RTLD_GLOBAL);
+    // Try the NVRTC sonames across CUDA 11/12/13 (+ the unversioned dev symlink). The wheel's
+    // libnvrtc (any version) is RTLD_GLOBAL-preloaded by __init__._preload_wheel_libnvrtc, so a
+    // matching soname here returns that handle; system/conda installs resolve via ldconfig.
+    const char* nvrtc_names[] = {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2",
+                                 "libnvrtc.so.11", "libnvrtc.so"};
+    for (const char* n : nvrtc_names) {
+      g_nvrtc_handle = dlopen(n, RTLD_NOW | RTLD_GLOBAL);
+      if (g_nvrtc_handle) break;
+    }
   }
   void* rt=g_nvrtc_handle;
-  if(!rt) return false;
-  auto nvCreate=(tNvCreate)dlsym(rt,"nvrtcCreateProgram");
-  auto nvCompile=(tNvCompile)dlsym(rt,"nvrtcCompileProgram");
-  auto nvPtxSz=(tNvPtxSz)dlsym(rt,"nvrtcGetPTXSize");
-  auto nvPtx=(tNvPtx)dlsym(rt,"nvrtcGetPTX");
-  auto nvDestroy=(tNvDestroy)dlsym(rt,"nvrtcDestroyProgram");
+  // If no handle (e.g. a preloaded NVRTC whose soname isn't in the list), resolve the symbols
+  // from the global namespace so the RTLD_GLOBAL preload still satisfies us.
+  auto nsym=[&](const char* s)->void*{ return rt ? dlsym(rt,s) : dlsym(RTLD_DEFAULT,s); };
+  auto nvCreate=(tNvCreate)nsym("nvrtcCreateProgram");
+  auto nvCompile=(tNvCompile)nsym("nvrtcCompileProgram");
+  auto nvPtxSz=(tNvPtxSz)nsym("nvrtcGetPTXSize");
+  auto nvPtx=(tNvPtx)nsym("nvrtcGetPTX");
+  auto nvDestroy=(tNvDestroy)nsym("nvrtcDestroyProgram");
   if(!nvCreate||!nvCompile||!nvPtxSz||!nvPtx) return false;
   void* prog=nullptr; if(nvCreate(&prog,KERNEL,"cc.cu",0,nullptr,nullptr)!=0) return false;
   // Destroy the NVRTC program on every exit path below, not just success.
@@ -989,27 +1184,51 @@ static bool compile_ptx_once() {
   return false;
 }
 
-static bool init_locked(CUcontext ctx) {
+static bool init_locked(CUcontext ctx, CacheEntry& e) {
   if (!g_cuda_lib_handle) return false;
-  g_alloc=(tAlloc)dlsym(g_cuda_lib_handle,"cuMemAlloc_v2");
-  g_free=(tFree)dlsym(g_cuda_lib_handle,"cuMemFree_v2");
-  g_h2d=(tH2D)dlsym(g_cuda_lib_handle,"cuMemcpyHtoD_v2");
-  g_d2h=(tD2H)dlsym(g_cuda_lib_handle,"cuMemcpyDtoH_v2");
-  g_launch=(tLaunch)dlsym(g_cuda_lib_handle,"cuLaunchKernel");
-  g_setctx=(tSetCtx)dlsym(g_cuda_lib_handle,"cuCtxSetCurrent");
-  g_sync=(tSync)dlsym(g_cuda_lib_handle,"cuCtxSynchronize");
+  // Resolve the process-global driver entry points ONCE: the per-context GPU pipeline reads
+  // them lock-free, so re-writing them on every new-context init (while another context's
+  // convert reads them) would be a data race. Set-once under g_mutex (init_locked is only
+  // reached via get_entry_locked, which holds g_mutex).
+  static bool funcs_loaded = false;
+  if (!funcs_loaded) {
+    g_alloc=(tAlloc)dlsym(g_cuda_lib_handle,"cuMemAlloc_v2");
+    g_free=(tFree)dlsym(g_cuda_lib_handle,"cuMemFree_v2");
+    g_h2d=(tH2D)dlsym(g_cuda_lib_handle,"cuMemcpyHtoD_v2");
+    g_d2h=(tD2H)dlsym(g_cuda_lib_handle,"cuMemcpyDtoH_v2");
+    g_launch=(tLaunch)dlsym(g_cuda_lib_handle,"cuLaunchKernel");
+    g_setctx=(tSetCtx)dlsym(g_cuda_lib_handle,"cuCtxSetCurrent");
+    g_sync=(tSync)dlsym(g_cuda_lib_handle,"cuCtxSynchronize");
+    g_memcpy2d=(tMemcpy2D)dlsym(g_cuda_lib_handle,"cuMemcpy2D_v2");  // optional fast path
+    if(!g_alloc||!g_free||!g_h2d||!g_d2h||!g_launch||!g_setctx||!g_sync) return false;
+    funcs_loaded = true;
+  }
   auto modLoad=(tModLoad)dlsym(g_cuda_lib_handle,"cuModuleLoadDataEx");
   auto modFn=(tModFn)dlsym(g_cuda_lib_handle,"cuModuleGetFunction");
-  if(!g_alloc||!g_free||!g_h2d||!g_d2h||!g_launch||!g_setctx||!g_sync||!modLoad||!modFn) return false;
+  if(!modLoad||!modFn) return false;
   // Make ctx current BEFORE compiling so the device-cc query (cuCtxGetDevice in
   // compile_ptx_once) targets THIS context's device and picks its exact virtual arch.
   g_setctx(ctx);
   if(!compile_ptx_once()) return false;
   // The CUmod is never cuModuleUnload'd: it is context-scoped and dies with its CUcontext
-  // (teardown invalidates before cuCtxDestroy), so there is no per-module process leak.
+  // (destroy_context erases the cache entry before cuCtxDestroy), so there is no per-module process leak.
   CUmod mod=nullptr; if(modLoad(&mod,g_ptx.data(),0,nullptr,nullptr)!=0) return false;
-  if(modFn(&g_fn,mod,"argb_to_nv12")!=0||!g_fn) return false;
+  if(modFn(&e.fn,mod,"argb_to_nv12")!=0||!e.fn) return false;
   return true;
+}
+
+// Look up (or lazily create+init) the cache entry for ctx. Returns nullptr if init failed;
+// a failed entry is left in the map (ready=false) so we don't retry the full compile every
+// frame -- matching the old single-context g_tried/g_ready latch, but per context. Assumes
+// g_mutex held.
+static CacheEntry* get_entry_locked(CUcontext ctx) {
+  auto it = g_cache.find(ctx);
+  if (it == g_cache.end()) {
+    CacheEntry e;
+    e.ready = init_locked(ctx, e);
+    it = g_cache.emplace(ctx, e).first;
+  }
+  return it->second.ready ? &it->second : nullptr;
 }
 
 static bool ensure_buf(CUdptr& d, size_t& cap, size_t need) {
@@ -1026,32 +1245,30 @@ bool argb_to_nv12(CUcontext ctx, const uint8_t* argb, int argb_stride,
   if (y_stride != w || uv_stride != w) return false;   // padded dst -> libyuv
   static const bool disabled = (std::getenv("PIXELFLUX_NO_CUDA_CONVERT") != nullptr);
   if (disabled) return false;
-  std::lock_guard<std::mutex> lk(g_mutex);
-  if (g_tried && ctx != g_init_ctx) {
-    // NVENC was re-initialized (resolution/format change, error recovery): the
-    // old context was destroyed along with its module and device buffers, so
-    // drop the stale handles (do NOT free them - cuCtxDestroy already did) and
-    // re-init against the new context.
-    g_tried = false; g_ready = false; g_fn = nullptr;
-    g_d_argb = g_d_y = g_d_uv = 0; g_cap_argb = g_cap_y = g_cap_uv = 0;
-  }
-  if (!g_tried) { g_tried = true; g_init_ctx = ctx; g_ready = init_locked(ctx); }
-  if (!g_ready) return false;
+  // Look up (or lazily build) this context's cache entry under g_mutex (map access + one-time
+  // init only). The GPU pipeline below then runs WITHOUT the lock: each CUcontext is driven by
+  // a single capture thread (one per instance), so no two threads touch the same entry, and
+  // converts on different contexts (multi-display) overlap instead of serializing on the
+  // blocking cuCtxSynchronize. The entry pointer stays valid (destroy_context only erases a
+  // context after its capture thread is joined; std::map nodes are address-stable).
+  CacheEntry* e;
+  { std::lock_guard<std::mutex> lk(g_mutex); e = get_entry_locked(ctx); }
+  if (!e) return false;
   if (g_setctx(ctx) != 0) return false;
   size_t argb_sz = (size_t)argb_stride * h, y_sz = (size_t)w * h, uv_sz = (size_t)w * (h / 2);
-  if (!ensure_buf(g_d_argb, g_cap_argb, argb_sz) || !ensure_buf(g_d_y, g_cap_y, y_sz) || !ensure_buf(g_d_uv, g_cap_uv, uv_sz)) return false;
-  if (g_h2d(g_d_argb, argb, argb_sz) != 0) return false;
+  if (!ensure_buf(e->d_argb, e->cap_argb, argb_sz) || !ensure_buf(e->d_y, e->cap_y, y_sz) || !ensure_buf(e->d_uv, e->cap_uv, uv_sz)) return false;
+  if (g_h2d(e->d_argb, argb, argb_sz) != 0) return false;
   int aw = argb_stride, yw = w, uvw = w, ww = w, hh = h;
-  void* args[] = {&g_d_argb, &aw, &g_d_y, &yw, &g_d_uv, &uvw, &ww, &hh};
-  if (g_launch(g_fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
+  void* args[] = {&e->d_argb, &aw, &e->d_y, &yw, &e->d_uv, &uvw, &ww, &hh};
+  if (g_launch(e->fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
   if (g_sync() != 0) return false;
-  if (g_d2h(y, g_d_y, y_sz) != 0) return false;
-  if (g_d2h(uv, g_d_uv, uv_sz) != 0) return false;
+  if (g_d2h(y, e->d_y, y_sz) != 0) return false;
+  if (g_d2h(uv, e->d_uv, uv_sz) != 0) return false;
   return true;
 }
 
 // Gated (PIXELFLUX_NVENC_DEVICE_INPUT) device-input variant. Same conversion, but writes
-// a CONTIGUOUS 256-pitch NV12 into g_d_nv12 (Y at base, UV at base+pitch*h) so NVENC can
+// a CONTIGUOUS 256-pitch NV12 into the per-context d_nv12 (Y at base, UV at base+pitch*h) so NVENC can
 // register it directly (nvEncRegisterResource), avoiding the host re-upload. The host
 // y/uv planes are still filled (per-row, since the device buffer is pitched) because the
 // change-detection hash reads them. Returns the device base + pitch. Default ON
@@ -1067,73 +1284,103 @@ bool nvenc_device_input_enabled() {
   }();
   return on;
 }
+// skip_host_download: in H.264 FullFrame STREAMING mode the change-detection hash is never
+// computed (the loop sends every stripe) and NVENC consumes the device buffer directly, so the
+// per-frame device->host NV12 copy is pure overhead -> skip it. The host planes then go stale;
+// encode_fullframe_nvenc refreshes them from this same device buffer (download_nv12) ONLY on the
+// rare nvEncMapInputResource-failure fallback, so non-streaming hashing and that fallback stay correct.
 bool argb_to_nv12_device(CUcontext ctx, const uint8_t* argb, int argb_stride,
                          uint8_t* y, int y_stride, uint8_t* uv, int uv_stride,
-                         int w, int h, unsigned long long* out_base, int* out_pitch) {
+                         int w, int h, unsigned long long* out_base, int* out_pitch,
+                         bool skip_host_download) {
   if (!ctx || w <= 0 || h <= 0 || (w & 1) || (h & 1)) return false;
   if (y_stride != w || uv_stride != w) return false;
   static const bool disabled = (std::getenv("PIXELFLUX_NO_CUDA_CONVERT") != nullptr);
   if (disabled) return false;
-  std::lock_guard<std::mutex> lk(g_mutex);
-  if (g_tried && ctx != g_init_ctx) {
-    g_tried = false; g_ready = false; g_fn = nullptr;
-    g_d_argb = g_d_y = g_d_uv = g_d_nv12 = 0;
-    g_cap_argb = g_cap_y = g_cap_uv = g_cap_nv12 = 0;
-  }
-  if (!g_tried) { g_tried = true; g_init_ctx = ctx; g_ready = init_locked(ctx); }
-  if (!g_ready) return false;
+  // g_mutex guards only the map lookup/init; the GPU pipeline runs lock-free (see argb_to_nv12).
+  CacheEntry* e;
+  { std::lock_guard<std::mutex> lk(g_mutex); e = get_entry_locked(ctx); }
+  if (!e) return false;
   if (g_setctx(ctx) != 0) return false;
   int pitch = (w + 255) & ~255;
   size_t argb_sz = (size_t)argb_stride * h;
   size_t nv12_sz = (size_t)pitch * h + (size_t)pitch * (h / 2);
-  if (!ensure_buf(g_d_argb, g_cap_argb, argb_sz) || !ensure_buf(g_d_nv12, g_cap_nv12, nv12_sz)) return false;
-  if (g_h2d(g_d_argb, argb, argb_sz) != 0) return false;
-  CUdptr y_base = g_d_nv12;
-  CUdptr uv_base = g_d_nv12 + (CUdptr)((size_t)pitch * h);
+  if (!ensure_buf(e->d_argb, e->cap_argb, argb_sz) || !ensure_buf(e->d_nv12, e->cap_nv12, nv12_sz)) return false;
+  if (g_h2d(e->d_argb, argb, argb_sz) != 0) return false;
+  CUdptr y_base = e->d_nv12;
+  CUdptr uv_base = e->d_nv12 + (CUdptr)((size_t)pitch * h);
   int aw = argb_stride, yw = pitch, uvw = pitch, ww = w, hh = h;
-  void* args[] = {&g_d_argb, &aw, &y_base, &yw, &uv_base, &uvw, &ww, &hh};
-  if (g_launch(g_fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
+  void* args[] = {&e->d_argb, &aw, &y_base, &yw, &uv_base, &uvw, &ww, &hh};
+  if (g_launch(e->fn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, nullptr, args, nullptr) != 0) return false;
   if (g_sync() != 0) return false;
-  // Per-row download to the tight host planes for the change-detection hash.
-  for (int r = 0; r < h; ++r)
-    if (g_d2h(y + (size_t)r * y_stride, y_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
-  for (int r = 0; r < h / 2; ++r)
-    if (g_d2h(uv + (size_t)r * uv_stride, uv_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
-  *out_base = (unsigned long long)g_d_nv12;
+  // Download the pitched device NV12 to the tight host planes for the change-detection hash.
+  // One strided 2D copy per plane (cuMemcpy2D) instead of h + h/2 single-row copies (1620 per
+  // frame at 1080p); falls back to the per-row loop if cuMemcpy2D_v2 wasn't resolved. Skipped
+  // in streaming mode (host planes refreshed on demand on the map-failure fallback only).
+  if (!skip_host_download) {
+    if (g_memcpy2d) {
+      CUDA_MEMCPY2D cp = {};
+      cp.srcMemoryType = CU_MEMORYTYPE_DEVICE_; cp.dstMemoryType = CU_MEMORYTYPE_HOST_;
+      cp.WidthInBytes = (size_t)w;
+      cp.srcDevice = y_base; cp.srcPitch = (size_t)pitch;
+      cp.dstHost = y; cp.dstPitch = (size_t)y_stride; cp.Height = (size_t)h;
+      if (g_memcpy2d(&cp) != 0) return false;
+      cp.srcDevice = uv_base;
+      cp.dstHost = uv; cp.dstPitch = (size_t)uv_stride; cp.Height = (size_t)(h / 2);
+      if (g_memcpy2d(&cp) != 0) return false;
+    } else {
+      for (int r = 0; r < h; ++r)
+        if (g_d2h(y + (size_t)r * y_stride, y_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
+      for (int r = 0; r < h / 2; ++r)
+        if (g_d2h(uv + (size_t)r * uv_stride, uv_base + (CUdptr)((size_t)r * pitch), (size_t)w) != 0) return false;
+    }
+  }
+  *out_base = (unsigned long long)e->d_nv12;
   *out_pitch = pitch;
   return true;
 }
 
-
-// Clear the cached module/device buffers (assumes g_mutex already held). The handles are
-// only dropped, never freed: the underlying GPU allocations and module die with the owning
-// CUcontext (freed by cuCtxDestroy), so freeing them here would double-free.
-static void clear_cache_locked() {
-  g_tried = false; g_ready = false; g_fn = nullptr; g_init_ctx = nullptr;
-  g_d_argb = g_d_y = g_d_uv = g_d_nv12 = 0;
-  g_cap_argb = g_cap_y = g_cap_uv = g_cap_nv12 = 0;
+// Copy a pitched device NV12 (dev_base: Y at base, UV at base + dev_pitch*h) into NV12
+// destinations (e.g. the locked NVENC input buffer), both pitched. Used only as the streaming
+// map-failure fallback so the device buffer (the source of truth) still reaches the encoder
+// when argb_to_nv12_device skipped the host download. ctx must be current on the calling
+// thread (encode_fullframe_nvenc pushes it). Returns false on any error.
+bool download_nv12(CUcontext ctx, unsigned long long dev_base, int dev_pitch,
+                   uint8_t* y_dst, int y_dst_pitch, uint8_t* uv_dst, int uv_dst_pitch,
+                   int w, int h) {
+  if (!ctx || !dev_base || dev_pitch <= 0 || w <= 0 || h <= 0) return false;
+  if (g_setctx(ctx) != 0) return false;
+  CUdptr y_base = (CUdptr)dev_base;
+  CUdptr uv_base = (CUdptr)dev_base + (CUdptr)((size_t)dev_pitch * h);
+  if (g_memcpy2d) {
+    CUDA_MEMCPY2D cp = {};
+    cp.srcMemoryType = CU_MEMORYTYPE_DEVICE_; cp.dstMemoryType = CU_MEMORYTYPE_HOST_;
+    cp.WidthInBytes = (size_t)w;
+    cp.srcDevice = y_base; cp.srcPitch = (size_t)dev_pitch;
+    cp.dstHost = y_dst; cp.dstPitch = (size_t)y_dst_pitch; cp.Height = (size_t)h;
+    if (g_memcpy2d(&cp) != 0) return false;
+    cp.srcDevice = uv_base;
+    cp.dstHost = uv_dst; cp.dstPitch = (size_t)uv_dst_pitch; cp.Height = (size_t)(h / 2);
+    if (g_memcpy2d(&cp) != 0) return false;
+  } else {
+    for (int r = 0; r < h; ++r)
+      if (g_d2h(y_dst + (size_t)r * y_dst_pitch, y_base + (CUdptr)((size_t)r * dev_pitch), (size_t)w) != 0) return false;
+    for (int r = 0; r < h / 2; ++r)
+      if (g_d2h(uv_dst + (size_t)r * uv_dst_pitch, uv_base + (CUdptr)((size_t)r * dev_pitch), (size_t)w) != 0) return false;
+  }
+  return true;
 }
 
-// Drop the cached module/device buffers bound to the current CUDA context. MUST be called
-// by NVENC teardown BEFORE cuCtxDestroy: otherwise a later cuCtxCreate can hand back the
-// same CUcontext address (pointer-identity ABA), the staleness check in argb_to_nv12
-// (ctx == g_init_ctx) is skipped, and the kernel launches against freed GPU memory. Like
-// that staleness branch we only drop the handles -- cuCtxDestroy frees the underlying
-// allocations -- and taking g_mutex also serializes against any in-flight argb_to_nv12 so
-// the context cannot be destroyed mid-conversion.
-void invalidate() {
-  std::lock_guard<std::mutex> lk(g_mutex);
-  clear_cache_locked();
-}
 
-// Destroy a per-instance CUDA context safely w.r.t. the SHARED color-convert cache. Holding
-// g_mutex across the destroy serializes it against any in-flight convert on any context
-// (avoids an intermittent exit crash), and we clear the cache only if it is bound to THIS
-// context, so one instance's teardown doesn't nuke another's live cache. Buffers/module are
-// freed by cuCtxDestroy, never here.
+// Destroy a per-instance CUDA context safely w.r.t. the per-context color-convert cache.
+// Holding g_mutex across the destroy serializes it against any in-flight convert on any
+// context (avoids an intermittent exit crash), and we erase ONLY this context's entry, so
+// one instance's teardown can't drop another's live cache. This context's entry buffers +
+// module are reclaimed by cuCtxDestroy, so erasing the entry (dropping the handles) here is
+// not a leak and not a double-free.
 void destroy_context(CUcontext ctx) {
   std::lock_guard<std::mutex> lk(g_mutex);
-  if (g_init_ctx == ctx) clear_cache_locked();
+  g_cache.erase(ctx);
   if (ctx && g_cuda_funcs.pfn_cuCtxDestroy) g_cuda_funcs.pfn_cuCtxDestroy(ctx);
 }
 }  // namespace cuda_convert
@@ -1391,7 +1638,57 @@ public:
   bool auto_adjust_screen_capture_size = false;
 
   std::atomic<bool> stop_requested;
+  // Set in start_capture / cleared in stop_capture; is_capturing reads this instead
+  // of capture_thread.joinable() (which races stop_capture's GIL-released join()).
+  std::atomic<bool> running{false};
   std::thread capture_thread;
+  // Serializes start_capture()/stop_capture() on ONE instance: with the GIL released,
+  // concurrent calls otherwise race the non-atomic capture_thread (joinable-check vs
+  // join vs reassignment) -> std::terminate. Distinct from settings_mutex/nvenc_mutex_;
+  // those are NOT held across join() (deadlock risk). The same-thread re-entrancy guard
+  // (capture_thread == this_thread) is checked via capture_thread_id_ BEFORE this lock.
+  std::mutex thread_lifecycle_mutex_;
+  // Snapshot of capture_thread's id, published under thread_lifecycle_mutex_ right
+  // after the thread is spawned and cleared after it is joined. Lets a re-entrant
+  // stop_capture()/start_capture() from the capture thread itself (e.g. a Python
+  // stripe callback calling sc.stop_capture()) detect itself and short-circuit
+  // WITHOUT reading the non-atomic capture_thread or blocking on the lifecycle
+  // lock — a blocking self-join would deadlock another thread already joining this
+  // one in stop_capture_locked(). Mirrors pcmflux's validated pattern.
+  std::atomic<std::thread::id> capture_thread_id_{};
+  // Set when a Python stripe callback drops the LAST ref to its OWN ScreenCapture
+  // (ScreenCapture_dealloc then runs re-entrantly ON this capture thread, with
+  // capture_loop still on the stack below). The module cannot be deleted inline there
+  // -- instead ownership is transferred to the capture thread, which deletes itself as
+  // its very last act (capture_thread_main, after capture_loop fully returns). The
+  // thread is detached in that same handoff so its own std::thread member can be
+  // destroyed without join()/std::terminate. Only ever set from the capture thread.
+  std::atomic<bool> delete_on_exit_{false};
+  // True iff the caller is running ON the capture thread (e.g. a re-entrant
+  // dealloc/clear from a stripe callback). Reads only the atomic id snapshot.
+  bool on_capture_thread() const {
+    return capture_thread_id_.load(std::memory_order_acquire) ==
+           std::this_thread::get_id();
+  }
+  // Called from ScreenCapture_dealloc ONLY when on_capture_thread() is true: hand this
+  // module off to its own capture thread for self-delete-on-exit. Sequenced entirely on
+  // the capture thread (synchronous up-stack from capture_loop's stripe dispatch), so the
+  // member writes here race with nothing. Clearing stripe_callback/user_data stops the
+  // current frame's remaining stripe dispatches from re-entering the trampoline with the
+  // now-dangling user_data (the dispatch loop checks stripe_callback != nullptr and frees
+  // the buffers itself instead). Detach makes the running thread's own std::thread member
+  // safe to destroy during the later delete this. No external ref to the Python object
+  // can exist here (its refcount just hit 0 under the GIL), so no concurrent
+  // start/stop_capture can touch capture_thread.
+  void request_self_delete() {
+    stop_requested = true;
+    stripe_callback = nullptr;
+    user_data = nullptr;
+    delete_on_exit_.store(true, std::memory_order_release);
+    if (capture_thread.joinable()) {
+      capture_thread.detach();
+    }
+  }
   // Per-module wire/ownership toggles (see CaptureSettings). Kept per-instance so
   // multiple modules in one process don't clobber each other's settings; atomic so
   // the capture loop and encode worker threads observe modify_settings consistently.
@@ -1444,7 +1741,17 @@ private:
     StripeEncodeResult encode_fullframe_vaapi(int width, int height, double fps, const uint8_t* y_plane, int y_stride, const uint8_t* u_plane, int u_stride, const uint8_t* v_plane, int v_stride, bool is_i444, int frame_counter, bool force_idr_frame);
 
     void load_watermark_image();
+    // Thread entry: runs capture_loop() to completion, then -- if a re-entrant
+    // self-teardown handed this module off via request_self_delete() -- releases the
+    // per-instance hardware encoders and `delete this` as the thread's final action.
+    // Doing the delete out here (not inside capture_loop) guarantees all of
+    // capture_loop's member-referencing RAII (e.g. its running-flag guard) has already
+    // run before the object is freed.
+    void capture_thread_main();
     void capture_loop();
+    // Teardown body of stop_capture(); caller MUST hold thread_lifecycle_mutex_ (lets
+    // start_capture() stop a prior run without re-locking the non-recursive lifecycle mutex).
+    void stop_capture_locked();
     void overlay_image(int image_height, int image_width, const uint32_t *image_ptr,
                      int image_x, int image_y, int frame_height, int frame_width,
                      unsigned char *frame_ptr, int frame_stride_bytes, int frame_bytes_per_pixel);
@@ -1578,24 +1885,9 @@ public:
     auto_adjust_screen_capture_size = new_settings.auto_adjust_screen_capture_size;
   }
 
-  /**
-   * @brief Retrieves the current capture and encoding settings.
-   * This function is thread-safe.
-   * @return A CaptureSettings struct containing the current settings as known
-   *         to the module (may not yet be active in the capture loop if recently modified).
-   */
-  CaptureSettings get_current_settings() const {
-    std::lock_guard<std::mutex> lock(settings_mutex);
-    return CaptureSettings(
-      capture_width, capture_height, capture_x, capture_y, target_fps,
-      jpeg_quality, paint_over_jpeg_quality, use_paint_over_quality,
-      paint_over_trigger_frames, damage_block_threshold,
-      damage_block_duration, output_mode, h264_crf, h264_paintover_crf,
-      h264_paintover_burst_frames, h264_fullcolor, h264_fullframe, h264_streaming_mode,
-      capture_cursor, watermark_path_internal.c_str(), watermark_location_internal,
-      vaapi_render_node_index, use_cpu, debug_logging, h264_cbr_mode, h264_bitrate_kbps,
-      h264_vbv_buffer_size_kb, auto_adjust_screen_capture_size);
-  }
+  // get_current_settings() was removed: it was dead (never called) and returned a
+  // CaptureSettings whose const char* fields borrowed .c_str() into mutable members
+  // (dangling once settings_mutex was released).
 
   /**
    * @brief Requests the next encoded frame to be an IDR (key) frame.
@@ -1671,8 +1963,22 @@ public:
  * prior to calling this function.
  */
 void ScreenCaptureModule::start_capture() {
+    // Re-entrant start from the capture thread itself (a stripe callback calling
+    // sc.start_capture()): it can't join/recreate the thread it's running on, so it
+    // just keeps the thread alive and undoes any stop_requested a nested
+    // stop_capture() set. Short-circuit BEFORE the lifecycle lock so we never block
+    // on (or self-join under) a lock another thread already holds while joining us.
+    if (capture_thread_id_.load(std::memory_order_acquire) ==
+        std::this_thread::get_id()) {
+      stop_requested = false;
+      return;
+    }
+    // Hold the lifecycle lock across the joinable-check + stop + thread reassignment so a
+    // concurrent stop_capture() can't race the non-atomic capture_thread. Use the *_locked
+    // teardown (we already hold the lock; the mutex is non-recursive).
+    std::lock_guard<std::mutex> lifecycle_lock(thread_lifecycle_mutex_);
     if (capture_thread.joinable()) {
-      stop_capture();
+      stop_capture_locked();
     }
     if (LoadNvencApi(nvenc_state_.nvenc_funcs)) {
       is_nvidia_system_detected = true;
@@ -1691,7 +1997,15 @@ void ScreenCaptureModule::start_capture() {
     if (!watermark_path_internal.empty() && watermark_location_internal != WatermarkLocation::NONE) {
       load_watermark_image();
     }
-    capture_thread = std::thread(&ScreenCaptureModule::capture_loop, this);
+    // Spawn the capture thread via capture_thread_main (which runs capture_loop and then
+    // performs the re-entrant self-delete-on-exit handoff, if requested). The thread's id
+    // is the same whichever member it starts in, so the snapshot below is still correct.
+    capture_thread = std::thread(&ScreenCaptureModule::capture_thread_main, this);
+    // Publish the new thread's id (under the lifecycle lock) so a re-entrant
+    // stop/start from within the capture thread can recognize itself and short-circuit.
+    capture_thread_id_.store(capture_thread.get_id(), std::memory_order_release);
+    // running is set inside capture_loop AFTER init succeeds (and cleared via RAII on any
+    // exit), so is_capturing reflects real thread health, not merely "thread spawned".
 }
 
 /**
@@ -1703,9 +2017,37 @@ void ScreenCaptureModule::start_capture() {
  */
 void ScreenCaptureModule::stop_capture() {
     stop_requested = true;
+    // Re-entrant stop from the capture thread itself (a Python stripe callback ->
+    // sc.stop_capture(), or dealloc/GC on that thread): it must NOT join itself
+    // (join() on the current thread throws) and never touches the non-atomic
+    // capture_thread, so it returns here WITHOUT taking the lifecycle lock. Taking it
+    // would deadlock if another thread already holds it while blocked in
+    // capture_thread.join() waiting for this very thread to exit. The atomic
+    // stop_requested set above suffices to wind the capture loop down; this reads only
+    // the atomic id snapshot, no non-atomic state. (This is the check that breaks the
+    // re-entrant-stop deadlock; the old guard lived inside stop_capture_locked, AFTER the lock.)
+    if (capture_thread_id_.load(std::memory_order_acquire) ==
+        std::this_thread::get_id()) {
+      return;
+    }
+    // Serialize against a concurrent start_capture()/stop_capture() on this instance.
+    std::lock_guard<std::mutex> lifecycle_lock(thread_lifecycle_mutex_);
+    stop_capture_locked();
+}
+
+// Teardown body; caller holds thread_lifecycle_mutex_. No other lock is held across join().
+// Both callers (stop_capture/start_capture) short-circuit a re-entrant capture-thread
+// caller BEFORE the lock via capture_thread_id_, so the thread joined here is never the
+// current thread (join() on self would throw); no same-thread guard is needed here.
+void ScreenCaptureModule::stop_capture_locked() {
+    stop_requested = true;
     if (capture_thread.joinable()) {
       capture_thread.join();
+      // Clear the published id now that the thread is gone, so a later self-check can't
+      // alias a future thread that happens to reuse this id.
+      capture_thread_id_.store(std::thread::id{}, std::memory_order_release);
     }
+    running = false;
     if (nvenc_state_.initialized) {
       reset_nvenc_encoder();  // destroys THIS instance's CUDA context + NVENC session
     }
@@ -1731,7 +2073,7 @@ void ScreenCaptureModule::reset_nvenc_encoder() {
   }
 
   if (nvenc_state_.encoder_session && nvenc_state_.nvenc_funcs.nvEncDestroyEncoder) {
-    // E2: unregister the cached device-input resource BEFORE destroying the session.
+    // Unregister the cached device-input resource BEFORE destroying the session.
     if (nvenc_state_.registered_resource && nvenc_state_.nvenc_funcs.nvEncUnregisterResource) {
         nvenc_state_.nvenc_funcs.nvEncUnregisterResource(nvenc_state_.encoder_session, nvenc_state_.registered_resource);
     }
@@ -1821,7 +2163,7 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
       NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {0};
       NV_ENC_CONFIG new_config = nvenc_state_.encode_config;
 
-      reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+      reconfigure_params.version = nvenc_struct_ver(1, (1u << 31));
       reconfigure_params.reInitEncodeParams = nvenc_state_.init_params;
       reconfigure_params.reInitEncodeParams.encodeConfig = &new_config;
 
@@ -1906,10 +2248,10 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
 
   NVENCSTATUS status;
   NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {0};
-  session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+  session_params.version = nvenc_struct_ver(1, 0);
   session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
   session_params.device = nvenc_state_.cuda_context;
-  session_params.apiVersion = NVENCAPI_VERSION;
+  session_params.apiVersion = g_nvenc_api_version.load(std::memory_order_relaxed);
 
   status = nvenc_state_.nvenc_funcs.nvEncOpenEncodeSessionEx(
     &session_params, &nvenc_state_.encoder_session);
@@ -1931,7 +2273,7 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   }
 
   memset(&nvenc_state_.init_params, 0, sizeof(nvenc_state_.init_params));
-  nvenc_state_.init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+  nvenc_state_.init_params.version = nvenc_struct_ver(5, (1u << 31));
   nvenc_state_.init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
   nvenc_state_.init_params.presetGUID = NV_ENC_PRESET_P1_GUID;
   nvenc_state_.init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
@@ -1944,8 +2286,8 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   nvenc_state_.init_params.enablePTD = 1;
 
   NV_ENC_PRESET_CONFIG preset_config = {0};
-  preset_config.version = NV_ENC_PRESET_CONFIG_VER;
-  preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
+  preset_config.version = nvenc_struct_ver(4, (1u << 31));
+  preset_config.presetCfg.version = nvenc_config_ver();
 
   if (nvenc_state_.nvenc_funcs.nvEncGetEncodePresetConfigEx) {
     status = nvenc_state_.nvenc_funcs.nvEncGetEncodePresetConfigEx(
@@ -1959,17 +2301,17 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
       std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx FAILED: " << status
                 << ". Falling back to manual config." << std::endl;
       memset(&nvenc_state_.encode_config, 0, sizeof(nvenc_state_.encode_config));
-      nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+      nvenc_state_.encode_config.version = nvenc_config_ver();
     } else {
       nvenc_state_.encode_config = preset_config.presetCfg;
-      nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+      nvenc_state_.encode_config.version = nvenc_config_ver();
     }
   } else {
     std::cerr << "NVENC_INIT_WARN: nvEncGetEncodePresetConfigEx not available. Using manual "
                  "config."
               << std::endl;
     memset(&nvenc_state_.encode_config, 0, sizeof(nvenc_state_.encode_config));
-    nvenc_state_.encode_config.version = NV_ENC_CONFIG_VER;
+    nvenc_state_.encode_config.version = nvenc_config_ver();
   }
 
   nvenc_state_.encode_config.profileGUID =
@@ -1991,6 +2333,8 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
       nvenc_state_.encode_config.rcParams.constQP.qpIntra = target_qp;
       nvenc_state_.encode_config.rcParams.constQP.qpInterB = target_qp;
   }
+  // Infinite GOP (no auto keyframes; IDRs are forced explicitly). idrPeriod set to match
+  // below so the streamed profile/level is deterministic from frame 1.
   nvenc_state_.encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
   nvenc_state_.encode_config.frameIntervalP = 1;
 
@@ -1999,7 +2343,47 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   // 1 yields a stream decoders reject). 4:4:4 also requires the cuCtxCreate_v2 context (see
   // LoadCudaApi); the v1 context makes NVENC's 4:4:4 CUDA ops fail.
   h264_cfg->chromaFormatIDC = use_yuv444 ? 3 : 1;
-  h264_cfg->h264VUIParameters.videoFullRangeFlag = use_yuv444 ? 1 : 0;
+  // Pin an explicit level/idrPeriod so the FIRST access unit declares the final High
+  // profile + level (the client parses it from the SPS). Leaving level at AUTOSELECT lets
+  // the first frames advertise a lower level, forcing WebCodecs/D3D11 to re-init when it
+  // later bumps. Compute the MINIMUM level whose Annex-A MaxFS (frame size in macroblocks)
+  // and MaxMBPS (macroblock rate) both fit this resolution+fps, with a 5.2 floor so <=4K
+  // stays at the prior deterministic High@5.2; only >4K (MBs > 36864) computes 6.x.
+  // NOTE: current NVENC H.264 on this HW (e.g. L40S) caps at level 5.2 / ~4096 width and
+  // will REJECT a computed 6.x level ('Invalid Level'), at which point the existing x264
+  // fallback takes over and encodes the >4K stream. The computation itself is still the
+  // correct minimum level and is honored by HW/codecs that DO support levels >5.2; we do
+  // not clamp it here so those paths stay accurate. Computed once from the fixed
+  // width/height/fps -> deterministic from frame 1.
+  {
+    uint64_t mbs = (uint64_t)((width + 15) / 16) * ((height + 15) / 16);
+    uint64_t mbps = (uint64_t)(mbs * (fps > 0.0 ? fps : 1.0));  // macroblocks/sec
+    struct LevelCap { uint32_t level; uint64_t max_fs; uint64_t max_mbps; };
+    static const LevelCap kLevels[] = {   // floor 5.2; ascending; Annex-A MaxFS/MaxMBPS
+      { NV_ENC_LEVEL_H264_52,  36864ull,  2073600ull },
+      { NV_ENC_LEVEL_H264_60, 139264ull,  4177920ull },
+      { NV_ENC_LEVEL_H264_61, 139264ull,  8355840ull },
+      { NV_ENC_LEVEL_H264_62, 139264ull, 16711680ull },
+    };
+    uint32_t chosen = NV_ENC_LEVEL_H264_62;   // highest if nothing fits (caller width cap still applies)
+    for (const auto& lc : kLevels) {
+      if (mbs <= lc.max_fs && mbps <= lc.max_mbps) { chosen = lc.level; break; }
+    }
+    h264_cfg->level = chosen;
+  }
+  h264_cfg->idrPeriod = NVENC_INFINITE_GOPLENGTH;
+  // VUI: signal the colour description consistently so the decoder never re-derives it.
+  // Match the x264 path / libyuv + CUDA conversion math exactly: BT.709 primaries+transfer,
+  // BT.601 (SMPTE170M) matrix coeffs, LIMITED range. The 4:4:4 path feeds libyuv ARGBToI444
+  // (studio/limited range) just like the 4:2:0 path feeds ARGBToNV12/the limited-range CUDA
+  // kernel, so the flag must be limited for both -- signalling full range for 4:4:4 mismatched
+  // the actual limited-range samples and washed out the decode.
+  h264_cfg->h264VUIParameters.videoSignalTypePresentFlag = 1;
+  h264_cfg->h264VUIParameters.videoFullRangeFlag = 0;
+  h264_cfg->h264VUIParameters.colourDescriptionPresentFlag = 1;
+  h264_cfg->h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+  h264_cfg->h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+  h264_cfg->h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
   h264_cfg->repeatSPSPPS = 1;
   nvenc_state_.init_params.encodeConfig = &nvenc_state_.encode_config;
 
@@ -2026,7 +2410,7 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
   nvenc_state_.output_buffers.resize(nvenc_state_.buffer_pool_size);
   for (int i = 0; i < nvenc_state_.buffer_pool_size; ++i) {
     NV_ENC_CREATE_INPUT_BUFFER icp = {0};
-    icp.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+    icp.version = nvenc_struct_ver(1, 0);
     icp.width = width;
     icp.height = height;
     icp.bufferFmt = target_buffer_format;
@@ -2040,7 +2424,7 @@ bool ScreenCaptureModule::initialize_nvenc_encoder(int width,
     }
     nvenc_state_.input_buffers[i] = icp.inputBuffer;
     NV_ENC_CREATE_BITSTREAM_BUFFER ocp = {0};
-    ocp.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    ocp.version = nvenc_struct_ver(1, 0);
     status = nvenc_state_.nvenc_funcs.nvEncCreateBitstreamBuffer(
       nvenc_state_.encoder_session, &ocp);
     if (status != NV_ENC_SUCCESS) {
@@ -2106,7 +2490,7 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
   NV_ENC_OUTPUT_PTR out_ptr =
     nvenc_state_.output_buffers[nvenc_state_.current_output_buffer_idx];
 
-  // E2 gated device-input: register+map the contiguous device NV12 the conversion site
+  // Gated device-input: register+map the contiguous device NV12 the conversion site
   // produced (dev_input_base) and feed it directly, skipping the host lock+copy. Falls
   // back to the host path on any failure. Off by default (dev_input_base == 0).
   NVENCSTATUS status = NV_ENC_SUCCESS;
@@ -2119,6 +2503,30 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
   // The host-buffer path below doesn't need it. 4:4:4 stays on the host path (gated !is_i444).
   bool nvenc_ctx_pushed = false;
   bool nvenc_ctx_set = false;
+  // RAII: if anything throws while the device-input resource is mapped and/or the encoder
+  // context is pushed on this thread, unmap and pop/clear before unwinding. The success path
+  // below nulls mapped_resource and clears the ctx flags, so the guard is then a no-op.
+  struct DeviceInputGuard {
+    ScreenCaptureModule* self;
+    NV_ENC_INPUT_PTR& mapped;
+    bool& pushed;
+    bool& set;
+    ~DeviceInputGuard() {
+      if (mapped && self->nvenc_state_.nvenc_funcs.nvEncUnmapInputResource) {
+        self->nvenc_state_.nvenc_funcs.nvEncUnmapInputResource(
+            self->nvenc_state_.encoder_session, mapped);
+        mapped = nullptr;
+      }
+      if (pushed && g_cuda_funcs.pfn_cuCtxPopCurrent) {
+        CUcontext popped = nullptr;
+        g_cuda_funcs.pfn_cuCtxPopCurrent(&popped);
+        pushed = false;
+      } else if (set && g_cuda_funcs.pfn_cuCtxSetCurrent) {
+        g_cuda_funcs.pfn_cuCtxSetCurrent(nullptr);
+        set = false;
+      }
+    }
+  } device_input_guard{this, mapped_resource, nvenc_ctx_pushed, nvenc_ctx_set};
   if (cuda_convert::nvenc_device_input_enabled() && nvenc_state_.dev_input_base != 0 && !is_i444 &&
       nvenc_state_.nvenc_funcs.nvEncRegisterResource && nvenc_state_.nvenc_funcs.nvEncMapInputResource) {
     if (nvenc_state_.cuda_context) {
@@ -2140,7 +2548,7 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
     }
     if (!nvenc_state_.registered_resource) {
       NV_ENC_REGISTER_RESOURCE rr = {0};
-      rr.version = NV_ENC_REGISTER_RESOURCE_VER;
+      rr.version = nvenc_struct_ver(3, 0);
       rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
       rr.width = width; rr.height = height; rr.pitch = nvenc_state_.dev_input_pitch;
       rr.resourceToRegister = reinterpret_cast<void*>(static_cast<uintptr_t>(nvenc_state_.dev_input_base));
@@ -2155,7 +2563,7 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
     }
     if (nvenc_state_.registered_resource) {
       NV_ENC_MAP_INPUT_RESOURCE mr = {0};
-      mr.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+      mr.version = nvenc_struct_ver(4, 0);
       mr.registeredResource = nvenc_state_.registered_resource;
       if (nvenc_state_.nvenc_funcs.nvEncMapInputResource(nvenc_state_.encoder_session, &mr) == NV_ENC_SUCCESS) {
         mapped_resource = mr.mappedResource;
@@ -2167,7 +2575,7 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
 
   if (!pic_input) {
     NV_ENC_LOCK_INPUT_BUFFER lip = {0};
-    lip.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+    lip.version = nvenc_struct_ver(1, 0);
     lip.inputBuffer = in_ptr;
     status =
       nvenc_state_.nvenc_funcs.nvEncLockInputBuffer(nvenc_state_.encoder_session, &lip);
@@ -2181,7 +2589,19 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
     uint8_t* y_dst = locked_buffer;
     uint8_t* uv_or_u_dst = locked_buffer + static_cast<size_t>(locked_pitch) * height;
 
-    if (is_i444) {
+    // Map-failure fallback when device-input conversion ran (dev_input_base != 0, always NV12):
+    // the host planes may be stale (streaming skipped the device->host download), so refresh the
+    // locked buffer directly from the authoritative device NV12 instead of the host planes.
+    bool filled_from_device = false;
+    if (!is_i444 && cuda_convert::nvenc_device_input_enabled() && nvenc_state_.dev_input_base != 0) {
+      filled_from_device = cuda_convert::download_nv12(
+          nvenc_state_.cuda_context, nvenc_state_.dev_input_base, nvenc_state_.dev_input_pitch,
+          y_dst, locked_pitch, uv_or_u_dst, locked_pitch, width, height);
+    }
+
+    if (filled_from_device) {
+      // locked buffer already populated from the device NV12; nothing further to copy.
+    } else if (is_i444) {
       uint8_t* v_dst = uv_or_u_dst + static_cast<size_t>(locked_pitch) * height;
       libyuv::CopyPlane(y_plane, y_stride, y_dst, locked_pitch, width, height);
       libyuv::CopyPlane(u_plane, u_stride, uv_or_u_dst, locked_pitch, width, height);
@@ -2202,7 +2622,7 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
   }
 
   NV_ENC_PIC_PARAMS pp = {0};
-  pp.version = NV_ENC_PIC_PARAMS_VER;
+  pp.version = nvenc_struct_ver(4, (1u << 31));
   pp.inputBuffer = pic_input;
   pp.outputBitstream = out_ptr;
   pp.bufferFmt = nvenc_state_.initialized_buffer_format;
@@ -2223,24 +2643,27 @@ StripeEncodeResult ScreenCaptureModule::encode_fullframe_nvenc(int width,
     throw std::runtime_error(err_msg);
   }
 
-  // Device-input was consumed by the (synchronous) encode; unmap it. A throw above
-  // leaves it mapped, but the encoder reset on that error path destroys the session.
+  // Device-input was consumed by the (synchronous) encode; unmap it. A throw above is
+  // handled by device_input_guard, which unmaps and pops/clears on unwind.
   if (mapped_resource && nvenc_state_.nvenc_funcs.nvEncUnmapInputResource) {
     nvenc_state_.nvenc_funcs.nvEncUnmapInputResource(nvenc_state_.encoder_session, mapped_resource);
     mapped_resource = nullptr;
   }
 
   // Restore the thread's prior context now the device-input span is done (pop balances push,
-  // else unset SetCurrent). A throw before here leaks the push, but only on this ending thread.
+  // else unset SetCurrent). Clear the flags so device_input_guard becomes a no-op; a throw
+  // before here is handled by that guard.
   if (nvenc_ctx_pushed && g_cuda_funcs.pfn_cuCtxPopCurrent) {
     CUcontext popped = nullptr;
     g_cuda_funcs.pfn_cuCtxPopCurrent(&popped);
+    nvenc_ctx_pushed = false;
   } else if (nvenc_ctx_set && g_cuda_funcs.pfn_cuCtxSetCurrent) {
     g_cuda_funcs.pfn_cuCtxSetCurrent(nullptr);
+    nvenc_ctx_set = false;
   }
 
   NV_ENC_LOCK_BITSTREAM lbs = {0};
-  lbs.version = NV_ENC_LOCK_BITSTREAM_VER;
+  lbs.version = nvenc_struct_ver(1, 0);
   lbs.outputBitstream = out_ptr;
   status =
     nvenc_state_.nvenc_funcs.nvEncLockBitstream(nvenc_state_.encoder_session, &lbs);
@@ -2703,6 +3126,29 @@ void ScreenCaptureModule::overlay_image(int image_height, int image_width, const
     }
 }
 
+// Thread entry. Runs the capture loop, then performs self-delete-on-exit if a re-entrant
+// teardown (a stripe callback dropping the last ref to its own ScreenCapture) handed this
+// module off via request_self_delete(). capture_loop() has fully returned here, so all of
+// its RAII (the running-flag guard etc.) has already touched members for the last time;
+// only then is it safe to free the object. The capture thread was detached in
+// request_self_delete(), so destroying its own std::thread member during `delete this`
+// (inside ~ScreenCaptureModule) does not std::terminate, and the destructor's stop_capture()
+// short-circuits because it is still the capture thread. NOTHING may touch `this` after the
+// delete; capture_thread_main returns immediately, ending the detached thread.
+void ScreenCaptureModule::capture_thread_main() {
+    capture_loop();
+    if (delete_on_exit_.load(std::memory_order_acquire)) {
+        // Release this instance's hardware encoder resources first: ~ScreenCaptureModule's
+        // stop_capture() self-short-circuits (we are the capture thread) and so would skip
+        // the usual reset_*(); both resets are self-locking and idempotent (no-op if not
+        // initialized), so calling them here avoids leaking GPU/VAAPI resources.
+        reset_nvenc_encoder();
+        reset_vaapi_encoder();
+        delete this;
+        return;
+    }
+}
+
 /**
  * @brief The main function for the screen capture thread.
  * This loop continuously captures the screen at the target FPS. It handles
@@ -2712,6 +3158,10 @@ void ScreenCaptureModule::overlay_image(int image_height, int image_width, const
  * the encoded results and invokes the user-provided callback.
  */
 void ScreenCaptureModule::capture_loop() {
+    // running reflects "thread alive AND past init". Clear it on EVERY exit (the many early
+    // returns + natural end) via RAII so is_capturing can't stay True after the thread dies
+    // on its own (XOpenDisplay/XShm/encoder-init failure). Set true only after init succeeds.
+    struct RunningGuard { std::atomic<bool>& r; ~RunningGuard() { r.store(false); } } running_guard{running};
     auto start_time_loop = std::chrono::high_resolution_clock::now();
     int frame_count_loop = 0;
 
@@ -2851,49 +3301,170 @@ void ScreenCaptureModule::capture_loop() {
     const int RETRY_BACKOFF_MS = 500;
     char* display_env = std::getenv("DISPLAY");
     const char* display_name = display_env ? display_env : ":0";
-    Display* display = XOpenDisplay(display_name);
+    Display* display = nullptr;
+    Window root_window = 0;
+    int screen = 0;
+    XShmSegmentInfo shminfo;
+    XImage* shm_image = nullptr;
+    bool shm_setup_complete = false;
+    // Carry the auto-adjust dimension publish out of the setup writer scope: we must not acquire
+    // settings_mutex while the lifecycle writer is held (lock-ordering invariant), so set the
+    // stack locals inside the scope and publish to this->capture_* after the writer releases.
+    bool publish_auto_adjust_dims = false;
+    int publish_capture_width = 0;
+    int publish_capture_height = 0;
+    {
+      // SETUP WRITER: one exclusive critical section spanning the ENTIRE connection-setup phase --
+      // XOpenDisplay, XGetWindowAttributes, XShmQueryExtension, XFixesQueryExtension, the
+      // XShmCreateImage/shmget/shmat/XShmAttach+XSync retry loop, and the success/failure
+      // determination. Every libxcb-touching setup call runs under this single writer so it can
+      // never race another instance's open/close (or any in-flight grab) on libxcb global state;
+      // it also serializes the process-global XSetErrorHandler swap + g_shm_attach_failed read.
+      // The mutex is non-recursive, so every failure-path XCloseDisplay WITHIN this scope is a
+      // BARE call (the lock is already held); the RAII lock releases exactly once on every exit
+      // path (success and each failure). No encode, no capture-thread join here. The only
+      // non-X work kept inside is stack-local dimension math; YUV-plane allocation and
+      // load_watermark_image() (which take other mutexes / do file I/O) run AFTER the scope.
+      // Writer-preference: signal intent BEFORE blocking so readers back off; clear once acquired.
+      g_x_display_writers_waiting.fetch_add(1, std::memory_order_release);
+      std::unique_lock<std::shared_mutex> x_lifecycle_lock(g_x_display_lifecycle_mutex);
+      g_x_display_writers_waiting.fetch_sub(1, std::memory_order_relaxed);
+      display = XOpenDisplay(display_name);
 
-    if (!display) {
-      std::cerr << "Error: Failed to open X display " << display_name << std::endl;
-      return;
-    }
-
-    Window root_window = DefaultRootWindow(display);
-    int screen = DefaultScreen(display);
-    XWindowAttributes attributes;
-
-    if (XGetWindowAttributes(display, root_window, &attributes)) {
-      if (local_current_auto_adjust_screen_capture_size) {
-          std::cout << "[pixelflux] auto_adjust_screen_capture_size is enabled, ignoring requested capture size "
-                    << local_capture_width_actual << "x" << local_capture_height_actual
-                    << " and resetting x and y offset to 0" << std::endl;
-          
-          local_capture_width_actual = attributes.width;
-          local_capture_height_actual = attributes.height;
-          local_capture_x_offset = 0;
-          local_capture_y_offset = 0;
-
-          std::lock_guard<std::mutex> lock(settings_mutex);
-          this->capture_width = attributes.width;
-          this->capture_height = attributes.height;
-      } else {
-          if (local_capture_width_actual > attributes.width) {
-          local_capture_width_actual = attributes.width;
-          local_capture_x_offset = 0;
-        }
-        if (local_capture_height_actual > attributes.height) {
-            local_capture_height_actual = attributes.height;
-            local_capture_y_offset = 0;
-        }
-        if (local_capture_x_offset + local_capture_width_actual > attributes.width) {
-            local_capture_x_offset = attributes.width - local_capture_width_actual;
-        }
-        if (local_capture_y_offset + local_capture_height_actual > attributes.height) {
-            local_capture_y_offset = attributes.height - local_capture_height_actual;
-        }
-        if (local_capture_x_offset < 0) local_capture_x_offset = 0;
-        if (local_capture_y_offset < 0) local_capture_y_offset = 0;
+      if (!display) {
+        std::cerr << "Error: Failed to open X display " << display_name << std::endl;
+        return;
       }
+
+      root_window = DefaultRootWindow(display);
+      screen = DefaultScreen(display);
+      XWindowAttributes attributes;
+
+      if (XGetWindowAttributes(display, root_window, &attributes)) {
+        if (local_current_auto_adjust_screen_capture_size) {
+            std::cout << "[pixelflux] auto_adjust_screen_capture_size is enabled, ignoring requested capture size "
+                      << local_capture_width_actual << "x" << local_capture_height_actual
+                      << " and resetting x and y offset to 0" << std::endl;
+
+            local_capture_width_actual = attributes.width;
+            local_capture_height_actual = attributes.height;
+            local_capture_x_offset = 0;
+            local_capture_y_offset = 0;
+
+            // Defer the settings_mutex publish until after the writer releases.
+            publish_auto_adjust_dims = true;
+            publish_capture_width = attributes.width;
+            publish_capture_height = attributes.height;
+        } else {
+            if (local_capture_width_actual > attributes.width) {
+            local_capture_width_actual = attributes.width;
+            local_capture_x_offset = 0;
+          }
+          if (local_capture_height_actual > attributes.height) {
+              local_capture_height_actual = attributes.height;
+              local_capture_y_offset = 0;
+          }
+          if (local_capture_x_offset + local_capture_width_actual > attributes.width) {
+              local_capture_x_offset = attributes.width - local_capture_width_actual;
+          }
+          if (local_capture_y_offset + local_capture_height_actual > attributes.height) {
+              local_capture_y_offset = attributes.height - local_capture_height_actual;
+          }
+          if (local_capture_x_offset < 0) local_capture_x_offset = 0;
+          if (local_capture_y_offset < 0) local_capture_y_offset = 0;
+        }
+      }
+
+      if (!XShmQueryExtension(display)) {
+        std::cerr << "Error: X Shared Memory Extension not available!" << std::endl;
+        XCloseDisplay(display);  // BARE: setup writer already held.
+        display = nullptr;
+        return;
+      }
+
+      std::cout << "X Shared Memory Extension available." << std::endl;
+
+      if (local_current_capture_cursor) {
+        if (!XFixesQueryExtension(display, &xfixes_event_base, &xfixes_error_base)) {
+          std::cerr << "Error: XFixes extension not available!" << std::endl;
+          XCloseDisplay(display);  // BARE: setup writer already held.
+          display = nullptr;
+          return;
+        }
+        std::cout << "XFixes Extension available." << std::endl;
+      }
+
+      for (int attempt = 1; attempt <= MAX_ATTACH_ATTEMPTS; ++attempt) {
+          memset(&shminfo, 0, sizeof(shminfo));
+          shm_image = XShmCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+                                      ZPixmap, nullptr, &shminfo, local_capture_width_actual,
+                                      local_capture_height_actual);
+          if (!shm_image) {
+              std::cerr << "Attempt " << attempt << ": XShmCreateImage failed." << std::endl;
+              if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+              continue;
+          }
+
+          shminfo.shmid = shmget(IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height, IPC_CREAT | 0600);
+          if (shminfo.shmid < 0) {
+              perror("shmget");
+              XDestroyImage(shm_image);
+              shm_image = nullptr;
+              if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+              continue;
+          }
+
+          shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
+          if (shminfo.shmaddr == (char*)-1) {
+              perror("shmat");
+              shmctl(shminfo.shmid, IPC_RMID, 0);
+              XDestroyImage(shm_image);
+              shm_image = nullptr;
+              if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+              continue;
+          }
+
+          shminfo.readOnly = False;
+          shm_image->data = shminfo.shmaddr;
+          // Already under the setup writer: the XSetErrorHandler swap + XShmAttach + XSync + flag
+          // read are exclusive vs other instances' setup (folds in the old g_xshm_setup_mutex).
+          g_shm_attach_failed = false;
+          XErrorHandler old_handler = XSetErrorHandler(shm_attach_error_handler);
+          XShmAttach(display, &shminfo);
+          XSync(display, False);
+          XSetErrorHandler(old_handler);
+          bool attach_failed = g_shm_attach_failed;
+
+          if (attach_failed) {
+              std::cerr << "Attempt " << attempt << "/" << MAX_ATTACH_ATTEMPTS << ": XShmAttach failed with an X server error." << std::endl;
+              shmdt(shminfo.shmaddr);
+              shmctl(shminfo.shmid, IPC_RMID, 0);
+              XDestroyImage(shm_image);
+              shm_image = nullptr;
+              if (attempt < MAX_ATTACH_ATTEMPTS) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
+              }
+              continue;
+          }
+
+          shm_setup_complete = true;
+          break;
+      }
+
+      if (!shm_setup_complete) {
+          std::cerr << "ERROR: Failed to set up XShm after " << MAX_ATTACH_ATTEMPTS << " attempts. Exiting capture thread." << std::endl;
+          XCloseDisplay(display);  // BARE: setup writer already held.
+          display = nullptr;
+          return;
+      }
+    }  // SETUP WRITER released here: all libxcb-touching setup is done.
+
+    // Publish the auto-adjusted dimensions now that the lifecycle writer is released (avoids
+    // nesting settings_mutex inside the writer).
+    if (publish_auto_adjust_dims) {
+      std::lock_guard<std::mutex> lock(settings_mutex);
+      this->capture_width = publish_capture_width;
+      this->capture_height = publish_capture_height;
     }
 
     this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
@@ -2933,87 +3504,6 @@ void ScreenCaptureModule::capture_loop() {
 
     if (!local_watermark_path_setting.empty() && local_watermark_location_setting != WatermarkLocation::NONE) {
         load_watermark_image();
-    }
-
-    if (!XShmQueryExtension(display)) {
-      std::cerr << "Error: X Shared Memory Extension not available!" << std::endl;
-      XCloseDisplay(display);
-      return;
-    }
-
-    std::cout << "X Shared Memory Extension available." << std::endl;
-
-    if (local_current_capture_cursor) {
-      if (!XFixesQueryExtension(display, &xfixes_event_base, &xfixes_error_base)) {
-        std::cerr << "Error: XFixes extension not available!" << std::endl;
-        XCloseDisplay(display);
-        return;
-      }
-      std::cout << "XFixes Extension available." << std::endl;
-    }
-
-    XShmSegmentInfo shminfo;
-    XImage* shm_image = nullptr;
-    bool shm_setup_complete = false;
-
-    for (int attempt = 1; attempt <= MAX_ATTACH_ATTEMPTS; ++attempt) {
-        memset(&shminfo, 0, sizeof(shminfo));
-        shm_image = XShmCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
-                                    ZPixmap, nullptr, &shminfo, local_capture_width_actual,
-                                    local_capture_height_actual);
-        if (!shm_image) {
-            std::cerr << "Attempt " << attempt << ": XShmCreateImage failed." << std::endl;
-            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
-            continue;
-        }
-
-        shminfo.shmid = shmget(IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height, IPC_CREAT | 0600);
-        if (shminfo.shmid < 0) {
-            perror("shmget");
-            XDestroyImage(shm_image);
-            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
-            continue;
-        }
-
-        shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
-        if (shminfo.shmaddr == (char*)-1) {
-            perror("shmat");
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XDestroyImage(shm_image);
-            if (attempt < MAX_ATTACH_ATTEMPTS) std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
-            continue;
-        }
-
-        shminfo.readOnly = False;
-        shm_image->data = shminfo.shmaddr;
-        g_shm_attach_failed = false;
-        XErrorHandler old_handler = XSetErrorHandler(shm_attach_error_handler);
-        XShmAttach(display, &shminfo);
-        XSync(display, False);
-        XSetErrorHandler(old_handler);
-
-        if (g_shm_attach_failed) {
-            std::cerr << "Attempt " << attempt << "/" << MAX_ATTACH_ATTEMPTS << ": XShmAttach failed with an X server error." << std::endl;
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XDestroyImage(shm_image);
-            if (attempt < MAX_ATTACH_ATTEMPTS) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_BACKOFF_MS));
-            }
-            continue;
-        }
-        
-        shm_setup_complete = true;
-        break;
-    }
-
-    if (!shm_setup_complete) {
-        std::cerr << "ERROR: Failed to set up XShm after " << MAX_ATTACH_ATTEMPTS << " attempts. Exiting capture thread." << std::endl;
-        if (display) {
-            XCloseDisplay(display);
-            display = nullptr;
-        }
-        return;
     }
 
     std::cout << "XShm setup complete for " << local_capture_width_actual
@@ -3103,14 +3593,26 @@ void ScreenCaptureModule::capture_loop() {
 
     auto last_output_time = std::chrono::high_resolution_clock::now();
 
+    // Init (display / XShm / encoder selection) succeeded -> capture is live.
+    running.store(true);
     while (!stop_requested) {
       auto current_loop_iter_start_time = std::chrono::high_resolution_clock::now();
 
+      bool paced_this_iter = false;
       if (current_loop_iter_start_time < next_frame_time) {
         auto time_to_sleep = next_frame_time - current_loop_iter_start_time;
         if (time_to_sleep > std::chrono::milliseconds(0)) {
           std::this_thread::sleep_for(time_to_sleep);
+          paced_this_iter = true;
         }
+      }
+      // Anti-starvation: when target_fps is so high the per-frame pacing sleep does not fire,
+      // the grab loop spins acquiring the shared_lock READER back-to-back. glibc's shared_mutex
+      // has no writer priority, so a concurrent stop_capture (XCloseDisplay, WRITER) could be
+      // starved indefinitely by saturating readers. Yield on the unpaced path so the writer
+      // gets a turn. (No effect when a real pacing sleep already ran.)
+      if (!paced_this_iter) {
+        std::this_thread::yield();
       }
       auto intended_current_frame_time = next_frame_time;
       next_frame_time += target_frame_duration_seconds;
@@ -3249,51 +3751,66 @@ void ScreenCaptureModule::capture_loop() {
         std::cout << "Capture parameters changed. Re-initializing XShm and YUV planes."
                   << std::endl;
 
-        if (shm_image) {
-            if (shminfo.shmaddr && shminfo.shmaddr != (char*)-1) {
-                XShmDetach(display, &shminfo);
-                shmdt(shminfo.shmaddr);
-                shminfo.shmaddr = (char*)-1;
-            }
-            if (shminfo.shmid != -1 && shminfo.shmid != 0) {
-                shmctl(shminfo.shmid, IPC_RMID, 0);
-                shminfo.shmid = -1;
-            }
-            XDestroyImage(shm_image);
-            shm_image = nullptr;
-            memset(&shminfo, 0, sizeof(shminfo));
-        }
+        // REINIT SETUP WRITER: one exclusive critical section spanning the whole resolution-change
+        // setup -- XShmDetach of the old segment through XShmCreateImage/shmget/shmat/XShmAttach of
+        // the new one. Mirrors the initial-setup writer: every libxcb-touching call is exclusive vs
+        // other instances' open/close (and vs grabs), failure-path XCloseDisplay is BARE (writer
+        // already held), and the RAII lock releases exactly once on every path. YUV-plane
+        // (re)allocation runs AFTER this scope. Every failure path returns from the thread, so
+        // falling through past the scope means the reinit succeeded.
+        {
+          // Writer-preference: signal intent BEFORE blocking so readers back off; clear once acquired.
+          g_x_display_writers_waiting.fetch_add(1, std::memory_order_release);
+          std::unique_lock<std::shared_mutex> x_lifecycle_lock(g_x_display_lifecycle_mutex);
+          g_x_display_writers_waiting.fetch_sub(1, std::memory_order_relaxed);
 
-        shm_image = XShmCreateImage(
-          display, DefaultVisual(display, screen), DefaultDepth(display, screen),
-          ZPixmap, nullptr, &shminfo, local_capture_width_actual,
-          local_capture_height_actual);
-        if (!shm_image) {
-          std::cerr << "Error: XShmCreateImage failed during re-init." << std::endl;
-          if(display) { XCloseDisplay(display); } display = nullptr; return;
-        }
-        shminfo.shmid = shmget(
-          IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height,
-          IPC_CREAT | 0600);
-        if (shminfo.shmid < 0) {
-          perror("shmget re-init"); if(shm_image) { XDestroyImage(shm_image); } shm_image = nullptr;
-          if(display) { XCloseDisplay(display); } display = nullptr; return;
-        }
-        shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
-        if (shminfo.shmaddr == (char*)-1) {
-          perror("shmat re-init"); 
-          if(shminfo.shmid != -1) { shmctl(shminfo.shmid, IPC_RMID, 0); } shminfo.shmid = -1;
-          if(shm_image) { XDestroyImage(shm_image); } shm_image = nullptr;
-          if(display) { XCloseDisplay(display); } display = nullptr; return;
-        }
-        shminfo.readOnly = False;
-        shm_image->data = shminfo.shmaddr;
-        if (!XShmAttach(display, &shminfo)) {
-          if(shminfo.shmaddr != (char*)-1) { shmdt(shminfo.shmaddr); } shminfo.shmaddr = (char*)-1;
-          if(shminfo.shmid != -1) { shmctl(shminfo.shmid, IPC_RMID, 0); } shminfo.shmid = -1;
-          if(shm_image) { XDestroyImage(shm_image); } shm_image = nullptr;
-          if(display) { XCloseDisplay(display); } display = nullptr; return;
-        }
+          if (shm_image) {
+              if (shminfo.shmaddr && shminfo.shmaddr != (char*)-1) {
+                  XShmDetach(display, &shminfo);
+                  shmdt(shminfo.shmaddr);
+                  shminfo.shmaddr = (char*)-1;
+              }
+              if (shminfo.shmid != -1 && shminfo.shmid != 0) {
+                  shmctl(shminfo.shmid, IPC_RMID, 0);
+                  shminfo.shmid = -1;
+              }
+              XDestroyImage(shm_image);
+              shm_image = nullptr;
+              memset(&shminfo, 0, sizeof(shminfo));
+          }
+
+          shm_image = XShmCreateImage(
+            display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+            ZPixmap, nullptr, &shminfo, local_capture_width_actual,
+            local_capture_height_actual);
+          if (!shm_image) {
+            std::cerr << "Error: XShmCreateImage failed during re-init." << std::endl;
+            XCloseDisplay(display); display = nullptr; return;  // BARE: reinit writer already held.
+          }
+          shminfo.shmid = shmget(
+            IPC_PRIVATE, static_cast<size_t>(shm_image->bytes_per_line) * shm_image->height,
+            IPC_CREAT | 0600);
+          if (shminfo.shmid < 0) {
+            perror("shmget re-init"); XDestroyImage(shm_image); shm_image = nullptr;
+            XCloseDisplay(display); display = nullptr; return;  // BARE: reinit writer already held.
+          }
+          shminfo.shmaddr = (char*)shmat(shminfo.shmid, nullptr, 0);
+          if (shminfo.shmaddr == (char*)-1) {
+            perror("shmat re-init");
+            shmctl(shminfo.shmid, IPC_RMID, 0); shminfo.shmid = -1;
+            XDestroyImage(shm_image); shm_image = nullptr;
+            XCloseDisplay(display); display = nullptr; return;  // BARE: reinit writer already held.
+          }
+          shminfo.readOnly = False;
+          shm_image->data = shminfo.shmaddr;
+          Bool reinit_attach_ok = XShmAttach(display, &shminfo);
+          if (!reinit_attach_ok) {
+            shmdt(shminfo.shmaddr); shminfo.shmaddr = (char*)-1;
+            shmctl(shminfo.shmid, IPC_RMID, 0); shminfo.shmid = -1;
+            XDestroyImage(shm_image); shm_image = nullptr;
+            XCloseDisplay(display); display = nullptr; return;  // BARE: reinit writer already held.
+          }
+        }  // REINIT SETUP WRITER released here.
 
         this->yuv_planes_are_i444_ = local_current_h264_fullcolor;
         if (local_current_output_mode == OutputMode::H264) {
@@ -3335,7 +3852,20 @@ void ScreenCaptureModule::capture_loop() {
         h264_minimal_store_.reset();
       }
 
-      if (XShmGetImage(display, root_window, shm_image, local_capture_x_offset, local_capture_y_offset, AllPlanes)) {
+      // READER (shared): only the per-frame grab touches the connection here, so concurrent
+      // capture threads grab in parallel; they are all blocked only while some instance holds the
+      // writer (open/close/attach/detach). The lock is released the instant the grab returns -- all
+      // the decode/encode work below runs UNLOCKED (it reads the process-private SHM segment, not
+      // the connection), so a slow encode never blocks another instance's open/close.
+      bool grab_ok;
+      {
+        // Writer-preference back-off: defer to any waiting writer (XCloseDisplay during stop) so a
+        // saturating reader stream can't starve it. Steady state (no writer) = one relaxed load.
+        while (g_x_display_writers_waiting.load(std::memory_order_acquire) != 0) { std::this_thread::yield(); }
+        std::shared_lock<std::shared_mutex> x_lifecycle_lock(g_x_display_lifecycle_mutex);
+        grab_ok = XShmGetImage(display, root_window, shm_image, local_capture_x_offset, local_capture_y_offset, AllPlanes);
+      }
+      if (grab_ok) {
         unsigned char* shm_data_ptr = (unsigned char*)shm_image->data;
         int shm_stride_bytes = shm_image->bytes_per_line;
         int shm_bytes_per_pixel = shm_image->bits_per_pixel / 8;
@@ -3469,11 +3999,16 @@ void ScreenCaptureModule::capture_loop() {
                 if (this->nvenc_operational) {
                     if (cuda_convert::nvenc_device_input_enabled()) {
                         unsigned long long dev_base = 0; int dev_pitch = 0;
+                        // FullFrame streaming: the hash is never computed and NVENC consumes the
+                        // device buffer directly, so skip the device->host NV12 download. Any
+                        // other mode (striped / non-streaming) still needs the host planes.
+                        bool skip_host_dl = local_current_h264_streaming_mode && local_current_h264_fullframe;
                         converted = cuda_convert::argb_to_nv12_device(
                             nvenc_state_.cuda_context, shm_data_ptr, shm_stride_bytes,
                             full_frame_y_plane_.data(), full_frame_y_stride_,
                             full_frame_u_plane_.data(), full_frame_u_stride_,
-                            local_capture_width_actual, local_capture_height_actual, &dev_base, &dev_pitch);
+                            local_capture_width_actual, local_capture_height_actual, &dev_base, &dev_pitch,
+                            skip_host_dl);
                         if (converted) { nvenc_state_.dev_input_base = dev_base; nvenc_state_.dev_input_pitch = dev_pitch; }
                     } else {
                         converted = cuda_convert::argb_to_nv12(
@@ -4025,7 +4560,15 @@ void ScreenCaptureModule::capture_loop() {
     if (display) {
         if (shm_image) {
             if (shminfo.shmaddr && shminfo.shmaddr != (char*)-1) {
-                 XShmDetach(display, &shminfo);
+                 {
+                     // Serialize detach against concurrent instance connection setup/teardown.
+                     // WRITER: exclusive vs grabs and other instances' open/close.
+                     // Writer-preference: signal intent BEFORE blocking so readers back off; clear once acquired.
+                     g_x_display_writers_waiting.fetch_add(1, std::memory_order_release);
+                     std::unique_lock<std::shared_mutex> x_lifecycle_lock(g_x_display_lifecycle_mutex);
+                     g_x_display_writers_waiting.fetch_sub(1, std::memory_order_relaxed);
+                     XShmDetach(display, &shminfo);
+                 }
                  shmdt(shminfo.shmaddr);
                  shminfo.shmaddr = (char*)-1;
             }
@@ -4036,8 +4579,17 @@ void ScreenCaptureModule::capture_loop() {
             XDestroyImage(shm_image);
             shm_image = nullptr;
         }
-        XSync(display, False);
-        XCloseDisplay(display);
+        {
+            // Serialize connection teardown so it can't race another instance's XOpenDisplay/
+            // XCloseDisplay on libxcb global state. XSync flushes immediately before close.
+            // WRITER: exclusive vs grabs and other instances' open/close.
+            // Writer-preference: signal intent BEFORE blocking so readers back off; clear once acquired.
+            g_x_display_writers_waiting.fetch_add(1, std::memory_order_release);
+            std::unique_lock<std::shared_mutex> x_lifecycle_lock(g_x_display_lifecycle_mutex);
+            g_x_display_writers_waiting.fetch_sub(1, std::memory_order_relaxed);
+            XSync(display, False);
+            XCloseDisplay(display);
+        }
         display = nullptr;
     }
     std::cout << "Capture loop stopped. X resources released." << std::endl;
@@ -4069,8 +4621,8 @@ void ScreenCaptureModule::capture_loop() {
  *           and stripe_y_start (uint16_t MSB)), and `size` is the total size of `data`.
  *         - On failure (e.g., invalid input, memory allocation error), `type` is
  *           `StripeDataType::UNKNOWN`, and `data` is `nullptr`.
- *         The caller is responsible for freeing `result.data` using
- *         `free_stripe_encode_result_data` or `delete[]`.
+ *         The caller owns `result.data`: the capture loop frees it via `delete[]`
+ *         unless ownership is transferred to Python (StripeFrame), which then frees it.
  */
 StripeEncodeResult encode_stripe_jpeg(
   int thread_id,
@@ -4298,7 +4850,12 @@ StripeEncodeResult encode_stripe_h264(
 
     if (perform_full_reinit) {
       if (h264_minimal_store.encoders[thread_id]) {
-        x264_encoder_close(h264_minimal_store.encoders[thread_id]);
+        // Process-global serialization vs other instances' libx264 open/close
+        // (heap-corruption fix). Tight scope: close only, not the encode.
+        {
+          std::lock_guard<std::mutex> x264_lock(g_x264_lifecycle_mutex);
+          x264_encoder_close(h264_minimal_store.encoders[thread_id]);
+        }
         h264_minimal_store.encoders[thread_id] = nullptr;
       }
       h264_minimal_store.initialized_flags[thread_id] = false;
@@ -4352,7 +4909,12 @@ StripeEncodeResult encode_stripe_h264(
         }
         param.b_aud = 0;
 
-        h264_minimal_store.encoders[thread_id] = x264_encoder_open(&param);
+        // Process-global serialization vs other instances' libx264 open/close
+        // (heap-corruption fix). Tight scope: open only, not the encode.
+        {
+          std::lock_guard<std::mutex> x264_lock(g_x264_lifecycle_mutex);
+          h264_minimal_store.encoders[thread_id] = x264_encoder_open(&param);
+        }
         if (!h264_minimal_store.encoders[thread_id]) {
           std::cerr << "H264 T" << thread_id << ": x264_encoder_open FAILED." << std::endl;
           result.type = StripeDataType::UNKNOWN;
@@ -4628,195 +5190,639 @@ uint64_t calculate_bgr_stripe_hash_from_shm(const unsigned char* shm_start_ptr,
     return hash;
 }
 
-extern "C" {
+// ============================================================================
+// CPython C-API extension (full API, not Limited/abi3). Built with -std=c++17,
+// so no C++20 designated initializers. All types via PyType_FromSpec.
+// ============================================================================
 
-  typedef void* ScreenCaptureModuleHandle;
+// Heap type for StripeFrame; created once in PyInit, never freed (immortal).
+static PyObject* g_StripeFrameType = nullptr;
 
-  // Exposes the C++ struct size so Python can assert ctypes/C ABI agreement.
-  int pixelflux_capture_settings_size() {
-    return static_cast<int>(sizeof(CaptureSettings));
+// ----------------------------------------------------------------------------
+// StripeFrame: zero-copy, refcount-owned view over one encoded stripe. Owns the
+// new[]'d buffer; a memoryview/slice keeps it alive via Py_buffer.obj refcount
+// (this replaces the old OwnedFrame ctypes pin).
+// ----------------------------------------------------------------------------
+typedef struct {
+  PyObject_HEAD
+  unsigned char* data;  // new[]-allocated; freed in dealloc
+  int size;
+  int data_type;        // StripeDataType: 1=JPEG, 2=H264
+  int stripe_y_start;
+  int stripe_height;
+  int frame_id;
+} StripeFrameObject;
+
+static int StripeFrame_getbuffer(PyObject* self, Py_buffer* view, int flags) {
+  StripeFrameObject* f = (StripeFrameObject*)self;
+  if (f->data == nullptr) {
+    PyErr_SetString(PyExc_ValueError, "StripeFrame buffer already released");
+    view->obj = nullptr;
+    return -1;
   }
+  // readonly=1; FillInfo INCREFs self into view->obj, pinning the buffer.
+  return PyBuffer_FillInfo(view, self, f->data, (Py_ssize_t)f->size, 1, flags);
+}
 
-  // FNV-1a-64 over each field's (name, offset, size) in declaration order, so
-  // Python can catch a same-size field reorder/rename the size-only guard misses.
-  // Declared metadata only (not a memory dump) and LE-explicit, so it matches the
-  // pure-stdlib Python computation in __init__.py byte-for-byte.
-  uint64_t pixelflux_capture_settings_layout_hash() {
-    const uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
-    const uint64_t FNV_PRIME  = 0x100000001b3ULL;
-    uint64_t h = FNV_OFFSET;
-    auto mix = [&](const unsigned char* p, size_t n) {
-      for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= FNV_PRIME; }
-    };
-    auto mix_str = [&](const char* s) {
-      size_t n = 0; while (s[n]) ++n;
-      mix(reinterpret_cast<const unsigned char*>(s), n);
-      unsigned char z = 0; mix(&z, 1);  // 0x00 delimiter between name and numbers
-    };
-    auto mix_u32 = [&](uint32_t v) {     // little-endian, matches Python struct.pack("<I")
-      unsigned char b[4] = {
-        static_cast<unsigned char>(v & 0xFF),
-        static_cast<unsigned char>((v >> 8) & 0xFF),
-        static_cast<unsigned char>((v >> 16) & 0xFF),
-        static_cast<unsigned char>((v >> 24) & 0xFF),
-      };
-      mix(b, 4);
-    };
-    // #NAME makes the hashed string literal and the offsetof/sizeof target the
-    // SAME token, so a field rename can never desync the literal from the field.
-    #define PF_FIELD(NAME) do {                                                   \
-        mix_str(#NAME);                                                           \
-        mix_u32(static_cast<uint32_t>(offsetof(CaptureSettings, NAME)));          \
-        mix_u32(static_cast<uint32_t>(sizeof(static_cast<CaptureSettings*>(nullptr)->NAME))); \
-      } while (0)
-    PF_FIELD(capture_width);
-    PF_FIELD(capture_height);
-    PF_FIELD(scale);
-    PF_FIELD(capture_x);
-    PF_FIELD(capture_y);
-    PF_FIELD(target_fps);
-    PF_FIELD(jpeg_quality);
-    PF_FIELD(paint_over_jpeg_quality);
-    PF_FIELD(use_paint_over_quality);
-    PF_FIELD(paint_over_trigger_frames);
-    PF_FIELD(damage_block_threshold);
-    PF_FIELD(damage_block_duration);
-    PF_FIELD(output_mode);
-    PF_FIELD(h264_crf);
-    PF_FIELD(h264_paintover_crf);
-    PF_FIELD(h264_paintover_burst_frames);
-    PF_FIELD(h264_fullcolor);
-    PF_FIELD(h264_fullframe);
-    PF_FIELD(h264_streaming_mode);
-    PF_FIELD(capture_cursor);
-    PF_FIELD(watermark_path);
-    PF_FIELD(watermark_location_enum);
-    PF_FIELD(vaapi_render_node_index);
-    PF_FIELD(use_cpu);
-    PF_FIELD(debug_logging);
-    PF_FIELD(h264_cbr_mode);
-    PF_FIELD(h264_bitrate_kbps);
-    PF_FIELD(h264_vbv_buffer_size_kb);
-    PF_FIELD(auto_adjust_screen_capture_size);
-    PF_FIELD(omit_stripe_headers);
-    PF_FIELD(deferred_free);
-    PF_FIELD(vaapi_render_node_path);
-    #undef PF_FIELD
-    return h;
+static void StripeFrame_releasebuffer(PyObject* self, Py_buffer* view) {
+  (void)self;
+  (void)view;  // FillInfo set view->obj; CPython DECREFs it. Nothing to do.
+}
+
+static Py_ssize_t StripeFrame_length(PyObject* self) {
+  return (Py_ssize_t)((StripeFrameObject*)self)->size;
+}
+
+static PyObject* StripeFrame_get_data_type(PyObject* self, void* closure) {
+  (void)closure;
+  return PyLong_FromLong(((StripeFrameObject*)self)->data_type);
+}
+
+static PyObject* StripeFrame_get_stripe_y_start(PyObject* self, void* closure) {
+  (void)closure;
+  return PyLong_FromLong(((StripeFrameObject*)self)->stripe_y_start);
+}
+
+static PyObject* StripeFrame_get_stripe_height(PyObject* self, void* closure) {
+  (void)closure;
+  return PyLong_FromLong(((StripeFrameObject*)self)->stripe_height);
+}
+
+static PyObject* StripeFrame_get_frame_id(PyObject* self, void* closure) {
+  (void)closure;
+  return PyLong_FromLong(((StripeFrameObject*)self)->frame_id);
+}
+
+static void StripeFrame_dealloc(PyObject* self) {
+  StripeFrameObject* f = (StripeFrameObject*)self;
+  delete[] f->data;
+  f->data = nullptr;
+  // Heap-type teardown: call tp_free, then drop the type ref tp_alloc took.
+  PyTypeObject* tp = Py_TYPE(self);
+  freefunc free_fn = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+  free_fn(self);
+  Py_DECREF(tp);
+}
+
+static PyGetSetDef StripeFrame_getset[] = {
+    {"data_type", StripeFrame_get_data_type, nullptr, PyDoc_STR("Encoded type: 1=JPEG, 2=H264."), nullptr},
+    {"stripe_y_start", StripeFrame_get_stripe_y_start, nullptr, PyDoc_STR("Stripe top Y coordinate."), nullptr},
+    {"stripe_height", StripeFrame_get_stripe_height, nullptr, PyDoc_STR("Stripe height in pixels."), nullptr},
+    {"frame_id", StripeFrame_get_frame_id, nullptr, PyDoc_STR("Frame identifier."), nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+static PyType_Slot StripeFrame_slots[] = {
+    {Py_tp_dealloc, (void*)StripeFrame_dealloc},
+    {Py_tp_getset, (void*)StripeFrame_getset},
+    {Py_bf_getbuffer, (void*)StripeFrame_getbuffer},
+    {Py_bf_releasebuffer, (void*)StripeFrame_releasebuffer},
+    {Py_sq_length, (void*)StripeFrame_length},
+    {Py_mp_length, (void*)StripeFrame_length},
+    {Py_tp_doc, (void*)PyDoc_STR("Zero-copy buffer-protocol view over an encoded stripe.")},
+    {0, nullptr},
+};
+
+static PyType_Spec StripeFrame_spec = {
+    "pixelflux._capture.StripeFrame",
+    sizeof(StripeFrameObject),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    StripeFrame_slots,
+};
+
+// Allocate a StripeFrame and take ownership of `data` (size bytes). Returns a
+// new ref, or nullptr (exception set; caller still owns `data`).
+static StripeFrameObject* StripeFrame_new_owning(unsigned char* data, int size,
+                                                 int data_type, int stripe_y_start,
+                                                 int stripe_height, int frame_id) {
+  PyTypeObject* ft = (PyTypeObject*)g_StripeFrameType;
+  StripeFrameObject* f = (StripeFrameObject*)ft->tp_alloc(ft, 0);
+  if (!f) return nullptr;
+  f->data = data;
+  f->size = size;
+  f->data_type = data_type;
+  f->stripe_y_start = stripe_y_start;
+  f->stripe_height = stripe_height;
+  f->frame_id = frame_id;
+  return f;
+}
+
+// Module function: copy any buffer-protocol object into a fresh StripeFrame.
+// Interim path the Wayland bridge uses (Rust still returns bytes) and the
+// GPU-free cross-version test vehicle for StripeFrame's buffer protocol.
+static PyObject* py_stripe_frame_from_buffer(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer buf;
+  int data_type, stripe_y_start, stripe_height, frame_id;
+  if (!PyArg_ParseTuple(args, "y*iiii:stripe_frame_from_buffer", &buf,
+                        &data_type, &stripe_y_start, &stripe_height, &frame_id)) {
+    return nullptr;
   }
-
-  /**
-   * @brief Creates a new instance of the ScreenCaptureModule.
-   * @return A handle to the created ScreenCaptureModule instance.
-   */
-  ScreenCaptureModuleHandle create_screen_capture_module() {
-    return static_cast<ScreenCaptureModuleHandle>(new ScreenCaptureModule());
+  int size = (int)buf.len;
+  unsigned char* copy = new (std::nothrow) unsigned char[size > 0 ? size : 1];
+  if (!copy) {
+    PyBuffer_Release(&buf);
+    PyErr_NoMemory();
+    return nullptr;
   }
+  if (size > 0) std::memcpy(copy, buf.buf, (size_t)size);
+  PyBuffer_Release(&buf);
+  StripeFrameObject* f = StripeFrame_new_owning(copy, size, data_type,
+                                                stripe_y_start, stripe_height, frame_id);
+  if (!f) { delete[] copy; return nullptr; }
+  return (PyObject*)f;
+}
 
-  /**
-   * @brief Destroys a ScreenCaptureModule instance.
-   * @param module_handle Handle to the ScreenCaptureModule instance to destroy.
-   */
-  void destroy_screen_capture_module(ScreenCaptureModuleHandle module_handle) {
-    if (module_handle) {
-      delete static_cast<ScreenCaptureModule*>(module_handle);
-    }
-  }
+// ----------------------------------------------------------------------------
+// ScreenCapture: owns a ScreenCaptureModule and the Python callback. The C++
+// capture threads invoke capture_trampoline per stripe.
+// ----------------------------------------------------------------------------
+typedef struct {
+  PyObject_HEAD
+  ScreenCaptureModule* module;
+  PyObject* callback;
+  PyObject* watermark_bytes;    // keeps cset.watermark_path's bytes alive for the thread
+  PyObject* render_node_bytes;  // keeps cset.vaapi_render_node_path's bytes alive
+} ScreenCaptureObject;
 
-  /**
-   * @brief Starts the screen capture process with the given settings and callback.
-   * @param module_handle Handle to the ScreenCaptureModule instance.
-   * @param settings The initial capture and encoding settings.
-   * @param callback A function pointer to be called when an encoded stripe is ready.
-   * @param user_data User-defined data to be passed to the callback function.
-   */
-  void start_screen_capture(ScreenCaptureModuleHandle module_handle,
-                            CaptureSettings settings,
-                            StripeCallback callback,
-                            void* user_data) {
-    if (module_handle) {
-      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
-      module->modify_settings(settings);
-
-      {
-        std::lock_guard<std::mutex> lock(module->settings_mutex);
-        module->stripe_callback = callback;
-        module->user_data = user_data;
+// Called from the C++ capture/encode threads. Builds a StripeFrame that takes
+// ownership of result->data and dispatches to the Python callback. Never lets a
+// Python exception escape into C++.
+//
+// Leak-safety: deferred_free is forced on by the Python ScreenCapture_start_capture
+// wrapper (cset.deferred_free = true), so after this returns the C++ loop sets
+// result.data=nullptr WITHOUT delete[] -- it never reclaims an un-taken buffer
+// (StripeEncodeResult has no data-freeing dtor). So the trampoline is the sole
+// owner: on alloc failure or a NULL Python callback it must delete[] here.
+static void capture_trampoline(StripeEncodeResult* result, void* user_data) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)user_data;
+  PyGILState_STATE g = PyGILState_Ensure();
+  // Own a strong ref to the capture object itself across the call. A callback that
+  // runs gc.collect() (or otherwise drops the last external ref to this very
+  // ScreenCapture) could let cyclic GC reclaim/finalize the object graph while the
+  // capture thread is mid-stripe -> heap corruption. Holding our own external ref
+  // here keeps `cap` (and, transitively, its module) alive across the call. The
+  // matching Py_DECREF below is what actually triggers dealloc on the re-entrant
+  // self-teardown path (see ScreenCapture_dealloc's on-capture-thread branch), which
+  // is why it must run only AFTER the callback has fully returned.
+  Py_INCREF((PyObject*)cap);
+  // Own a strong ref to the callback across the call: a re-entrant
+  // cap.stop_capture()/clear/dealloc (a documented path -- the Python callback
+  // may stop its own capture) runs Py_CLEAR(cap->callback) up this same C stack.
+  // Reading cap->callback once and INCREF'ing it here guarantees that Py_CLEAR
+  // only drops ITS ref, never the last one, so the in-flight callable stays
+  // valid through PyObject_CallFunctionObjArgs (was use-after-free / heap
+  // corruption). Read once under the GIL; if NULL, skip the call.
+  PyObject* cb = cap->callback;
+  Py_XINCREF(cb);
+  if (cb && result && result->size > 0 && result->data) {
+    StripeFrameObject* f = StripeFrame_new_owning(
+        result->data, result->size, (int)result->type,
+        result->stripe_y_start, result->stripe_height, result->frame_id);
+    if (f) {
+      result->data = nullptr;  // ownership transferred to Python; C++ won't free
+      PyObject* r = PyObject_CallFunctionObjArgs(cb, (PyObject*)f, nullptr);
+      if (!r) {
+        PyErr_WriteUnraisable(cb);
+      } else {
+        Py_DECREF(r);
       }
-
-      module->start_capture();
-    }
-  }
-
-  /**
-   * @brief Requests an IDR frame from an encoder
-   * @param moduel_handle Handle to the ScreenCaptureModule instance.
-  */
-  void request_idr(ScreenCaptureModuleHandle module_handle) {
-		if (module_handle) {
-			ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
-			if (module) {
-				module->request_idr();
-			}
-		}
-  }
-
-  /**
-   * @brief Update video bitrate of an encoder
-   * @param moduel_handle Handle to the ScreenCaptureModule instance.
-   * @param bitrate video bitrate to set 
-   */
-  void update_video_bitrate(ScreenCaptureModuleHandle module_handle, int bitrate) {
-    if (module_handle) {
-      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
-      if (module) module->update_video_bitrate(bitrate);
-    }
-  }
-
-  /**
-   * @brief Updates the framerate of the screen capture process.
-   * @param module_handle Handle to the ScreenCaptureModule instance.
-   * @param fps The new framerate to set.
-   */
-  void update_framerate(ScreenCaptureModuleHandle module_handle, double fps) {
-    if (module_handle) {
-      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
-      if (module) module->update_framerate(fps);
-    }
-  }
-
-    /**
-   * @brief Updates the VBV buffer size for H.264 CBR mode.
-   * @param module_handle Handle to the ScreenCaptureModule instance.
-   * @param vbv_buffer_size_kbps The new VBV buffer size in kb
-   */
-  void update_vbv_buffer_size(ScreenCaptureModuleHandle module_handle, int vbv_buffer_size_kb) {
-    if (module_handle) {
-      ScreenCaptureModule* module = static_cast<ScreenCaptureModule*>(module_handle);
-      if (module) module->update_vbv_buffer_size(vbv_buffer_size_kb);
-    }
-  }
-
-  /**
-   * @brief Stops the screen capture process.
-   * @param module_handle Handle to the ScreenCaptureModule instance.
-   */
-  void stop_screen_capture(ScreenCaptureModuleHandle module_handle) {
-    if (module_handle) {
-      static_cast<ScreenCaptureModule*>(module_handle)->stop_capture();
-    }
-  }
-
-  /**
-   * @brief Frees the data buffer within a StripeEncodeResult.
-   * This is called from Python via ctypes to prevent memory leaks.
-   * @param result Pointer to the StripeEncodeResult whose data needs freeing.
-   */
-  void free_stripe_encode_result_data(StripeEncodeResult* result) {
-    if (result && result->data) {
+      Py_DECREF(f);
+    } else {
+      // Alloc failed: C++ deferred path won't reclaim, so free here ourselves.
+      PyErr_WriteUnraisable(cb);
       delete[] result->data;
       result->data = nullptr;
     }
+  } else if (result && result->data) {
+    // No Python callback (cap->callback == NULL) but the buffer was allocated. The
+    // deferred-free loop detaches result.data WITHOUT delete, so as sole owner we
+    // must reclaim it here to avoid a per-frame leak.
+    delete[] result->data;
+    result->data = nullptr;
+  }
+  Py_XDECREF(cb);  // release the strong ref taken across the call
+  // Release our strong ref on the capture object. If this drops the last ref it runs
+  // ScreenCapture_dealloc HERE, on the capture thread, with capture_loop still on the
+  // stack below; that path must NOT delete the module inline (it hands the module off
+  // to the capture thread for self-delete-on-exit -- see ScreenCapture_dealloc). Do
+  // not touch `cap` after this point.
+  Py_DECREF((PyObject*)cap);
+  PyGILState_Release(g);
+}
+
+static PyObject* ScreenCapture_new(PyTypeObject* type, PyObject* args, PyObject* kwds) {
+  (void)args;
+  (void)kwds;
+  ScreenCaptureObject* self = (ScreenCaptureObject*)type->tp_alloc(type, 0);
+  if (!self) return nullptr;
+  self->module = nullptr;
+  self->callback = nullptr;
+  self->watermark_bytes = nullptr;
+  self->render_node_bytes = nullptr;
+  self->module = new (std::nothrow) ScreenCaptureModule();
+  if (!self->module) {
+    Py_DECREF(self);
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  // Note: tp_alloc (PyType_GenericAlloc) already GC-tracks the object for a
+  // Py_TPFLAGS_HAVE_GC type, so do NOT call PyObject_GC_Track here (double-track aborts).
+  return (PyObject*)self;
+}
+
+// GC support: holds a Python callback (+ watermark/render-node bytes) that can form a
+// reference cycle (e.g. a bound-method callback whose self owns this ScreenCapture).
+static int ScreenCapture_traverse(PyObject* self, visitproc visit, void* arg) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  Py_VISIT(Py_TYPE(self));  // heap type: must visit its type
+  Py_VISIT(cap->callback);
+  Py_VISIT(cap->watermark_bytes);
+  Py_VISIT(cap->render_node_bytes);
+  return 0;
+}
+
+// Break the cycle. Stop the capture FIRST (GIL released so a final trampoline can run)
+// so the thread can't touch callback after we clear it -- same ordering as stop_capture.
+static int ScreenCapture_clear(PyObject* self) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  if (cap->module) {
+    Py_BEGIN_ALLOW_THREADS
+    try { cap->module->stop_capture(); } catch (...) {}  // teardown must not throw across ALLOW_THREADS
+    Py_END_ALLOW_THREADS
+  }
+  Py_CLEAR(cap->callback);
+  Py_CLEAR(cap->watermark_bytes);
+  Py_CLEAR(cap->render_node_bytes);
+  return 0;
+}
+
+static void ScreenCapture_dealloc(PyObject* self) {
+  PyObject_GC_UnTrack(self);  // GC type: untrack before teardown
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  if (cap->module) {
+    if (cap->module->on_capture_thread()) {
+      // Re-entrant dealloc: a Python stripe callback dropped the LAST ref to its own
+      // ScreenCapture, so we are running ON the capture thread with capture_loop still
+      // on the C stack below us. Deleting the module here would free an object whose
+      // member function is still executing (UAF) and destroy a joinable std::thread
+      // from within itself (std::terminate). Instead transfer module ownership to the
+      // capture thread: it stops, drains the current frame WITHOUT re-entering this
+      // (now-dying) callback, and `delete this`-es as its final act. We detach inside
+      // request_self_delete so no join is ever attempted on the running thread.
+      cap->module->request_self_delete();
+      cap->module = nullptr;  // Python object no longer owns the (self-deleting) module
+    } else {
+      Py_BEGIN_ALLOW_THREADS  // stop_capture joins the thread; release GIL so the
+      try { cap->module->stop_capture(); } catch (...) {}  // trampoline finishes draining; never throw in dealloc
+      Py_END_ALLOW_THREADS
+      delete cap->module;
+      cap->module = nullptr;
+    }
+  }
+  Py_CLEAR(cap->callback);
+  Py_CLEAR(cap->watermark_bytes);
+  Py_CLEAR(cap->render_node_bytes);
+  PyTypeObject* tp = Py_TYPE(self);
+  freefunc free_fn = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+  free_fn(self);
+  Py_DECREF(tp);
+}
+
+// Read one bool-ish attribute (0/1) from a settings object; -1 + exception set.
+static int read_bool_attr(PyObject* obj, const char* name, bool* out) {
+  PyObject* v = PyObject_GetAttrString(obj, name);
+  if (!v) return -1;
+  int b = PyObject_IsTrue(v);
+  Py_DECREF(v);
+  if (b < 0) return -1;
+  *out = (b != 0);
+  return 0;
+}
+
+// Read one int attribute; -1 + exception set.
+static int read_int_attr(PyObject* obj, const char* name, long* out) {
+  PyObject* v = PyObject_GetAttrString(obj, name);
+  if (!v) return -1;
+  long n = PyLong_AsLong(v);
+  Py_DECREF(v);
+  if (n == -1 && PyErr_Occurred()) return -1;
+  *out = n;
+  return 0;
+}
+
+// Read one double attribute; -1 + exception set.
+static int read_double_attr(PyObject* obj, const char* name, double* out) {
+  PyObject* v = PyObject_GetAttrString(obj, name);
+  if (!v) return -1;
+  double d = PyFloat_AsDouble(v);
+  Py_DECREF(v);
+  if (d == -1.0 && PyErr_Occurred()) return -1;
+  *out = d;
+  return 0;
+}
+
+// Read a str/bytes/None C-string attribute. On success *holder owns a new bytes
+// ref (or nullptr for None) and *out points into it (or nullptr); -1 on error.
+static int read_cstr_attr(PyObject* obj, const char* name, const char** out,
+                          PyObject** holder) {
+  *out = nullptr;
+  *holder = nullptr;
+  PyObject* v = PyObject_GetAttrString(obj, name);
+  if (!v) return -1;
+  if (v == Py_None) {
+    Py_DECREF(v);
+    return 0;
+  }
+  PyObject* b = nullptr;
+  if (PyUnicode_Check(v)) {
+    b = PyUnicode_AsUTF8String(v);  // new ref
+    Py_DECREF(v);
+    if (!b) return -1;
+  } else if (PyBytes_Check(v)) {
+    b = v;  // steal the ref we already hold
+  } else {
+    Py_DECREF(v);
+    PyErr_Format(PyExc_TypeError, "%s must be str, bytes, or None", name);
+    return -1;
+  }
+  *holder = b;
+  *out = PyBytes_AS_STRING(b);  // valid while b lives
+  return 0;
+}
+
+static PyObject* ScreenCapture_start_capture(PyObject* self, PyObject* args) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  PyObject* settings;
+  PyObject* callback;
+  if (!PyArg_ParseTuple(args, "OO:start_capture", &settings, &callback)) {
+    return nullptr;
+  }
+  if (!PyCallable_Check(callback)) {
+    PyErr_SetString(PyExc_TypeError, "callback must be callable");
+    return nullptr;
+  }
+  if (!cap->module) {
+    PyErr_SetString(PyExc_RuntimeError, "capture module not initialized");
+    return nullptr;
   }
 
+  CaptureSettings cset;  // C++ defaults; overridden below
+  PyObject* wm_bytes = nullptr;
+  PyObject* node_bytes = nullptr;
+  long lv;
+  double dv;
+  bool bv;
+
+  // Two C-string fields: held alive in wm_bytes/node_bytes for the thread.
+  if (read_cstr_attr(settings, "watermark_path", &cset.watermark_path, &wm_bytes) < 0)
+    goto err;
+  if (read_cstr_attr(settings, "vaapi_render_node_path", &cset.vaapi_render_node_path, &node_bytes) < 0)
+    goto err;
+
+  if (read_int_attr(settings, "capture_width", &lv) < 0) goto err;
+  cset.capture_width = (int)lv;
+  if (read_int_attr(settings, "capture_height", &lv) < 0) goto err;
+  cset.capture_height = (int)lv;
+  if (read_double_attr(settings, "scale", &dv) < 0) goto err;
+  cset.scale = dv;
+  if (read_int_attr(settings, "capture_x", &lv) < 0) goto err;
+  cset.capture_x = (int)lv;
+  if (read_int_attr(settings, "capture_y", &lv) < 0) goto err;
+  cset.capture_y = (int)lv;
+  if (read_double_attr(settings, "target_fps", &dv) < 0) goto err;
+  cset.target_fps = dv;
+  if (read_int_attr(settings, "jpeg_quality", &lv) < 0) goto err;
+  cset.jpeg_quality = (int)lv;
+  if (read_int_attr(settings, "paint_over_jpeg_quality", &lv) < 0) goto err;
+  cset.paint_over_jpeg_quality = (int)lv;
+  if (read_bool_attr(settings, "use_paint_over_quality", &bv) < 0) goto err;
+  cset.use_paint_over_quality = bv;
+  if (read_int_attr(settings, "paint_over_trigger_frames", &lv) < 0) goto err;
+  cset.paint_over_trigger_frames = (int)lv;
+  if (read_int_attr(settings, "damage_block_threshold", &lv) < 0) goto err;
+  cset.damage_block_threshold = (int)lv;
+  if (read_int_attr(settings, "damage_block_duration", &lv) < 0) goto err;
+  cset.damage_block_duration = (int)lv;
+  if (read_int_attr(settings, "output_mode", &lv) < 0) goto err;
+  cset.output_mode = (OutputMode)lv;
+  if (read_int_attr(settings, "h264_crf", &lv) < 0) goto err;
+  cset.h264_crf = (int)lv;
+  if (read_int_attr(settings, "h264_paintover_crf", &lv) < 0) goto err;
+  cset.h264_paintover_crf = (int)lv;
+  if (read_int_attr(settings, "h264_paintover_burst_frames", &lv) < 0) goto err;
+  cset.h264_paintover_burst_frames = (int)lv;
+  if (read_bool_attr(settings, "h264_fullcolor", &bv) < 0) goto err;
+  cset.h264_fullcolor = bv;
+  if (read_bool_attr(settings, "h264_fullframe", &bv) < 0) goto err;
+  cset.h264_fullframe = bv;
+  if (read_bool_attr(settings, "h264_streaming_mode", &bv) < 0) goto err;
+  cset.h264_streaming_mode = bv;
+  if (read_bool_attr(settings, "capture_cursor", &bv) < 0) goto err;
+  cset.capture_cursor = bv;
+  if (read_int_attr(settings, "watermark_location_enum", &lv) < 0) goto err;
+  cset.watermark_location_enum = (WatermarkLocation)lv;
+  if (read_int_attr(settings, "vaapi_render_node_index", &lv) < 0) goto err;
+  cset.vaapi_render_node_index = (int)lv;
+  if (read_bool_attr(settings, "use_cpu", &bv) < 0) goto err;
+  cset.use_cpu = bv;
+  if (read_bool_attr(settings, "debug_logging", &bv) < 0) goto err;
+  cset.debug_logging = bv;
+  if (read_bool_attr(settings, "h264_cbr_mode", &bv) < 0) goto err;
+  cset.h264_cbr_mode = bv;
+  if (read_int_attr(settings, "h264_bitrate_kbps", &lv) < 0) goto err;
+  cset.h264_bitrate_kbps = (int)lv;
+  if (read_int_attr(settings, "h264_vbv_buffer_size_kb", &lv) < 0) goto err;
+  cset.h264_vbv_buffer_size_kb = (int)lv;
+  if (read_bool_attr(settings, "auto_adjust_screen_capture_size", &bv) < 0) goto err;
+  cset.auto_adjust_screen_capture_size = bv;
+  if (read_bool_attr(settings, "omit_stripe_headers", &bv) < 0) goto err;
+  cset.omit_stripe_headers = bv;
+  // deferred_free is forced on: the trampoline always takes ownership. The
+  // Python value is ignored (kept on the settings object only for API parity).
+  cset.deferred_free = true;
+
+  // Commit: retain C-string bytes + callback, wire up module, start.
+  Py_XSETREF(cap->watermark_bytes, wm_bytes);    // steals our ref; clears prior
+  Py_XSETREF(cap->render_node_bytes, node_bytes);
+  wm_bytes = nullptr;
+  node_bytes = nullptr;
+  Py_INCREF(callback);
+  Py_XSETREF(cap->callback, callback);
+  cap->module->modify_settings(cset);
+  {
+    std::lock_guard<std::mutex> lock(cap->module->settings_mutex);
+    cap->module->stripe_callback = capture_trampoline;
+    cap->module->user_data = cap;
+  }
+  // start_capture() stops any prior run, probes encoders, and spawns the thread.
+  // std::thread creation can throw std::system_error (thread limit/OOM); a C++ exception
+  // must not unwind through ALLOW_THREADS (GIL released) into CPython. Catch, restore the
+  // GIL, then raise a Python error.
+  {  // scoped so the `goto err` paths above don't jump across start_err's initialization
+    std::string start_err;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+      cap->module->start_capture();
+    } catch (const std::exception& e) {
+      start_err = e.what();
+    } catch (...) {
+      start_err = "unknown C++ exception";
+    }
+    Py_END_ALLOW_THREADS
+    if (!start_err.empty()) {
+      Py_CLEAR(cap->callback);
+      PyErr_Format(PyExc_RuntimeError, "start_capture failed: %s", start_err.c_str());
+      return nullptr;
+    }
+  }
+  Py_RETURN_NONE;
+
+err:
+  Py_XDECREF(wm_bytes);
+  Py_XDECREF(node_bytes);
+  return nullptr;
+}
+
+static PyObject* ScreenCapture_stop_capture(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  if (cap->module) {
+    Py_BEGIN_ALLOW_THREADS  // joins the thread; release GIL so a final
+    try { cap->module->stop_capture(); } catch (...) {}  // trampoline runs; never throw across the C boundary
+    Py_END_ALLOW_THREADS
+  }
+  Py_CLEAR(cap->callback);
+  Py_RETURN_NONE;
+}
+
+static PyObject* ScreenCapture_request_idr_frame(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  if (cap->module) cap->module->request_idr();
+  Py_RETURN_NONE;
+}
+
+static PyObject* ScreenCapture_update_video_bitrate(PyObject* self, PyObject* arg) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  long n = PyLong_AsLong(arg);
+  if (n == -1 && PyErr_Occurred()) return nullptr;
+  if (cap->module) cap->module->update_video_bitrate((int)n);
+  Py_RETURN_NONE;
+}
+
+static PyObject* ScreenCapture_update_framerate(PyObject* self, PyObject* arg) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  double fps = PyFloat_AsDouble(arg);
+  if (fps == -1.0 && PyErr_Occurred()) return nullptr;
+  if (cap->module) cap->module->update_framerate(fps);
+  Py_RETURN_NONE;
+}
+
+static PyObject* ScreenCapture_update_vbv_buffer_size(PyObject* self, PyObject* arg) {
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  long n = PyLong_AsLong(arg);
+  if (n == -1 && PyErr_Occurred()) return nullptr;
+  if (cap->module) cap->module->update_vbv_buffer_size((int)n);
+  Py_RETURN_NONE;
+}
+
+static PyObject* ScreenCapture_get_is_capturing(PyObject* self, void* closure) {
+  (void)closure;
+  ScreenCaptureObject* cap = (ScreenCaptureObject*)self;
+  bool running = cap->module && cap->module->running.load() &&
+                 !cap->module->stop_requested.load();
+  return PyBool_FromLong(running ? 1 : 0);
+}
+
+static PyMethodDef ScreenCapture_methods[] = {
+    {"start_capture", ScreenCapture_start_capture, METH_VARARGS,
+     PyDoc_STR("start_capture(settings, callback): begin capture; callback(frame) per stripe.")},
+    {"stop_capture", ScreenCapture_stop_capture, METH_NOARGS,
+     PyDoc_STR("Stop capture and join the capture thread.")},
+    {"request_idr_frame", ScreenCapture_request_idr_frame, METH_NOARGS,
+     PyDoc_STR("Request the next encoded frame be an IDR (key) frame.")},
+    {"update_video_bitrate", ScreenCapture_update_video_bitrate, METH_O,
+     PyDoc_STR("update_video_bitrate(kbps): set the H.264 CBR bitrate.")},
+    {"update_framerate", ScreenCapture_update_framerate, METH_O,
+     PyDoc_STR("update_framerate(fps): set the target framerate.")},
+    {"update_vbv_buffer_size", ScreenCapture_update_vbv_buffer_size, METH_O,
+     PyDoc_STR("update_vbv_buffer_size(kb): set the H.264 VBV buffer size.")},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+static PyGetSetDef ScreenCapture_getset[] = {
+    {"is_capturing", ScreenCapture_get_is_capturing, nullptr,
+     PyDoc_STR("True while the capture thread is running."), nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+static PyType_Slot ScreenCapture_slots[] = {
+    {Py_tp_new, (void*)ScreenCapture_new},
+    {Py_tp_dealloc, (void*)ScreenCapture_dealloc},
+    {Py_tp_traverse, (void*)ScreenCapture_traverse},
+    {Py_tp_clear, (void*)ScreenCapture_clear},
+    {Py_tp_methods, (void*)ScreenCapture_methods},
+    {Py_tp_getset, (void*)ScreenCapture_getset},
+    {Py_tp_doc, (void*)PyDoc_STR("X11 screen capture + JPEG/H.264 encoder.")},
+    {0, nullptr},
+};
+
+static PyType_Spec ScreenCapture_spec = {
+    "pixelflux._capture.ScreenCapture",
+    sizeof(ScreenCaptureObject),
+    0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
+    ScreenCapture_slots,
+};
+
+// ----------------------------------------------------------------------------
+// Module definition
+// ----------------------------------------------------------------------------
+static PyMethodDef capture_module_methods[] = {
+    {"stripe_frame_from_buffer", py_stripe_frame_from_buffer, METH_VARARGS,
+     PyDoc_STR("stripe_frame_from_buffer(buf, data_type, stripe_y_start, stripe_height, frame_id): "
+               "copy a buffer into an owning StripeFrame.")},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+static struct PyModuleDef capture_module = {
+    PyModuleDef_HEAD_INIT,
+    "pixelflux._capture",
+    PyDoc_STR("Native X11 screen capture -> JPEG/H.264 (full C-API, zero-copy)."),
+    -1,
+    capture_module_methods,
+    nullptr, nullptr, nullptr, nullptr,
+};
+
+PyMODINIT_FUNC PyInit__capture(void) {
+  // Make Xlib/libxcb multithread-safe BEFORE any other Xlib call in this process. Each
+  // ScreenCapture instance opens/uses/closes its own Display from its own capture thread;
+  // without this, concurrent multi-instance Xlib use corrupts the glibc heap. Module import
+  // runs before any ScreenCapture exists (hence before the first XOpenDisplay), so this is the
+  // earliest, canonical entry point. call_once guards against any interpreter re-init.
+  static std::once_flag g_xinitthreads_once;
+  std::call_once(g_xinitthreads_once, []() { XInitThreads(); });
+
+  PyObject* m = PyModule_Create(&capture_module);
+  if (!m) return nullptr;
+
+  g_StripeFrameType = PyType_FromSpec(&StripeFrame_spec);
+  if (!g_StripeFrameType) { Py_DECREF(m); return nullptr; }
+  Py_INCREF(g_StripeFrameType);  // module-global keeps it alive forever
+  if (PyModule_AddObject(m, "StripeFrame", g_StripeFrameType) < 0) {
+    Py_DECREF(g_StripeFrameType);  // undo the AddObject ref we tried to give
+    Py_DECREF(g_StripeFrameType);  // undo the global ref
+    Py_DECREF(m);
+    return nullptr;
+  }
+
+  PyObject* capture_type = PyType_FromSpec(&ScreenCapture_spec);
+  if (!capture_type) { Py_DECREF(m); return nullptr; }
+  if (PyModule_AddObject(m, "ScreenCapture", capture_type) < 0) {
+    Py_DECREF(capture_type);
+    Py_DECREF(m);
+    return nullptr;
+  }
+
+  return m;
 }

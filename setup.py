@@ -1,11 +1,8 @@
 import os
-import subprocess
-import sys
 import platform
-from pathlib import Path
+import subprocess
 import setuptools
-from setuptools import setup
-from setuptools.command.build_ext import build_ext
+from setuptools import Extension, setup
 from setuptools_rust import Binding, RustExtension, Strip
 
 if "RUSTFLAGS" not in os.environ:
@@ -14,48 +11,39 @@ if "RUSTFLAGS" not in os.environ:
         print("Enabling x86-64-v3 optimizations (AVX2/FMA)")
         os.environ["RUSTFLAGS"] = "-C target-cpu=x86-64-v3"
 
-class BuildCtypesExt(build_ext):
-    def run(self):
-        super().run()
-        self.build_custom_cpp()
 
-    def build_custom_cpp(self):
-        compiler = "g++"
-        if hasattr(self, 'compiler') and self.compiler:
-             if hasattr(self.compiler, 'compiler_cxx'):
-                 compiler = self.compiler.compiler_cxx[0]
+def _pkg_config(*args):
+    """pkg-config output tokens, or [] when pkg-config / the .pc files are
+    missing (caller then relies on the hardcoded -l flags + include_dirs)."""
+    pkg_config = os.environ.get("PKG_CONFIG", "pkg-config")
+    try:
+        out = subprocess.check_output([pkg_config, *args], stderr=subprocess.DEVNULL)
+        return out.decode(errors="surrogateescape").split()
+    except (OSError, subprocess.CalledProcessError):
+        return []
 
-        lib_dir = Path(self.build_lib)
-        output_path = lib_dir / "pixelflux" / "screen_capture_module.so"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        sources = [
-            'pixelflux/screen_capture_module.cpp',
-            'pixelflux/include/xxhash.c'
-        ]
-        
-        include_dirs = ['pixelflux/include']
-        library_dirs = []
-        
-        if os.environ.get("CIBUILDWHEEL"):
-            include_dirs.append('/usr/local/include')
-            library_dirs.append('/usr/local/lib')
 
-        libraries = ['X11', 'Xext', 'Xfixes', 'jpeg', 'x264', 'yuv', 'dl', 'avcodec', 'avutil']
-        extra_compile_args = ['-std=c++17', '-Wno-unused-function', '-fPIC', '-O3', '-flto', '-shared']
-            
-        command = [compiler] + extra_compile_args + ['-o', str(output_path)]
-        for inc in include_dirs: command.append(f'-I{inc}')
-        for lib in library_dirs: command.append(f'-L{lib}')
-        command.extend(sources)
-        for lib in libraries: command.append(f'-l{lib}')
-            
-        print(f"Building C++ module: {' '.join(command)}")
-        try:
-            subprocess.check_call(command)
-        except subprocess.CalledProcessError as e:
-            print(f"C++ build failed with exit code {e.returncode}")
-            sys.exit(1)
+# Pull the toolchain include dirs (e.g. conda's $FLUX/include) from pkg-config so
+# the C++ ext finds ffmpeg/x11/etc. headers reliably. Some setuptools versions
+# drop CFLAGS' -I flags from the C++ compile, so we append pkg-config --cflags
+# directly to extra_compile_args (and never remove the hardcoded -l fallback,
+# keeping the existing build working when the .pc files are absent).
+_pkg_cflags = _pkg_config(
+    "--cflags", "x11", "xext", "xfixes", "libavcodec", "libavutil", "x264"
+)
+
+# Declarative C-API extension (full API, not Limited/abi3). xxhash.c is C but
+# compiled as part of this C++ Extension; setuptools compiles each source per
+# its own extension, so the .c stays C.
+capture_ext = Extension(
+    "pixelflux._capture",
+    sources=["pixelflux/screen_capture_module.cpp", "pixelflux/include/xxhash.c"],
+    include_dirs=["pixelflux/include"],
+    libraries=["X11", "Xext", "Xfixes", "jpeg", "x264", "yuv", "dl", "avcodec", "avutil"],
+    extra_compile_args=["-std=c++17", "-O3", "-fvisibility=hidden", "-Wno-unused-function"]
+    + _pkg_cflags,
+    language="c++",
+)
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -80,29 +68,29 @@ setup(
     license="MPL-2.0",
     url="https://github.com/linuxserver/pixelflux",
     packages=setuptools.find_packages(),
-    
+
+    ext_modules=[capture_ext],
+
     rust_extensions=[
         RustExtension(
-            "pixelflux.pixelflux_wayland", 
+            "pixelflux.pixelflux_wayland",
             "pixelflux_wayland/Cargo.toml",
             binding=Binding.PyO3,
             debug=False,
             strip=Strip.All
         )
     ],
-    
-    cmdclass={
-       "build_ext": BuildCtypesExt,
-    },
 
-    package_data={
-       "pixelflux": ["screen_capture_module.so"],
-    },
-    
     classifiers=[
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Operating System :: POSIX :: Linux",
     ],
-    python_requires=">=3.6",
+    python_requires=">=3.9",
     zip_safe=False,
 )

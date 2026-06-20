@@ -185,6 +185,7 @@ pub struct NvencEncoder {
     _nvenc_lib: Arc<NvencLibrary>,
     nvenc_funcs: NV_ENCODE_API_FUNCTION_LIST,
     recording_sink: Option<Arc<RecordingSink>>,
+    omit_stripe_headers: bool,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -250,6 +251,35 @@ impl Drop for NvencEncoder {
             (self.cuda.cuCtxDestroy_v2)(self.cuda_context);
         }
     }
+}
+
+/// Minimum H.264 level (nvenc_sys numeric values: 52/60/61/62) whose MaxFS
+/// (frame size in MBs) and MaxMBPS (MB rate) fit this resolution+fps per H.264
+/// Annex-A Table A-1, floored at 5.2. The level table starts at 5.2 (no 5.1
+/// entry) so <=4K stays deterministically at High@5.2 -- matching the C++/X11
+/// path (screen_capture_module.cpp), where 1080p/4K always streamed 5.2.
+/// Hardcoding 5.2 fails NVENC init above 4K (5.2 MaxFS=36864 MBs ~= 4096x2304);
+/// only >4K steps UP to 6.0/6.1/6.2. We pick the LOWEST fitting level at or above
+/// the 5.2 floor so the SPS advertises the smallest level a decoder must support,
+/// while the level is fixed from frame 1 (profile stays High) -- no mid-stream bump.
+fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
+    // Frame size in macroblocks and the per-second MB rate.
+    let mbs = ((width as u64 + 15) / 16) * ((height as u64 + 15) / 16);
+    let mbps = mbs * fps.max(1) as u64;
+    // (numeric level, MaxFS, MaxMBPS) ascending; floored at 5.2 (no 5.1 entry)
+    // to preserve the prior deterministic High@5.2 for typical <=4K streams.
+    const LEVELS: [(u32, u64, u64); 4] = [
+        (52, 36864, 2073600),   // 5.2 (floor)
+        (60, 139264, 4177920),  // 6.0
+        (61, 139264, 8355840),  // 6.1
+        (62, 139264, 16711680), // 6.2
+    ];
+    for &(level, max_fs, max_mbps) in &LEVELS {
+        if mbs <= max_fs && mbps <= max_mbps {
+            return level;
+        }
+    }
+    62 // Above 6.2's limits NVENC has no higher level; best effort.
 }
 
 impl NvencEncoder {
@@ -537,8 +567,19 @@ impl NvencEncoder {
             config.rcParams.constQP.qpInterP = settings.h264_crf as u32;
             config.rcParams.constQP.qpInterB = settings.h264_crf as u32;
             config.rcParams.constQP.qpIntra = settings.h264_crf as u32;
-            config.frameIntervalP = 1; 
+            config.frameIntervalP = 1;
             config.gopLength = 0xFFFFFFFF;
+            // Pin an explicit H.264 level + idrPeriod so the very first access unit already
+            // declares the final High profile at the deterministic level, matching the C++/X11
+            // path (screen_capture_module.cpp). Leaving level at AUTOSELECT lets early frames
+            // advertise a lower level; when NVENC later bumps it mid-stream, Windows Chromium's
+            // D3D11VideoDecoder (and WebCodecs) must re-init and drops frames. Compute the
+            // minimum Annex-A level for this resolution+fps, floored at 5.2: <=4K stays
+            // High@5.2; >4K needs 6.0/6.1/6.2 (else NVENC init fails). idrPeriod mirrors
+            // the infinite GOP above.
+            config.encodeCodecConfig.h264Config.level =
+                min_h264_level(width, height, settings.target_fps as u32);
+            config.encodeCodecConfig.h264Config.idrPeriod = 0xFFFFFFFF;
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoSignalTypePresentFlag = 1;
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat = 5;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag = 1;
@@ -676,6 +717,7 @@ impl NvencEncoder {
                 _nvenc_lib: nvenc_lib,
                 nvenc_funcs: function_list,
                 recording_sink,
+                omit_stripe_headers: settings.omit_stripe_headers,
             })
         }
     }
@@ -764,14 +806,24 @@ impl NvencEncoder {
 
         let data_ptr = lock_params.bitstreamBufferPtr as *const u8;
         let data_size = lock_params.bitstreamSizeInBytes as usize;
-        let mut output = Vec::with_capacity(10 + data_size);
+        let header_sz = if self.omit_stripe_headers { 0 } else { 10 };
+        let mut output = Vec::with_capacity(header_sz + data_size);
 
-        output.push(0x04);
-        output.push(if force_idr { 0x01 } else { 0x00 });
-        output.extend_from_slice(&(frame_number as u16).to_be_bytes());
-        output.extend_from_slice(&0u16.to_be_bytes());
-        output.extend_from_slice(&(self.width as u16).to_be_bytes());
-        output.extend_from_slice(&(self.height as u16).to_be_bytes());
+        if !self.omit_stripe_headers {
+            // Match X11: derive the type byte from the ACTUAL encoded picture type
+            // (IDR=0x01, I=0x02, P=0x00), not the force_idr request.
+            let type_hdr = match lock_params.pictureType {
+                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR => 0x01u8,
+                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => 0x02u8,
+                _ => 0x00u8,
+            };
+            output.push(0x04);
+            output.push(type_hdr);
+            output.extend_from_slice(&(frame_number as u16).to_be_bytes());
+            output.extend_from_slice(&0u16.to_be_bytes());
+            output.extend_from_slice(&(self.width as u16).to_be_bytes());
+            output.extend_from_slice(&(self.height as u16).to_be_bytes());
+        }
 
         if data_size > 0 && !data_ptr.is_null() {
             let slice = std::slice::from_raw_parts(data_ptr, data_size);

@@ -133,6 +133,7 @@ impl H264EncoderWrapper {
         frame_id: i64,
         force_idr: bool,
         fixed_header: &[u8],
+        omit_headers: bool,
         output_buf: &mut Vec<u8>,
         recording_sink: Option<&Arc<RecordingSink>>,
     ) -> bool {
@@ -172,22 +173,24 @@ impl H264EncoderWrapper {
             );
 
             if frame_size > 0 {
-                let header_len = 2 + fixed_header.len();
+                let header_len = if omit_headers { 0 } else { 2 + fixed_header.len() };
                 let total_len = header_len + frame_size as usize;
 
                 output_buf.clear();
                 output_buf.reserve(total_len);
-                output_buf.push(0x04);
 
-                let type_byte = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
-                    0x01
-                } else if pic_out.i_type == x264_sys::X264_TYPE_I as i32 {
-                    0x02
-                } else {
-                    0x00
-                };
-                output_buf.push(type_byte);
-                output_buf.extend_from_slice(fixed_header);
+                if !omit_headers {
+                    output_buf.push(0x04);
+                    let type_byte = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
+                        0x01
+                    } else if pic_out.i_type == x264_sys::X264_TYPE_I as i32 {
+                        0x02
+                    } else {
+                        0x00
+                    };
+                    output_buf.push(type_byte);
+                    output_buf.extend_from_slice(fixed_header);
+                }
 
                 let nal_slice = std::slice::from_raw_parts(nals, i_nals as usize);
                 for nal in nal_slice {
@@ -220,6 +223,17 @@ pub struct StripeState {
     pub packet_buf: Vec<u8>,
 }
 
+/// Encoded stripe payload plus the metadata the consumer needs as frame attributes
+/// (so it stays available even when the per-stripe header is omitted). data_type
+/// matches the Wayland bridge convention: JPEG=1, H.264=2.
+pub struct EncodedStripe {
+    pub data: Vec<u8>,
+    pub data_type: i32,
+    pub stripe_y_start: i32,
+    pub stripe_height: i32,
+    pub frame_id: i32,
+}
+
 /// @brief Main CPU encoding logic handling threading, striping, and format conversion.
 ///
 /// Divides the screen into horizontal stripes, checks for damage/motion, converts
@@ -247,7 +261,7 @@ pub fn encode_cpu(
     use_gpu: bool,
     recording_sink: Option<&Arc<RecordingSink>>,
     force_idr_all: bool,
-) -> Vec<Vec<u8>> {
+) -> Vec<EncodedStripe> {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -297,6 +311,7 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let target_fps = settings.target_fps;
+    let omit_headers = settings.omit_stripe_headers;
     let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
         recording_sink.cloned()
     } else {
@@ -388,16 +403,25 @@ pub fn encode_cpu(
                         format: pixel_format,
                     };
                     stripe_state.packet_buf.clear();
-                    stripe_state
-                        .packet_buf
-                        .extend_from_slice(&frame_counter.to_be_bytes());
-                    stripe_state
-                        .packet_buf
-                        .extend_from_slice(&(y_start as u16).to_be_bytes());
+                    if !omit_headers {
+                        stripe_state
+                            .packet_buf
+                            .extend_from_slice(&frame_counter.to_be_bytes());
+                        stripe_state
+                            .packet_buf
+                            .extend_from_slice(&(y_start as u16).to_be_bytes());
+                    }
                     match compressor.compress_to_vec(img) {
                         Ok(jpeg) => {
                             stripe_state.packet_buf.extend_from_slice(&jpeg);
-                            Some(stripe_state.packet_buf.clone())
+                            Some(EncodedStripe {
+                                data: stripe_state.packet_buf.clone(),
+                                data_type: 1,
+                                stripe_y_start: y_start as i32,
+                                // Report actual height for cross-backend parity (X11 reports it for JPEG too).
+                                stripe_height: actual_height as i32,
+                                frame_id: frame_counter as i32,
+                            })
                         }
                         Err(_) => None,
                     }
@@ -526,10 +550,17 @@ pub fn encode_cpu(
                             frame_counter as i64,
                             force_idr || force_idr_for_recording,
                             &fixed_header,
+                            omit_headers,
                             &mut stripe_state.packet_buf,
                             stripe_sink.as_ref(),
                         ) {
-                            Some(stripe_state.packet_buf.clone())
+                            Some(EncodedStripe {
+                                data: stripe_state.packet_buf.clone(),
+                                data_type: 2,
+                                stripe_y_start: y_start as i32,
+                                stripe_height: actual_height as i32,
+                                frame_id: frame_counter as i32,
+                            })
                         } else {
                             None
                         }
