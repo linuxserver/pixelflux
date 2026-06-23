@@ -1,3 +1,9 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixListener;
@@ -10,12 +16,11 @@ use crossbeam_channel::{bounded, Sender, TrySendError};
 
 /// Core settings and state for the out-of-band H.264 recording sink.
 ///
-/// Defines socket connection timeouts, polling intervals, environment fallbacks,
-/// keyframe cadence, and the primary RecordingSink structure used to multiplex
-/// the elementary stream to connected Unix socket clients.
+/// Defines socket connection timeouts, polling intervals, keyframe cadence, and
+/// the primary RecordingSink structure used to multiplex the elementary stream
+/// to connected Unix socket clients.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-pub const RECORDING_SOCKET_ENV: &str = "PIXELFLUX_RECORDING_SOCKET";
 const DEFAULT_KEYINT_FRAMES: u32 = 60;
 
 /// Per-client buffered-frame cap; a client that exceeds it is dropped as too slow.
@@ -38,21 +43,15 @@ pub struct RecordingSink {
 }
 
 impl RecordingSink {
-    /// @brief Resolves the configured socket path and tries to bind it.
+    /// @brief Binds the configured socket path, if one is set.
     ///
-    /// @input settings_path: The configured path for the socket.
+    /// @input settings_path: The configured path for the socket ("" = recording off).
     /// @return Option containing the new RecordingSink instance.
     pub fn try_bind(settings_path: &str) -> Option<Arc<Self>> {
-        let path = if !settings_path.is_empty() {
-            settings_path.to_string()
-        } else {
-            match std::env::var(RECORDING_SOCKET_ENV) {
-                Ok(p) if !p.is_empty() => p,
-                _ => return None,
-            }
-        };
-
-        match Self::bind(path) {
+        if settings_path.is_empty() {
+            return None;
+        }
+        match Self::bind(settings_path.to_string()) {
             Ok(sink) => Some(Arc::new(sink)),
             Err(e) => {
                 eprintln!("[recording_sink] bind failed: {:?}", e);
@@ -235,8 +234,7 @@ fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> s
     let mut written = 0usize;
     while written < buf.len() {
         if stop.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "writer stopped (client dropped)",
             ));
         }

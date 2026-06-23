@@ -1,3 +1,9 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Cursor as IoCursor;
@@ -138,6 +144,7 @@ pub fn wayland_utime() -> u64 {
 }
 
 /// @brief Enum wrapper for supported GPU hardware encoders.
+#[allow(clippy::large_enum_variant)]
 pub enum GpuEncoder {
     Vaapi(VaapiEncoder),
     Nvenc(NvencEncoder),
@@ -176,8 +183,9 @@ pub struct AppState {
     pub xdg_activation_state: XdgActivationState,
     pub primary_selection_state: PrimarySelectionState,
     pub popups: PopupManager,
+    // Render target for the pixman memory-throttle path only; normal readback capture
+    // renders/reads back into pooled buffers owned by `encode_pool`.
     pub frame_buffer: Vec<u8>,
-    pub nv12_buffer: Vec<u8>,
 
     pub gles_renderer: Option<GlesRenderer>,
     pub pixman_renderer: Option<PixmanRenderer>,
@@ -189,11 +197,8 @@ pub struct AppState {
     pub settings: RustCaptureSettings,
     pub callback: Option<Py<PyAny>>,
     pub cursor_callback: Option<Py<PyAny>>,
-    pub stripes: Vec<StripeState>,
 
     pub last_log_time: Instant,
-    pub encoded_frame_count: u32,
-    pub total_stripes_encoded: u32,
     pub start_time: Instant,
     pub clock: Clock<Monotonic>,
 
@@ -211,6 +216,10 @@ pub struct AppState {
     pub synthetic_mod_refcounts: std::collections::HashMap<u32, u32>,
     pub use_gpu: bool,
 
+    // ZERO-COPY GPU session only (GLES render + same-GPU dmabuf encode); its EGL/dmabuf
+    // handles are calloop-affine, so this encoder runs inline. Every readback path (CPU
+    // encoders, cross-GPU or pixman HW sessions) instead runs on the encode thread behind
+    // `encode_pool`, so the calloop overlaps the next render with the current encode.
     pub video_encoder: Option<GpuEncoder>,
     pub vaapi_state: StripeState,
     pub cursor_helper: Cursor,
@@ -222,12 +231,39 @@ pub struct AppState {
     pub current_cursor_icon: Option<CursorImageStatus>,
     pub cursor_buffer: Option<WlBuffer>,
     pub cursor_cache: std::collections::HashMap<u64, Vec<u8>>,
+    // Dynamic keymap overlay for keysyms absent from the base layout (Unicode
+    // codepoints, symbols): spare keycodes past the base range, bound on demand and
+    // round-robin recycled. base_keymap_string caches the pristine pre-overlay map.
+    pub base_keymap_string: Option<String>,
+    pub overlay_slots: [u32; crate::OVERLAY_SLOTS],
+    pub overlay_next: usize,
     pub render_cursor_on_framebuffer: bool,
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
+    // True when auto-GPU selection (not an explicit path) picked render_node_path;
+    // StartCapture then aims the encoder at the same node unless one was chosen.
+    pub auto_gpu_selected: bool,
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
+    // Encoded frames are handed to a dedicated delivery thread (not the calloop thread) so a slow,
+    // GIL-holding Python callback can't stall input/control dispatch. Capacity-1 rendezvous mirrors
+    // the X11 FramePool single slot: non-dropping, ordered, <=1 frame of blocking backpressure.
+    pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
+    pub deliver_join: Option<std::thread::JoinHandle<()>>,
+    // Readback capture||encode split: the calloop renders/reads back into a pooled host
+    // buffer and publishes it; the encode thread owns the encoders (wayland_encode_loop).
+    // None while a zero-copy GPU session runs. The join hands the thread's HW session
+    // back so a restart can reconfigure it in place instead of rebuilding it.
+    pub encode_pool: Option<Arc<crate::WlFramePool>>,
+    pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    pub encode_controls: Arc<crate::WlEncodeControls>,
+    pub encode_stats: Arc<crate::WlEncodeStats>,
+    // Buffer-age bookkeeping for the pixman path, which renders INTO the pooled buffers:
+    // ages are "renders since this slot was last the target". GLES renders into one fixed
+    // offscreen buffer and never consults these.
+    pub pool_last_render: Vec<u64>,
+    pub render_seq: u64,
 }
 
 impl PointerConstraintsHandler for AppState {
@@ -481,7 +517,13 @@ impl AppState {
     /// This method accepts a `CursorImageStatus` (Named, Hidden, or Surface), extracts
     /// the relevant pixel data (checking the hash cache for surfaces to avoid re-encoding),
     /// and outputs the final PNG bytes and hotspot coordinates to the registered Python callback.
-    fn send_cursor_image(&mut self, image: &CursorImageStatus) {
+    // pub(crate): also invoked from the calloop command handlers in lib.rs to replay the retained
+    // cursor when a callback (re)registers or a capture (re)starts.
+    pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
+        // Teardown gate: never attach to a finalizing interpreter from this thread.
+        if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(ref cb) = self.cursor_callback {
             let (msg_type, data, hot_x, hot_y) = match image {
                 CursorImageStatus::Named(icon) => {
@@ -581,7 +623,7 @@ impl AppState {
                                                     Some(o) => o,
                                                     None => continue,
                                                 };
-                                                if offset.checked_add(4).map_or(false, |end| end <= raw_bytes.len()) {
+                                                if offset.checked_add(4).is_some_and(|end| end <= raw_bytes.len()) {
                                                     // Xrgb8888 has no alpha; byte 3 is padding.
                                                     let alpha = if format == wl_shm::Format::Xrgb8888 {
                                                         255
@@ -623,10 +665,10 @@ impl AppState {
                                         let height = dmabuf.height() as i32;
 
                                         match renderer.bind(&mut dmabuf) {
-                                            Ok(mut frame) => {
+                                            Ok(frame) => {
                                                 let rect = Rectangle::new((0, 0).into(), (width, height).into());
                                                 
-                                                match renderer.copy_framebuffer(&mut frame, rect, Fourcc::Abgr8888) {
+                                                match renderer.copy_framebuffer(&frame, rect, Fourcc::Abgr8888) {
                                                     Ok(mapping) => {
                                                         match renderer.map_texture(&mapping) {
                                                             Ok(data) => {
@@ -692,12 +734,15 @@ impl AppState {
                     if !final_png.is_empty() {
                         ("png", final_png, hot_x, hot_y)
                     } else {
+                        // Transient: the surface's buffer wasn't readable (common during a
+                        // stop/start replay). An intentional pointer hide arrives as Hidden,
+                        // so suppress this instead of blanking the consumer's last cursor.
                         ("surface", Vec::new(), 0, 0)
                     }
                 }
             };
 
-            if !data.is_empty() || msg_type == "hide" || msg_type == "surface" {
+            if !data.is_empty() || msg_type == "hide" {
                 Python::attach(|py| {
                     let py_bytes = PyBytes::new(py, &data);
                     let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
@@ -777,6 +822,7 @@ impl FractionalScaleHandler for AppState {
 /// (mouse, keyboard, touch). This struct bridges the gap between the abstract
 /// input event and the concrete Wayland surface contained within a `Window`.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum FocusTarget {
     Window(Window),
     Popup(PopupKind),

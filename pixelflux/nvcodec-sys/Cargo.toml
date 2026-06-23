@@ -1,0 +1,21 @@
+[package]
+name = "nvcodec-sys"
+description = "FFI bindings for the NVIDIA Video Codec SDK (NVENC) and the CUDA driver subset used by pixelflux. Generated from the bundled NVIDIA SDK headers in headers/ (NVENCAPI 13.0, from FFmpeg/nv-codec-headers sdk/13.0) and committed under src/bindgen/, so normal builds need no libclang. The NVIDIA headers retain their own license."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+publish = false
+
+[features]
+default = []
+# CUDA driver bindings (NVENC needs a CUDA context + device upload).
+cuda = []
+# Opt-in: regenerate src/bindgen/*.rs from the bundled headers. Needs libclang. OFF by default
+# so end-user / cibuildwheel builds compile the committed bindings with no extra toolchain.
+regen = ["bindgen", "regex"]
+
+[build-dependencies]
+# Pinned to the version that produced the committed bindings so a regen reproduces them.
+bindgen = { version = "=0.59.2", default-features = false, features = ["runtime"], optional = true }
+regex = { version = "1", optional = true }

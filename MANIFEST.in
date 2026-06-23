@@ -1,9 +1,10 @@
-graft pixelflux
+include pixelflux/Cargo.toml
+include pixelflux/Cargo.lock
+recursive-include pixelflux/src *
+recursive-include pixelflux/nvcodec-sys *
 recursive-exclude pixelflux *.so *.pyc
-prune pixelflux/__pycache__
-include pixelflux_wayland/Cargo.toml
-recursive-include pixelflux_wayland/src *
-recursive-exclude pixelflux_wayland *.so
-prune pixelflux_wayland/target
+prune pixelflux/target
+prune pixelflux/nvcodec-sys/target
 include pyproject.toml
 include README.md
+include setup.py

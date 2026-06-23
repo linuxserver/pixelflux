@@ -1,3 +1,9 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 use image::{ImageBuffer, Rgba};
 use std::io::Cursor as IoCursor;
 use std::io::Read;
@@ -15,14 +21,13 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// @brief Loads the default cursor theme defined by environment variables or falls back to a generated default.
+    /// @brief Loads the cursor theme (XCURSOR_THEME) at the requested size.
+    /// @input size_override: Pixel size from the CaptureSettings cursor_size field
+    ///        (selkies resolves --cursor-size / XCURSOR_SIZE); <=0 = default 24.
     /// @return Cursor: The initialized cursor manager.
-    pub fn load() -> Cursor {
+    pub fn load(size_override: i32) -> Cursor {
         let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
-        let size = std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
+        let size: u32 = if size_override > 0 { size_override as u32 } else { 24 };
 
         let theme = CursorTheme::load(&name);
         let icons = load_icon(&theme, "default").unwrap_or_else(|_| {

@@ -7,56 +7,42 @@
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 
-It supports CPU-based encoding (libx264, libjpeg-turbo) as well as hardware-accelerated H.264 encoding via NVIDIA's NVENC and VA-API for Intel/AMD GPUs. The Wayland backend features a **zero-copy pipeline**, passing GPU buffers directly to the encoder to minimize latency and CPU usage.
+It supports CPU-based encoding (x264, JPEG) as well as hardware-accelerated H.264 encoding via NVIDIA's NVENC and VA-API for Intel/AMD GPUs. Both backends share a **zero-copy pipeline** that minimizes copies and latency end to end.
 
 ## Installation
 
-This module relies on native C++ (X11) and Rust (Wayland) extensions that are compiled during installation.
+pixelflux is a single self-contained **Rust** extension (no C/C++ sources) compiled during installation. Both the X11 and Wayland backends, all encoders, and the Python API live in it.
 
 ### 1. Prerequisites
 
-Ensure you have a C++ compiler (`g++`), the Rust toolchain (`cargo`), and development files for Python and the underlying graphics libraries.
-
-**Base Dependencies (Debian/Ubuntu):**
-```bash
-sudo apt-get update && \
-sudo apt-get install -y \
-  g++ \
-  git \
-  curl \
-  python3-dev \
-  libavcodec-dev \
-  libavutil-dev \
-  libjpeg-turbo8-dev \
-  libx264-dev \
-  libyuv-dev
-```
-
-**X11 Backend Dependencies:**
-```bash
-sudo apt-get install -y \
-  libx11-dev \
-  libxext-dev \
-  libxfixes-dev
-```
-
-**Wayland Backend Dependencies:**
-To build the Rust-based Wayland backend, you need the Rust toolchain and Wayland/DRM libraries:
+Ensure you have the Rust toolchain (`cargo`), Python development files, and the development libraries below.
 
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install Libraries
+# Build dependencies (Debian/Ubuntu)
+sudo apt-get update && \
 sudo apt-get install -y \
+  git \
+  curl \
+  python3-dev \
+  cmake \
+  nasm \
+  libclang-dev \
+  libavcodec-dev \
+  libavutil-dev \
+  libx264-dev \
+  libturbojpeg0-dev \
   libgbm-dev \
   libdrm-dev \
   libwayland-dev \
   libinput-dev \
   libxkbcommon-dev \
-  libva-dev \
-  libclang-dev
+  libva-dev
 ```
+
+> **Notes:** the FFmpeg bindings (`ffmpeg-next` 8.1) require **FFmpeg 8.1**; on distros shipping an older FFmpeg, install a newer build and point `PKG_CONFIG_PATH` at it. X11 capture uses pure-Rust XCB (no `libX11`/`libxcb`/`Xfixes` dev packages needed); colorspace conversion is pure-Rust and the NVENC/CUDA libraries are loaded at runtime (no compile-time NVIDIA packages).
 
 ### 2. Hardware Acceleration (Optional but Recommended)
 *   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
@@ -138,15 +124,15 @@ settings.jpeg_quality = 75              # Quality for changed stripes (0-100)
 settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripes (0-100)
 
 # --- H.264 Settings ---
-settings.h264_crf = 25                            # CRF value (0-51, lower is better quality/higher bitrate)
-settings.h264_paintover_crf = 18                  # CRF for H.264 paintover on static content. Must be lower than h264_crf to activate.
-settings.h264_paintover_burst_frames = 5          # Number of high-quality frames to send in a burst when a paintover is triggered.
-settings.h264_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Supported by software encoding and NVENC.
-settings.h264_fullframe = True                    # Encode full frames (required for HW accel) instead of just changed stripes
-settings.h264_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
-settings.h264_cbr_mode = False                    # Switches to CBR mode and ignores CRF value. Used in conjunction with h264_bitrate_kbps.
-settings.h264_bitrate_kbps = 4000                 # Target bitrate for CBR mode. Required when h264_cbr_mode is enabled.
-settings.h264_vbv_buffer_size_kb = 400            # Optional VBV buffer size in kilobits for custom buffer size.
+settings.video_crf = 25                            # CRF value (0-51, lower is better quality/higher bitrate)
+settings.video_paintover_crf = 18                  # CRF for H.264 paintover on static content. Must be lower than video_crf to activate.
+settings.video_paintover_burst_frames = 5          # Number of high-quality frames to send in a burst when a paintover is triggered.
+settings.video_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Supported by software encoding and NVENC.
+settings.video_fullframe = True                    # Encode full frames (required for HW accel) instead of just changed stripes
+settings.video_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
+settings.video_cbr_mode = False                    # Switches to CBR mode and ignores CRF value. Used in conjunction with video_bitrate_kbps.
+settings.video_bitrate_kbps = 4000                 # Target bitrate for CBR mode. Required when video_cbr_mode is enabled.
+settings.video_vbv_multiplier = 1.5                # Optional CBR VBV size as a multiple of one frame's bit budget (0 = auto: 1.5, or 3 with periodic keyframes).
 settings.auto_adjust_screen_capture_size = True   # Allow pixelflux to adjust its capture width and height.
 
 # --- Hardware Acceleration ---
@@ -247,7 +233,7 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 2.  **Export:** This buffer is exported as a `Dmabuf` (file descriptor).
 3.  **Encoding:** The `Dmabuf` is imported directly into the encoder context (NVENC or VA-API) without ever copying pixel data to system RAM (CPU).
 
-**Performance Note:** Enabling **watermarking** or utilizing a render node different from the encoding node will force a "Readback" fallback, copying pixels to the CPU and breaking the zero-copy chain. This increases latency and CPU load.
+**Performance Note:** Software (Pixman) rendering, the absence of a hardware encoder, or utilizing a render node different from the encoding node will force a "Readback" fallback, copying pixels to the CPU and breaking the zero-copy chain (higher latency and CPU load). A watermark does **not** force readback — on the GPU path it is composited into the frame before encoding.
 
 ## Recording Sink (Wayland)
 
@@ -275,58 +261,27 @@ ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -prese
 *   **Multi-GPU containers:** When several GPUs are exposed to a container, NVENC is filtered
     in-process to the GPU you selected (no separate `LD_PRELOAD` shim is required). Verified on
     NVIDIA drivers 570–595.
-*   **4:4:4 (High 4:4:4):** Set `h264_fullcolor = True` to encode full-chroma H.264 via NVENC
-    (`h264_fullcolor` codec), in addition to the software path.
+*   **4:4:4 (High 4:4:4):** Set `video_fullcolor = True` to encode full-chroma H.264 via NVENC
+    (`video_fullcolor` codec), in addition to the software path.
 *   **Force a keyframe on demand:** `capture.request_idr_frame()` forces an IDR frame, e.g. when
     a client reconnects or its decoder is reset. It routes to whichever encoder is active
     (NVENC, VA-API, or software) and is a no-op while no capture is running.
 
-### Optional CUDA Color Conversion (NVRTC)
+### NVENC color conversion
 
-NVENC encoding can optionally use a CUDA (NVRTC) kernel for ARGB→NV12 colorspace conversion,
-loading `libnvrtc` at runtime. If `libnvrtc` is **absent or incompatible, pixelflux silently
-falls back to the libyuv CPU conversion** — this is not a failure. Two environment kill-switches
-let you disable the GPU paths explicitly:
-
-```bash
-export PIXELFLUX_NO_CUDA_CONVERT=1     # disable the CUDA conversion kernel (use libyuv CPU path)
-export PIXELFLUX_NVENC_DEVICE_INPUT=0  # disable feeding NVENC a device buffer directly
-```
-
-#### Matching NVRTC to your NVIDIA driver
-
-NVRTC emits PTX which the driver then JIT-compiles. A **newer** NVRTC can emit a PTX ISA version
-the **older** driver cannot JIT, so the installed NVRTC must be **≤ the driver's CUDA version**.
-(The kernel is device-cc-aware and targets as low as Kepler `sm_35`, so it is broadly
-forward-compatible across GPUs; the constraint is purely the PTX ISA version the driver can JIT.)
-Read your driver's CUDA version from `nvidia-smi` (the **"CUDA Version"** field, top-right) and
-pin NVRTC to it.
-
-**Recommended (version-agnostic):** install NVIDIA's `cuda-toolkit` meta-package and let its
-`[nvrtc]` extra pull the correct nvrtc wheel for the version you pin — no need to know the
-per-CUDA package name. These resolve from the public PyPI (no extra index required):
-
-```bash
-pip install "cuda-toolkit[nvrtc]==13.3.*"   # CUDA 13
-pip install "cuda-toolkit[nvrtc]==12.9.*"   # CUDA 12
-pip install "cuda-toolkit[nvrtc]==11.8.*"   # CUDA 11 (Kepler and older / driver <= 470)
-```
-
-`pip install pixelflux[cuda]` does the same (latest/CUDA 13); pin as above for older drivers.
-
-> **Note:** plain `pip install pixelflux` does **not** auto-install NVRTC, because the right
-> version depends on your driver. Use `pixelflux[cuda]` or one of the commands above. If no
-> compatible `libnvrtc` is present, conversion just falls back to the libyuv CPU path with no
-> failure.
+NVENC encodes the captured ARGB directly (the driver's hardware does the ARGB→NV12 colorspace
+conversion in BT.709), so there is **no CUDA Toolkit / NVRTC requirement** — only the NVIDIA
+driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. Nothing extra to
+install at build or runtime beyond the driver.
 
 ## Features
 
-*   **Hybrid Backend:**
-    *   **X11 (C++):** Legacy support using XShm.
-    *   **Wayland (Rust):** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
+*   **Dual Backend (one Rust extension):**
+    *   **X11:** XShm capture via pure-Rust XCB, with XFixes cursor and watermark compositing.
+    *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
-    *   **Software:** libx264 (H.264, incl. 4:4:4) and libjpeg-turbo (JPEG) with multi-threaded striping.
-    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, multi-GPU containers, optional CUDA conversion) and VA-API (Intel/AMD) with Zero-Copy support.
+    *   **Software:** x264 (H.264, incl. 4:4:4) and JPEG with multi-threaded striping.
+    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct BT.709, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via `SELKIES_AUTO_GPU`.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**
