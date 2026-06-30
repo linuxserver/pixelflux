@@ -1,83 +1,60 @@
 use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor as IoCursor;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gbm::{BufferObject, Device as RawGbmDevice};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::Mutex;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use smithay::backend::renderer::utils::RendererSurfaceState;
-use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::allocator::{ Buffer, Fourcc};
-use smithay::backend::renderer::{
-    Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
-};
-use smithay::input::dnd::{DndFocus, Source};
-use std::sync::Arc;
-use crate::wayland::cursor::Cursor;
-use smithay::wayland::viewporter::ViewporterState;
-use smithay::delegate_viewporter;
-use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
-use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
-use smithay::wayland::relative_pointer::RelativePointerManagerState;
-use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
-use smithay::input::pointer::PointerHandle;
-use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
-use smithay::delegate_single_pixel_buffer;
-use smithay::desktop::{PopupKind, PopupManager};
-use smithay::wayland::presentation::PresentationState;
-use smithay::delegate_presentation;
-use smithay::wayland::foreign_toplevel_list::{
-    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
-};
-use smithay::wayland::shell::xdg::decoration::{
-    XdgDecorationHandler, XdgDecorationState,
-};
-use smithay::desktop::{layer_map_for_output, LayerSurface as DesktopLayerSurface};
-use smithay::wayland::shell::wlr_layer::{
-    WlrLayerShellHandler, WlrLayerShellState, Layer as WlrLayer, LayerSurface as WlrLayerSurface,
-};
-use smithay::delegate_layer_shell;
-use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-use smithay::{delegate_foreign_toplevel_list, delegate_xdg_decoration};
-use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
-use smithay::delegate_data_control;
-use smithay::wayland::xdg_activation::{
-    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
-};
-use smithay::delegate_xdg_activation;
-use smithay::wayland::selection::primary_selection::{
-    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
-};
-use smithay::delegate_primary_selection;
 
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_output, delegate_seat, delegate_shm, delegate_virtual_keyboard_manager,
-    delegate_xdg_shell, delegate_relative_pointer, delegate_pointer_warp, 
-    delegate_pointer_constraints,
-    desktop::{Space, Window},
+    delegate_compositor, delegate_data_control, delegate_data_device, delegate_dmabuf,
+    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_layer_shell,
+    delegate_output, delegate_pointer_constraints, delegate_pointer_warp, delegate_presentation,
+    delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_viewporter, delegate_virtual_keyboard_manager,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+
+    backend::{
+        allocator::{dmabuf::Dmabuf, Buffer, Fourcc},
+        renderer::{
+            utils::RendererSurfaceState,
+            Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
+        },
+    },
+    desktop::{
+        layer_map_for_output, LayerSurface as DesktopLayerSurface,
+        PopupKind, PopupManager, Space, Window,
+    },
     input::{
+        dnd::{DndFocus, Source},
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{
-            AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, CursorImageStatus, GestureHoldBeginEvent,
-            GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
-            GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
+            AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, CursorImageStatus,
+            GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+            GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
+            GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, PointerHandle,
+            PointerTarget, RelativeMotionEvent,
         },
         touch::{DownEvent, OrientationEvent, ShapeEvent, TouchTarget, UpEvent},
         Seat, SeatHandler, SeatState,
     },
     output::Output,
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
+        wayland_protocols::{
+            xdg::{
+                decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+                shell::server::xdg_toplevel::State as XdgState,
+            },
+        },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-            protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+            protocol::{wl_buffer::WlBuffer, wl_pointer::WlPointer, wl_surface::WlSurface},
             Client, DisplayHandle, Resource,
         },
     },
@@ -89,30 +66,50 @@ use smithay::{
             CompositorState, SurfaceAttributes,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
+        foreign_toplevel_list::{
+            ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+        },
         fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        pointer_warp::{PointerWarpHandler, PointerWarpManager},
+        presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
         selection::{
-            data_device::{
-                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+            data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
+            primary_selection::{
+                set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
             },
+            wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler,
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
+        shell::{
+            wlr_layer::{
+                WlrLayerShellHandler, WlrLayerShellState,
+                Layer as WlrLayer, LayerSurface as WlrLayerSurface,
+            },
+            xdg::{
+                decoration::{XdgDecorationHandler, XdgDecorationState},
+                PopupSurface, PositionerState, ToplevelSurface,
+                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
+            },
         },
         shm::{with_buffer_contents, ShmHandler, ShmState, BufferAccessError},
+        single_pixel_buffer::SinglePixelBufferState,
+        viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState,
+            XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 
-use crate::encoders::overlay::OverlayState;
-use crate::encoders::vaapi::VaapiEncoder;
+use crate::encoders::{overlay::OverlayState, vaapi::VaapiEncoder};
 use crate::nvenc::NvencEncoder;
+use crate::wayland::cursor::Cursor;
 use crate::{RustCaptureSettings, StripeState};
-
-use std::sync::atomic::{AtomicU32, Ordering};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -216,6 +213,7 @@ pub struct AppState {
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
+    pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl PointerConstraintsHandler for AppState {

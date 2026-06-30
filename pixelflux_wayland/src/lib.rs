@@ -25,10 +25,6 @@ use yuv::{
     BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
 };
 
-use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
-use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::presentation::PresentationState;
-use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::{
     backend::{
         allocator::{
@@ -51,7 +47,10 @@ use smithay::{
             Bind, ImportAll, ImportEgl, ImportMem,
         },
     },
-    desktop::{space::SpaceRenderElements, Space},
+    desktop::{
+        layer_map_for_output, space::SpaceRenderElements,
+        PopupManager, Space,
+    },
     input::{
         keyboard::{FilterResult, XkbConfig},
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
@@ -70,24 +69,33 @@ use smithay::{
     wayland::{
         compositor::{with_states, CompositorState},
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
+        foreign_toplevel_list::ForeignToplevelListState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
-        seat::WaylandFocus,
-        shell::xdg::XdgShellState,
-        shm::ShmState,
-        socket::ListeningSocketSource,
-        virtual_keyboard::VirtualKeyboardManagerState,
-        pointer_warp::PointerWarpManager,
-        relative_pointer::RelativePointerManagerState,
         pointer_constraints::PointerConstraintsState,
-        foreign_toplevel_list::ForeignToplevelListState,
-        shell::xdg::decoration::XdgDecorationState,
+        pointer_warp::PointerWarpManager,
+        presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
+        seat::WaylandFocus,
+        selection::{
+            data_device::DataDeviceState,
+            primary_selection::PrimarySelectionState,
+            wlr_data_control::DataControlState,
+        },
+        shell::{
+            wlr_layer::WlrLayerShellState,
+            xdg::{
+                decoration::XdgDecorationState,
+                XdgShellState,
+            },
+        },
+        shm::ShmState,
+        single_pixel_buffer::SinglePixelBufferState,
+        socket::ListeningSocketSource,
+        viewporter::ViewporterState,
+        virtual_keyboard::VirtualKeyboardManagerState,
+        xdg_activation::XdgActivationState,
     },
-    desktop::{layer_map_for_output, PopupManager},
-    wayland::shell::wlr_layer::WlrLayerShellState,
-    wayland::xdg_activation::XdgActivationState,
-    wayland::selection::primary_selection::PrimarySelectionState,
 };
 
 pub mod encoders {
@@ -99,6 +107,7 @@ pub mod encoders {
 
 pub mod wayland;
 pub mod recording_sink;
+pub mod computer_use;
 
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
@@ -245,6 +254,9 @@ pub enum ThreadCommand {
     PointerButton { btn: u32, state: u32 },
     PointerAxis { x: f64, y: f64 },
     UpdateCursorConfig { render_on_framebuffer: bool },
+    CuScreenshot { resp: std::sync::mpsc::Sender<Vec<u8>> },
+    CuCursorPosition { resp: std::sync::mpsc::Sender<(f64, f64)> },
+    CuGetInfo { resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
 }
 
 fn get_gpu_driver(card_index: i32) -> String {
@@ -282,7 +294,10 @@ fn get_gpu_driver(card_index: i32) -> String {
 ///      "Zero-Copy" path (sharing DMABUFs directly with hardware encoders) vs the "Readback"
 ///      path (copying pixels for CPU-based processing/encoding).
 ///    - **Transmission**: Sends the encoded video packets back to the Python layer via callback.
-fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>) {
+fn run_wayland_thread(
+    command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
+    command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+) {
     let mut width: i32 = 1024;
     let mut height: i32 = 768;
 
@@ -501,6 +516,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         render_cursor_on_framebuffer: false,
         render_node_path,
         recording_sink: None,
+        pending_screenshot: None,
     };
 
     let output = Output::new(
@@ -989,6 +1005,25 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 CalloopEvent::Msg(ThreadCommand::UpdateCursorConfig { render_on_framebuffer }) => {
                     state.render_cursor_on_framebuffer = render_on_framebuffer;
                 }
+                CalloopEvent::Msg(ThreadCommand::CuScreenshot { resp }) => {
+                    state.pending_screenshot = Some(resp);
+                }
+                CalloopEvent::Msg(ThreadCommand::CuCursorPosition { resp }) => {
+                    let pos = state.seat.get_pointer()
+                        .map(|p| p.current_location())
+                        .unwrap_or_else(|| (0.0f64, 0.0f64).into());
+                    let scale = state.settings.scale;
+                    let fb_x = pos.x * scale;
+                    let fb_y = pos.y * scale;
+                    let _ = resp.send((fb_x, fb_y));
+                }
+                CalloopEvent::Msg(ThreadCommand::CuGetInfo { resp }) => {
+                    let _ = resp.send((
+                        state.settings.width,
+                        state.settings.height,
+                        state.settings.scale,
+                    ));
+                }
                 CalloopEvent::Closed => {}
             }
         })
@@ -1108,7 +1143,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                 state.last_log_time = now;
             }
 
-            if !state.is_capturing {
+            if !state.is_capturing && state.pending_screenshot.is_none() {
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
@@ -1138,7 +1173,7 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                     }
                 }
 
-                let needs_readback = !rendering_gpu || !encoding_gpu_avail || different_gpu;
+                let needs_readback = !rendering_gpu || !encoding_gpu_avail || different_gpu || state.pending_screenshot.is_some();
                 if rendering_gpu {
                     if let Some(renderer) = state.gles_renderer.as_mut() {
                         if let Some((_bo, dmabuf)) = state.offscreen_buffer.as_mut() {
@@ -1688,6 +1723,28 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
                             }
                         }
                     }
+                    if let Some(resp) = state.pending_screenshot.take() {
+                        if render_success && !state.frame_buffer.is_empty() {
+                            let w = state.settings.width as u32;
+                            let h = state.settings.height as u32;
+                            let png = if state.use_gpu {
+                                crate::computer_use::encode_png_rgba(&state.frame_buffer, w, h)
+                            } else {
+                                let mut rgba = state.frame_buffer.clone();
+                                for px in rgba.chunks_exact_mut(4) {
+                                    px.swap(0, 2);
+                                }
+                                crate::computer_use::encode_png_rgba(&rgba, w, h)
+                            };
+                            match png {
+                                Ok(data) => { let _ = resp.send(data); }
+                                Err(e) => { let _ = resp.send(Vec::new()); eprintln!("[ComputerUse] PNG encode error: {}", e); }
+                            }
+                        } else {
+                            let _ = resp.send(Vec::new());
+                        }
+                    }
+
                     state.frame_counter = state.frame_counter.wrapping_add(1);
                 }
             }
@@ -1708,6 +1765,18 @@ fn run_wayland_thread(command_rx: smithay::reexports::calloop::channel::Channel<
         })
         .unwrap();
 
+    if let Ok(port_str) = std::env::var("PIXELFLUX_CU") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            println!("[ComputerUse] Starting server on port {} (PIXELFLUX_CU={})", port, port);
+            let cu_tx = command_tx.clone();
+            thread::spawn(move || {
+                crate::computer_use::run_cu_server(cu_tx, port);
+            });
+        } else {
+            println!("[ComputerUse] Invalid PIXELFLUX_CU value: '{}' - expected a port number", port_str);
+        }
+    }
+
     event_loop.run(None, &mut state, |state| { state.dh.flush_clients().unwrap(); }).unwrap();
 }
 
@@ -1725,8 +1794,9 @@ impl WaylandBackend {
     #[new]
     fn new() -> Self {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
+        let tx_for_thread = tx.clone();
         thread::spawn(move || {
-            run_wayland_thread(rx);
+            run_wayland_thread(rx, tx_for_thread);
         });
         WaylandBackend { tx }
     }
