@@ -70,88 +70,112 @@ pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
 
 fn scancode_for_char(c: char) -> Option<(u32, bool)> {
     Some(match c {
-        'a'..='z' => (30 + (c as u32 - 'a' as u32), false),
-        'A'..='Z' => (30 + (c as u32 - 'A' as u32), true),
-        '0' => (11, false), '1' => (2, false), '2' => (3, false),
-        '3' => (4, false), '4' => (5, false), '5' => (6, false),
-        '6' => (7, false), '7' => (8, false), '8' => (9, false),
-        '9' => (10, false),
-        '!' => (2, true), '@' => (3, true), '#' => (4, true),
-        '$' => (5, true), '%' => (6, true), '^' => (7, true),
-        '&' => (8, true), '*' => (9, true), '(' => (10, true),
-        ')' => (11, true),
-        '-' => (12, false), '_' => (12, true),
-        '=' => (13, false), '+' => (13, true),
-        '[' => (26, false), '{' => (26, true),
-        ']' => (27, false), '}' => (27, true),
-        ';' => (39, false), ':' => (39, true),
-        '\'' => (40, false), '"' => (40, true),
-        '`' => (41, false), '~' => (41, true),
-        '\\' => (43, false), '|' => (43, true),
-        ',' => (51, false), '<' => (51, true),
-        '.' => (52, false), '>' => (52, true),
-        '/' => (53, false), '?' => (53, true),
-        ' ' => (57, false),
-        '\t' => (15, false),
-        '\n' => (28, false),
+        'a' | 'A' => (38, c.is_uppercase()),
+        'b' | 'B' => (56, c.is_uppercase()),
+        'c' | 'C' => (54, c.is_uppercase()),
+        'd' | 'D' => (40, c.is_uppercase()),
+        'e' | 'E' => (26, c.is_uppercase()),
+        'f' | 'F' => (41, c.is_uppercase()),
+        'g' | 'G' => (42, c.is_uppercase()),
+        'h' | 'H' => (43, c.is_uppercase()),
+        'i' | 'I' => (31, c.is_uppercase()),
+        'j' | 'J' => (44, c.is_uppercase()),
+        'k' | 'K' => (45, c.is_uppercase()),
+        'l' | 'L' => (46, c.is_uppercase()),
+        'm' | 'M' => (58, c.is_uppercase()),
+        'n' | 'N' => (57, c.is_uppercase()),
+        'o' | 'O' => (32, c.is_uppercase()),
+        'p' | 'P' => (33, c.is_uppercase()),
+        'q' | 'Q' => (24, c.is_uppercase()),
+        'r' | 'R' => (27, c.is_uppercase()),
+        's' | 'S' => (39, c.is_uppercase()),
+        't' | 'T' => (28, c.is_uppercase()),
+        'u' | 'U' => (30, c.is_uppercase()),
+        'v' | 'V' => (55, c.is_uppercase()),
+        'w' | 'W' => (25, c.is_uppercase()),
+        'x' | 'X' => (53, c.is_uppercase()),
+        'y' | 'Y' => (29, c.is_uppercase()),
+        'z' | 'Z' => (52, c.is_uppercase()),
+        '0' => (19, false), '1' => (10, false), '2' => (11, false),
+        '3' => (12, false), '4' => (13, false), '5' => (14, false),
+        '6' => (15, false), '7' => (16, false), '8' => (17, false),
+        '9' => (18, false),
+        '!' => (10, true), '@' => (11, true), '#' => (12, true),
+        '$' => (13, true), '%' => (14, true), '^' => (15, true),
+        '&' => (16, true), '*' => (17, true), '(' => (18, true),
+        ')' => (19, true),
+        '-' => (20, false), '_' => (20, true),
+        '=' => (21, false), '+' => (21, true),
+        '[' => (34, false), '{' => (34, true),
+        ']' => (35, false), '}' => (35, true),
+        ';' => (47, false), ':' => (47, true),
+        '\'' => (48, false), '"' => (48, true),
+        '`' => (49, false), '~' => (49, true),
+        '\\' => (51, false), '|' => (51, true),
+        ',' => (59, false), '<' => (59, true),
+        '.' => (60, false), '>' => (60, true),
+        '/' => (61, false), '?' => (61, true),
+        ' ' => (65, false),
+        '\t' => (23, false),
+        '\n' => (36, false),
         _ => return None,
     })
 }
 
 fn scancode_for_keyname(name: &str) -> Option<u32> {
     Some(match name.to_lowercase().as_str() {
-        "return" | "enter" => 28,
-        "tab" => 15,
-        "escape" | "esc" => 1,
-        "backspace" => 14,
-        "delete" => 111,
-        "insert" => 110,
-        "home" => 102,
-        "end" => 107,
-        "pageup" => 104,
-        "pagedown" => 109,
-        "up" => 103,
-        "down" => 108,
-        "left" => 105,
-        "right" => 106,
-        "space" => 57,
-        "capslock" => 58,
-        "numlock" => 69,
-        "scrolllock" => 70,
-        "printscreen" | "sysrq" | "print" => 99,
-        "pause" | "break" => 119,
-        "f1" => 59, "f2" => 60, "f3" => 61, "f4" => 62,
-        "f5" => 63, "f6" => 64, "f7" => 65, "f8" => 66,
-        "f9" => 67, "f10" => 68, "f11" => 87, "f12" => 88,
-        "f13" => 183, "f14" => 184, "f15" => 185, "f16" => 186,
-        "f17" => 187, "f18" => 188, "f19" => 189, "f20" => 190,
-        "f21" => 191, "f22" => 192, "f23" => 193, "f24" => 194,
-        "ctrl" | "lctrl" | "leftctrl" => 29,
-        "rctrl" | "rightctrl" => 97,
-        "shift" | "lshift" | "leftshift" => 42,
-        "rshift" | "rightshift" => 54,
-        "alt" | "lalt" | "leftalt" => 56,
-        "ralt" | "rightalt" => 100,
-        "super" | "meta" | "lsuper" | "leftmeta" | "leftsuper" | "windows" | "leftwindows" => 125,
-        "rsuper" | "rightmeta" | "rightsuper" | "rightwindows" => 126,
-        "menu" | "compose" => 127,
-        "kp_0" | "kp0" => 82, "kp_1" | "kp1" => 79,
-        "kp_2" | "kp2" => 80, "kp_3" | "kp3" => 81,
-        "kp_4" | "kp4" => 75, "kp_5" | "kp5" => 76,
-        "kp_6" | "kp6" => 77, "kp_7" | "kp7" => 71,
-        "kp_8" | "kp8" => 72, "kp_9" | "kp9" => 73,
-        "kp_decimal" | "kp_dot" => 83,
-        "kp_divide" | "kp_slash" => 98,
-        "kp_multiply" | "kp_asterisk" => 55,
-        "kp_subtract" | "kp_minus" => 74,
-        "kp_add" | "kp_plus" => 78,
-        "kp_enter" => 96,
+        "return" | "enter" => 36,
+        "tab" => 23,
+        "escape" | "esc" => 9,
+        "backspace" => 22,
+        "delete" => 119,
+        "insert" => 118,
+        "home" => 110,
+        "end" => 115,
+        "pageup" => 112,
+        "pagedown" => 117,
+        "up" => 111,
+        "down" => 116,
+        "left" => 113,
+        "right" => 114,
+        "space" => 65,
+        "capslock" => 66,
+        "numlock" => 77,
+        "scrolllock" => 78,
+        "printscreen" | "sysrq" | "print" => 107,
+        "pause" | "break" => 127,
+        "f1" => 67, "f2" => 68, "f3" => 69, "f4" => 70,
+        "f5" => 71, "f6" => 72, "f7" => 73, "f8" => 74,
+        "f9" => 75, "f10" => 76, "f11" => 95, "f12" => 96,
+        "f13" => 191, "f14" => 192, "f15" => 193, "f16" => 194,
+        "f17" => 195, "f18" => 196, "f19" => 197, "f20" => 198,
+        "f21" => 199, "f22" => 200, "f23" => 201, "f24" => 202,
+        "ctrl" | "lctrl" | "leftctrl" => 37,
+        "rctrl" | "rightctrl" => 105,
+        "shift" | "lshift" | "leftshift" => 50,
+        "rshift" | "rightshift" => 62,
+        "alt" | "lalt" | "leftalt" => 64,
+        "ralt" | "rightalt" => 108,
+        "super" | "meta" | "lsuper" | "leftmeta" | "leftsuper" | "windows" | "leftwindows" => 133,
+        "rsuper" | "rightmeta" | "rightsuper" | "rightwindows" => 134,
+        "menu" | "compose" => 135,
+        "kp_0" | "kp0" => 90, "kp_1" | "kp1" => 87,
+        "kp_2" | "kp2" => 88, "kp_3" | "kp3" => 89,
+        "kp_4" | "kp4" => 83, "kp_5" | "kp5" => 84,
+        "kp_6" | "kp6" => 85, "kp_7" | "kp7" => 79,
+        "kp_8" | "kp8" => 80, "kp_9" | "kp9" => 81,
+        "kp_decimal" | "kp_dot" => 91,
+        "kp_divide" | "kp_slash" => 106,
+        "kp_multiply" | "kp_asterisk" => 63,
+        "kp_subtract" | "kp_minus" => 82,
+        "kp_add" | "kp_plus" => 86,
+        "kp_enter" => 104,
         _ => return None,
     })
 }
 
 fn is_modifier(scancode: u32) -> bool {
-    matches!(scancode, 29 | 97 | 42 | 54 | 56 | 100 | 125 | 126)
+    matches!(scancode, 37 | 105 | 50 | 62 | 64 | 108 | 133 | 134)
 }
 
 fn send_key(tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>, scancode: u32, pressed: bool) {
@@ -164,6 +188,10 @@ fn send_key(tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>, sc
 fn send_mouse_move(tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>, x: f64, y: f64) {
     let _ = tx.send(ThreadCommand::PointerMotion { x, y });
 }
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 fn send_mouse_button(tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>, btn: u32, pressed: bool) {
     let _ = tx.send(ThreadCommand::PointerButton {
@@ -274,9 +302,9 @@ fn handle_action_inner(
 
         "left_click" | "right_click" | "middle_click" => {
             let btn: u32 = match req.action.as_str() {
-                "left_click" => 1,
-                "right_click" => 3,
-                _ => 2,
+                "left_click" => BTN_LEFT,
+                "right_click" => BTN_RIGHT,
+                _ => BTN_MIDDLE,
             };
             if let Some(coord) = req.coordinate {
                 let (fx, fy) = handle_coord(coord)?;
@@ -311,20 +339,23 @@ fn handle_action_inner(
                 send_mouse_move(tx, fx, fy);
                 sleep_ms(30);
             }
-            let mod_sc = req.key.as_ref().and_then(|k| handle_modifier(k));
-            if let Some(sc) = mod_sc {
-                send_key(tx, sc, true);
-                sleep_ms(20);
+            if let Some(ref mod_name) = req.text {
+                if let Some(sc) = handle_modifier(mod_name) {
+                    send_key(tx, sc, true);
+                    sleep_ms(20);
+                }
             }
             for _ in 0..n {
-                send_mouse_button(tx, 1, true);
+                send_mouse_button(tx, BTN_LEFT, true);
                 sleep_ms(10);
-                send_mouse_button(tx, 1, false);
+                send_mouse_button(tx, BTN_LEFT, false);
                 sleep_ms(10);
             }
-            if let Some(sc) = mod_sc {
-                sleep_ms(10);
-                send_key(tx, sc, false);
+            if let Some(ref mod_name) = req.text {
+                if let Some(sc) = handle_modifier(mod_name) {
+                    sleep_ms(10);
+                    send_key(tx, sc, false);
+                }
             }
             sleep_ms(50);
             let png = screenshot(tx)?;
@@ -339,11 +370,11 @@ fn handle_action_inner(
             let (ex, ey) = handle_coord(end)?;
             send_mouse_move(tx, sx, sy);
             sleep_ms(30);
-            send_mouse_button(tx, 1, true);
+            send_mouse_button(tx, BTN_LEFT, true);
             sleep_ms(30);
             send_mouse_move(tx, ex, ey);
             sleep_ms(30);
-            send_mouse_button(tx, 1, false);
+            send_mouse_button(tx, BTN_LEFT, false);
             sleep_ms(50);
             let png = screenshot(tx)?;
             let b64 = BASE64.encode(&png);
@@ -351,14 +382,14 @@ fn handle_action_inner(
         }
 
         "left_mouse_down" => {
-            send_mouse_button(tx, 1, true);
+            send_mouse_button(tx, BTN_LEFT, true);
             let png = screenshot(tx)?;
             let b64 = BASE64.encode(&png);
             Ok(format!("{{\"data\":\"{}\"}}", b64))
         }
 
         "left_mouse_up" => {
-            send_mouse_button(tx, 1, false);
+            send_mouse_button(tx, BTN_LEFT, false);
             let png = screenshot(tx)?;
             let b64 = BASE64.encode(&png);
             Ok(format!("{{\"data\":\"{}\"}}", b64))
@@ -370,20 +401,20 @@ fn handle_action_inner(
                 let chunk_str = std::str::from_utf8(chunk).map_err(|_| "Invalid UTF-8")?;
                 for ch in chunk_str.chars() {
                     if ch == '\n' {
-                        send_key(tx, 28, true);
+                        send_key(tx, 36, true);
                         sleep_ms(10);
-                        send_key(tx, 28, false);
+                        send_key(tx, 36, false);
                         sleep_ms(10);
                         continue;
                     }
                     if let Some((sc, need_shift)) = scancode_for_char(ch) {
                         if need_shift {
-                            send_key(tx, 42, true);
+                            send_key(tx, 50, true);
                             sleep_ms(5);
                             send_key(tx, sc, true);
                             sleep_ms(10);
                             send_key(tx, sc, false);
-                            send_key(tx, 42, false);
+                            send_key(tx, 50, false);
                         } else {
                             send_key(tx, sc, true);
                             sleep_ms(10);
@@ -468,8 +499,8 @@ fn handle_action_inner(
                 }
             }
             let (dx, dy) = match dir {
-                "up" => (0.0, amount),
-                "down" => (0.0, -amount),
+                "up" => (0.0, -amount),
+                "down" => (0.0, amount),
                 "left" => (-amount, 0.0),
                 "right" => (amount, 0.0),
                 _ => return Err(format!("Invalid scroll_direction: {}", dir)),
