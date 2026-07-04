@@ -228,44 +228,56 @@ ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -prese
 
 ## Computer Use Interface (Wayland)
 
-The Wayland backend implements the [Anthropic Computer Use spec](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo), providing an HTTP API for AI agents to control the desktop. Enable it by setting the `PIXELFLUX_CU` environment variable to a port number:
+The Wayland backend implements the [Anthropic Computer Use specification](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo), providing an HTTP API for AI agents to control the desktop. Enable it by setting the `PIXELFLUX_CU` environment variable to the port the server should listen on:
 
 ```bash
 export PIXELFLUX_CU=5000
 ```
 
+The Computer Use server listens for `POST` requests on `/computer-use` and responds with JSON. Unless otherwise noted, successful actions return:
+
+```json
+{"result":"ok"}
+```
+
+Coordinates are specified in absolute framebuffer pixels. Any coordinates outside the framebuffer are automatically clamped to the nearest valid pixel.
+
 ### Actions
 
-All actions are `POST` requests to `/computer-use` with a JSON body:
+All actions are `POST` requests to `/computer-use` with a JSON body.
 
-**`screenshot`** - Capture the current display as a base64 PNG:
+**`screenshot`** - Capture the current display as a base64-encoded PNG:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"screenshot"}' | jq -r '.data' | base64 -d > screen.png
 ```
 
-**`mouse_move`** - Move cursor to absolute pixel coordinates (in API space):
+**`mouse_move`** - Move the cursor to absolute pixel coordinates:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
-  -d '{"action":"mouse_move","coordinate":[500,300]}' | jq -r '.data' | base64 -d > after_move.png
+  -d '{"action":"mouse_move","coordinate":[500,300]}'
 ```
 
-**`left_click`** / **`right_click`** / **`middle_click`** - Click a button, optionally at a coordinate and/or with a held modifier:
+**`left_click`** / **`right_click`** / **`middle_click`** - Click a mouse button, optionally at a coordinate and/or while holding a keyboard modifier:
+
 ```bash
 # Simple click
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"left_click"}'
 
-# Click at a specific position while holding shift
+# Right click at a specific position while holding Shift
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"right_click","coordinate":[800,600],"text":"shift"}'
 ```
 
-**`double_click`** / **`triple_click`** - Multiple clicks:
+**`double_click`** / **`triple_click`** - Perform multiple left mouse clicks, optionally while holding a modifier:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
@@ -273,17 +285,19 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
-  -d '{"action":"triple_click","key":"ctrl"}'
+  -d '{"action":"triple_click","text":"ctrl"}'
 ```
 
-**`left_click_drag`** - Click-hold at start, drag to end, release:
+**`left_click_drag`** - Press the left mouse button at `start_coordinate`, drag to `coordinate`, then release:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"left_click_drag","start_coordinate":[100,100],"coordinate":[500,300]}'
 ```
 
-**`left_mouse_down`** / **`left_mouse_up`** - Fine-grained press/release:
+**`left_mouse_down`** / **`left_mouse_up`** - Press or release the left mouse button without moving the pointer:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
@@ -291,13 +305,15 @@ curl -s -X POST http://localhost:5000/computer-use \
 ```
 
 **`type`** - Type a string of text:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"type","text":"Hello, world!"}'
 ```
 
-**`key`** - Press a key or key combination:
+**`key`** - Press a key or key combination. Key combinations are specified using `+` separators:
+
 ```bash
 # Single key
 curl -s -X POST http://localhost:5000/computer-use \
@@ -314,27 +330,30 @@ curl -s -X POST http://localhost:5000/computer-use \
   -d '{"action":"key","text":"ctrl+alt+Delete"}'
 ```
 
-**`hold_key`** - Hold a key for a specified duration (seconds):
+**`hold_key`** - Hold a key for the specified duration (seconds). Durations are capped at 100 seconds.
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"hold_key","text":"ctrl","duration":2.0}'
 ```
 
-**`scroll`** - Scroll the mouse wheel:
+**`scroll`** - Scroll vertically or horizontally, optionally at a coordinate and/or while holding a keyboard modifier:
+
 ```bash
 # Scroll down 3 clicks
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"scroll","scroll_direction":"down","scroll_amount":3}'
 
-# Scroll at a position while holding shift
+# Scroll at a position while holding Shift
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"scroll","coordinate":[500,400],"scroll_direction":"up","scroll_amount":5,"text":"shift"}'
 ```
 
-**`cursor_position`** - Get the current cursor position:
+**`cursor_position`** - Return the current cursor position:
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
@@ -342,64 +361,20 @@ curl -s -X POST http://localhost:5000/computer-use \
 # → X=500,Y=300
 ```
 
-**`wait`** - Pause and return a screenshot:
+**`wait`** - Pause execution for the specified duration (seconds). Durations are capped at 100 seconds.
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
-  -d '{"action":"wait","duration":0.5}' | jq -r '.data' | base64 -d > after_wait.png
+  -d '{"action":"wait","duration":0.5}'
 ```
 
-**`zoom`** - View a specific region at full resolution (v2 spec only):
+**`zoom`** - Capture and return a cropped base64-encoded PNG of the specified framebuffer region (`[left, top, right, bottom]`):
+
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"zoom","region":[100,200,400,350]}' | jq -r '.data' | base64 -d > zoomed.png
-```
-
-### Response Format
-
-Successful actions return either a base64-encoded PNG or a text result:
-
-```json
-{"data":"<base64-encoded-png>"}
-{"text":"X=500,Y=300"}
-```
-
-Errors return an error message and HTTP 400:
-
-```json
-{"error":"Missing coordinate"}
-```
-
-### Coordinate System
-
-The API operates in a scaled coordinate space. The framebuffer resolution is scaled down to fit a 1568px long edge maximum (matching the Anthropic reference implementation). All coordinates in requests and cursor position responses use this scaled API space. The mapping is transparent, the server handles scaling internally.
-
-### Integration with AI Agents
-
-This endpoint is compatible with any agent loop that follows the Anthropic computer use spec. The tool definition sent to the model would be:
-
-```json
-{
-  "type": "computer_20250124",
-  "name": "computer",
-  "display_width_px": 1366,
-  "display_height_px": 768,
-  "display_number": 1
-}
-```
-
-For the v2 spec with zoom support:
-
-```json
-{
-  "type": "computer_20251124",
-  "name": "computer",
-  "display_width_px": 1366,
-  "display_height_px": 768,
-  "display_number": 1,
-  "enable_zoom": true
-}
 ```
 
 ## Features

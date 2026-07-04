@@ -17,39 +17,6 @@ use tiny_http;
 
 use crate::ThreadCommand;
 
-const API_LONG_EDGE_MAX: u32 = 1568;
-
-fn scale_to_api(fb_w: i32, fb_h: i32) -> (i32, i32) {
-    let long_edge = fb_w.max(fb_h) as u32;
-    if long_edge <= API_LONG_EDGE_MAX {
-        return (fb_w, fb_h);
-    }
-    let ratio = API_LONG_EDGE_MAX as f64 / long_edge as f64;
-    let api_w = (fb_w as f64 * ratio).round() as i32;
-    let api_h = (fb_h as f64 * ratio).round() as i32;
-    (api_w.max(1), api_h.max(1))
-}
-
-fn api_to_framebuffer(
-    api_x: f64, api_y: f64,
-    fb_w: i32, fb_h: i32,
-    api_w: i32, api_h: i32,
-) -> (f64, f64) {
-    let sx = api_w as f64 / fb_w as f64;
-    let sy = api_h as f64 / fb_h as f64;
-    (api_x / sx, api_y / sy)
-}
-
-fn framebuffer_to_api(
-    fb_x: f64, fb_y: f64,
-    fb_w: i32, fb_h: i32,
-    api_w: i32, api_h: i32,
-) -> (f64, f64) {
-    let sx = api_w as f64 / fb_w as f64;
-    let sy = api_h as f64 / fb_h as f64;
-    (fb_x * sx, fb_y * sy)
-}
-
 fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
     if v < lo { lo } else if v > hi { hi } else { v }
 }
@@ -222,13 +189,14 @@ fn cursor_position(
     resp_rx.recv().map_err(|_| "Cursor position failed".to_string())
 }
 
-fn get_info(
+fn get_fb_size(
     tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>,
-) -> Result<(i32, i32, f64), String> {
+) -> Result<(i32, i32), String> {
     let (resp_tx, resp_rx) = mpsc::channel();
     tx.send(ThreadCommand::CuGetInfo { resp: resp_tx })
         .map_err(|_| "Failed to request compositor info".to_string())?;
-    resp_rx.recv().map_err(|_| "Compositor info request failed".to_string())
+    let (w, h, _) = resp_rx.recv().map_err(|_| "Compositor info request failed".to_string())?;
+    Ok((w, h))
 }
 
 #[derive(Deserialize)]
@@ -244,38 +212,42 @@ struct CuActionRequest {
     region: Option<[f64; 4]>,
 }
 
+fn ok_json() -> String {
+    "{\"result\":\"ok\"}".to_string()
+}
+
 fn handle_action(
     req: CuActionRequest,
     tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>,
 ) -> String {
-    let (fb_w, fb_h, api_w, api_h) = match get_info(tx) {
-        Ok((w, h, _scale)) => {
-            let (aw, ah) = scale_to_api(w, h);
-            (w, h, aw, ah)
-        }
-        Err(e) => return format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\"")),
-    };
-    let result = handle_action_inner(req, tx, fb_w, fb_h, api_w, api_h);
+    let result = handle_action_inner(req, tx);
     match result {
         Ok(response) => response,
         Err(e) => format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\"")),
     }
 }
 
+/// @brief Execute a Computer Use API action.
+///
+/// Dispatches a parsed Computer Use request to the corresponding compositor
+/// operation. Coordinates are clamped to the current framebuffer size, keyboard
+/// and pointer events are translated into compositor thread commands, and
+/// actions requiring framebuffer data (such as `screenshot` and `zoom`) request
+/// a fresh capture before encoding the JSON response. Returns either the JSON
+/// response payload or an error string describing why the action failed.
 fn handle_action_inner(
     req: CuActionRequest,
     tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>,
-    fb_w: i32, fb_h: i32,
-    api_w: i32, api_h: i32,
 ) -> Result<String, String> {
     let sleep_ms = |ms: u64| thread::sleep(Duration::from_millis(ms));
 
-    let handle_coord = |coord: [f64; 2]| -> Result<(f64, f64), String> {
-        let (sx, sy) = api_to_framebuffer(coord[0], coord[1], fb_w, fb_h, api_w, api_h);
-        Ok((
-            clamp(sx, 0.0, (fb_w - 1) as f64),
-            clamp(sy, 0.0, (fb_h - 1) as f64),
-        ))
+    let (fb_w, fb_h) = get_fb_size(tx)?;
+
+    let handle_coord = |coord: [f64; 2]| -> (f64, f64) {
+        (
+            clamp(coord[0], 0.0, (fb_w - 1) as f64),
+            clamp(coord[1], 0.0, (fb_h - 1) as f64),
+        )
     };
 
     let handle_modifier = |mod_name: &str| -> Option<u32> {
@@ -292,12 +264,9 @@ fn handle_action_inner(
 
         "mouse_move" => {
             let coord = req.coordinate.ok_or("Missing coordinate")?;
-            let (fx, fy) = handle_coord(coord)?;
+            let (fx, fy) = handle_coord(coord);
             send_mouse_move(tx, fx, fy);
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "left_click" | "right_click" | "middle_click" => {
@@ -307,7 +276,7 @@ fn handle_action_inner(
                 _ => BTN_MIDDLE,
             };
             if let Some(coord) = req.coordinate {
-                let (fx, fy) = handle_coord(coord)?;
+                let (fx, fy) = handle_coord(coord);
                 send_mouse_move(tx, fx, fy);
                 sleep_ms(30);
             }
@@ -326,16 +295,13 @@ fn handle_action_inner(
                     send_key(tx, sc, false);
                 }
             }
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "double_click" | "triple_click" => {
             let n = if req.action == "double_click" { 2 } else { 3 };
             if let Some(coord) = req.coordinate {
-                let (fx, fy) = handle_coord(coord)?;
+                let (fx, fy) = handle_coord(coord);
                 send_mouse_move(tx, fx, fy);
                 sleep_ms(30);
             }
@@ -357,17 +323,14 @@ fn handle_action_inner(
                     send_key(tx, sc, false);
                 }
             }
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "left_click_drag" => {
             let start = req.start_coordinate.ok_or("Missing start_coordinate")?;
             let end = req.coordinate.ok_or("Missing coordinate")?;
-            let (sx, sy) = handle_coord(start)?;
-            let (ex, ey) = handle_coord(end)?;
+            let (sx, sy) = handle_coord(start);
+            let (ex, ey) = handle_coord(end);
             send_mouse_move(tx, sx, sy);
             sleep_ms(30);
             send_mouse_button(tx, BTN_LEFT, true);
@@ -375,24 +338,17 @@ fn handle_action_inner(
             send_mouse_move(tx, ex, ey);
             sleep_ms(30);
             send_mouse_button(tx, BTN_LEFT, false);
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "left_mouse_down" => {
             send_mouse_button(tx, BTN_LEFT, true);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "left_mouse_up" => {
             send_mouse_button(tx, BTN_LEFT, false);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "type" => {
@@ -425,10 +381,7 @@ fn handle_action_inner(
                 }
                 sleep_ms(20);
             }
-            sleep_ms(100);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "key" => {
@@ -463,10 +416,7 @@ fn handle_action_inner(
                 sleep_ms(10);
                 send_key(tx, sc, false);
             }
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "hold_key" => {
@@ -478,17 +428,14 @@ fn handle_action_inner(
                 sleep_ms((duration * 1000.0) as u64);
                 send_key(tx, sc, false);
             }
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "scroll" => {
             let dir = req.scroll_direction.as_deref().ok_or("Missing scroll_direction")?;
             let amount = req.scroll_amount.unwrap_or(1).max(0) as f64;
             if let Some(coord) = req.coordinate {
-                let (fx, fy) = handle_coord(coord)?;
+                let (fx, fy) = handle_coord(coord);
                 send_mouse_move(tx, fx, fy);
                 sleep_ms(30);
             }
@@ -513,35 +460,27 @@ fn handle_action_inner(
                     send_key(tx, sc, false);
                 }
             }
-            sleep_ms(50);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "cursor_position" => {
             let (x, y) = cursor_position(tx)?;
-            let (ax, ay) = framebuffer_to_api(x, y, fb_w, fb_h, api_w, api_h);
-            Ok(format!("{{\"text\":\"X={},Y={}\"}}", ax.round() as i32, ay.round() as i32))
+            Ok(format!("{{\"text\":\"X={},Y={}\"}}", x.round() as i32, y.round() as i32))
         }
 
         "wait" => {
             let duration = req.duration.unwrap_or(1.0).min(100.0);
             sleep_ms((duration * 1000.0) as u64);
-            let png = screenshot(tx)?;
-            let b64 = BASE64.encode(&png);
-            Ok(format!("{{\"data\":\"{}\"}}", b64))
+            Ok(ok_json())
         }
 
         "zoom" => {
             let region = req.region.ok_or("Missing region")?;
             let (x0, y0, x1, y1) = (region[0], region[1], region[2], region[3]);
-            let (fx0, fy0) = api_to_framebuffer(x0, y0, fb_w, fb_h, api_w, api_h);
-            let (fx1, fy1) = api_to_framebuffer(x1, y1, fb_w, fb_h, api_w, api_h);
-            let left = clamp(fx0.round() as u32, 0, fb_w as u32 - 1);
-            let top = clamp(fy0.round() as u32, 0, fb_h as u32 - 1);
-            let right = clamp(fx1.round() as u32, left + 1, fb_w as u32);
-            let bottom = clamp(fy1.round() as u32, top + 1, fb_h as u32);
+            let left = clamp(x0.round() as u32, 0, fb_w as u32 - 1);
+            let top = clamp(y0.round() as u32, 0, fb_h as u32 - 1);
+            let right = clamp(x1.round() as u32, left + 1, fb_w as u32);
+            let bottom = clamp(y1.round() as u32, top + 1, fb_h as u32);
             let crop_w = right - left;
             let crop_h = bottom - top;
             let png = screenshot(tx)?;
