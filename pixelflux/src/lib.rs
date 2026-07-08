@@ -2060,9 +2060,7 @@ fn run_wayland_thread(
                     let serial = next_serial();
                     let time = wayland_time();
                     if let Some(keyboard) = state.seat.get_keyboard() {
-                        // scancode is an evdev keycode; xkb/smithay want X11 keycodes (see
-                        // EVDEV_TO_XKB_KEYCODE_OFFSET).
-                        keyboard.input(state, Keycode::new(scancode.saturating_add(EVDEV_TO_XKB_KEYCODE_OFFSET)), key_state, serial, time, |_, _, _| {
+                        keyboard.input(state, Keycode::new(scancode), key_state, serial, time, |_, _, _| {
                             FilterResult::<()>::Forward
                         });
                     }
