@@ -1677,9 +1677,10 @@ fn run_wayland_thread(
         .insert_source(command_rx, move |event, _, state| {
             match event {
                 CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
-                    // AUTO_GPU aims the encoder at the auto-picked render node, but an explicit
-                    // operator choice (encode_node_index >= 0, e.g. --encode-dri) always wins.
-                    if state.auto_gpu_selected && settings.encode_node_index < -1 {
+                    // AUTO_GPU aims the encoder at the auto-picked render node. An explicit
+                    // render_node_path (which sets auto_gpu_selected = false) is respected.
+                    // Operator choice (encode_node_index >= 0, e.g. --encode-dri) always wins.
+                    if state.auto_gpu_selected {
                         if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
                             if let Ok(idx) = idx_str.parse::<i32>() {
                                 settings.encode_node_index = idx - 128;
@@ -3520,11 +3521,11 @@ impl ScreenCapture {
             return Ok(());
         }
 
-        // AUTO_GPU on X11: with no explicit encode device chosen (encode_node_index still
-        // auto), resolve the requested GPU to a render node and aim the encoder at it so a
+        // AUTO_GPU on X11: with no explicit encode device chosen (encode_node_index < 0),
+        // resolve the requested GPU to a render node and aim the encoder at it so a
         // multi-GPU host doesn't silently default to device 0. Explicit --encode-dri wins.
         let mut rs = rs;
-        if rs.encode_node_index < -1 {
+        if rs.encode_node_index < 0 {
             let auto_gpu = settings
                 .getattr("auto_gpu")
                 .ok()

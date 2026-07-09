@@ -73,9 +73,8 @@ base_capture_settings.video_fullcolor = False
 base_capture_settings.video_fullframe = False
 # Flag the stream to be in streaming mode to bypass all vnc logic
 base_capture_settings.video_streaming_mode = False
-# Encoder device index (VA-API/NVENC): ID 0 = renderD128, the first GPU (also
-# the default when left unset); -1 forces software encoding.
-base_capture_settings.encode_node_index = 0
+# Encoder device index: -2 = auto-detect (lets AUTO_GPU pick), -1 = software encoding, 0+ = specific GPU.
+base_capture_settings.encode_node_index = -2
 # Switches to CBR mode and ignores CRF value. Used in conjunction with video_bitrate_kbps.
 base_capture_settings.video_cbr_mode = False
 # Target bitrate in kbps for CBR mode. Required when video_cbr_mode is enabled.
