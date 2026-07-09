@@ -1420,8 +1420,19 @@ fn run_wayland_thread(
 ) {
     // Initial framebuffer size comes from selkies (the server owns resolution policy
     // and forwards it via the WaylandBackend constructor); first StartCapture resizes.
-    let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
-    let height: i32 = if initial_height > 0 { initial_height } else { 768 };
+    let mut width: i32 = if initial_width > 0 { initial_width } else { 1024 };
+    let mut height: i32 = if initial_height > 0 { initial_height } else { 768 };
+
+    if let Ok(w_str) = std::env::var("SELKIES_MANUAL_WIDTH") {
+        if let Ok(w) = w_str.parse::<i32>() {
+            width = w;
+        }
+    }
+    if let Ok(h_str) = std::env::var("SELKIES_MANUAL_HEIGHT") {
+        if let Ok(h) = h_str.parse::<i32>() {
+            height = h;
+        }
+    }
 
     let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
     let display: Display<AppState> = Display::new().unwrap();
@@ -3876,6 +3887,41 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     if let Ok(atexit) = m.py().import("atexit") {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));
     }
+
+    {
+        let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
+        if slot.lock().unwrap().is_none() {
+            let width = 0;
+            let height = 0;
+            let mut dri_node = String::new();
+            let mut auto_gpu_selected = false;
+
+            if let Ok(node) = std::env::var("SELKIES_RENDER_DRI") {
+                dri_node = node;
+            } else if let Ok(node) = std::env::var("DRINODE") {
+                dri_node = node;
+            }
+
+            if dri_node.is_empty() {
+                let auto_val = std::env::var("SELKIES_AUTO_GPU")
+                    .or_else(|_| std::env::var("AUTO_GPU"))
+                    .unwrap_or_default();
+                if matches!(auto_val.as_str(), "1" | "true" | "yes" | "on") {
+                    if let Some(picked) = auto_select_render_node(None) {
+                        dri_node = picked;
+                        auto_gpu_selected = true;
+                    }
+                }
+            }
+
+            let be = Py::new(
+                m.py(),
+                WaylandBackend::new(width, height, dri_node, auto_gpu_selected, -1),
+            )?;
+            *slot.lock().unwrap() = Some(be);
+        }
+    }
+
     Ok(())
 }
 
