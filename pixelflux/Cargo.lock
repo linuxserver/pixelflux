@@ -1256,7 +1256,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pixelflux"
-version = "1.6.4"
+version = "2.0.0"
 dependencies = [
  "calloop 0.12.4",
  "crossbeam-channel",

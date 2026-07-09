@@ -13,7 +13,6 @@ use xcursor::{
     CursorTheme,
 };
 
-/// @brief Manages XCursor themes, loading, and animation state.
 pub struct Cursor {
     icons: Vec<Image>,
     theme: CursorTheme,
@@ -21,10 +20,8 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// @brief Loads the cursor theme (XCURSOR_THEME) at the requested size.
-    /// @input size_override: Pixel size from the CaptureSettings cursor_size field
-    ///        (selkies resolves --cursor-size / XCURSOR_SIZE); <=0 = default 24.
-    /// @return Cursor: The initialized cursor manager.
+    // size_override comes from CaptureSettings.cursor_size (selkies --cursor-size /
+    // XCURSOR_SIZE); <=0 falls back to 24.
     pub fn load(size_override: i32) -> Cursor {
         let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
         let size: u32 = if size_override > 0 { size_override as u32 } else { 24 };
@@ -52,29 +49,17 @@ impl Cursor {
         Cursor { icons, theme, size }
     }
 
-    /// @brief Retrieves the default cursor image frame for a specific timestamp and scale.
-    /// @input scale: The scaling factor for the cursor size.
-    /// @input time: The current duration for animation calculation.
-    /// @return Image: The parsed XCursor image frame.
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
         let size = self.size * scale;
         frame(time.as_millis() as u32, size, &self.icons)
     }
 
-    /// @brief Retrieves a named cursor image frame (e.g., "hand1") for a specific timestamp and scale.
-    /// @input name: The name of the cursor icon.
-    /// @input scale: The scaling factor.
-    /// @input time: The current duration for animation.
-    /// @return Option<Image>: The image frame if found.
     pub fn get_image_by_name(&self, name: &str, scale: u32, time: Duration) -> Option<Image> {
         let icons = load_icon(&self.theme, name).ok()?;
         let size = self.size * scale;
         Some(frame(time.as_millis() as u32, size, &icons))
     }
 
-    /// @brief Converts a named cursor icon into a PNG byte array for transmission to web clients.
-    /// @input name: The name of the cursor icon.
-    /// @return Option<(Vec<u8>, u32, u32)>: Tuple containing PNG bytes, hotspot X, and hotspot Y.
     pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
@@ -95,10 +80,6 @@ impl Cursor {
     }
 }
 
-/// @brief Filters available cursor images to find those matching the requested size.
-/// @input size: Target size.
-/// @input images: Slice of available images.
-/// @return impl Iterator: Iterator over matching images.
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
     let nearest_image = images
         .iter()
@@ -109,11 +90,6 @@ fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
         .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
 }
 
-/// @brief Calculates the correct animation frame based on elapsed time.
-/// @input millis: Elapsed milliseconds.
-/// @input size: Target size.
-/// @input images: Slice of available images.
-/// @return Image: The specific frame to render.
 fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     let total = nearest_images(size, images).fold(0, |acc, image| acc + image.delay);
     if total == 0 {
@@ -129,10 +105,6 @@ fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     unreachable!()
 }
 
-/// @brief Loads and parses an XCursor file from the theme.
-/// @input theme: The cursor theme.
-/// @input name: The icon name.
-/// @return Result<Vec<Image>, String>: List of parsed images or error.
 fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
     let icon_path = theme.load_icon(name).ok_or("Icon not found")?;
     let mut cursor_file = std::fs::File::open(icon_path).map_err(|e| e.to_string())?;

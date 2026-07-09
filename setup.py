@@ -10,7 +10,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pixelflux",
-    version="1.6.4",
+    version="2.0.0",
     author="Linuxserver.io",
     author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",

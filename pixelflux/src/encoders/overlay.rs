@@ -19,7 +19,6 @@ use smithay::{
 };
 use std::path::Path;
 
-/// @brief Defines the screen position for the watermark overlay.
 #[derive(Clone, Copy, PartialEq)]
 pub enum WatermarkLocation {
     None = 0,
@@ -45,7 +44,6 @@ impl From<i32> for WatermarkLocation {
     }
 }
 
-/// @brief Manages the pixel data, position, and animation state of an overlay image.
 pub struct OverlayState {
     wm_width: u32,
     wm_height: u32,
@@ -79,9 +77,6 @@ impl Default for OverlayState {
 }
 
 impl OverlayState {
-    /// @brief Loads an image from disk to use as the watermark.
-    /// @input path: Filesystem path to the image.
-    /// @input output_scale: The current output's fractional scale factor.
     pub fn load_watermark(&mut self, path: &str, output_scale: f64) {
         if let Ok(img) = image::open(Path::new(path)) {
             let rgba = img.to_rgba8();
@@ -104,22 +99,14 @@ impl OverlayState {
         }
     }
 
-    /// @brief Checks if a watermark is currently loaded.
-    /// @return bool: True if loaded.
     pub fn is_active(&self) -> bool {
         self.wm_loaded
     }
 
-    /// @brief Checks if the current watermark mode requires continuous animation updates.
-    /// @return bool: True if animated.
     pub fn is_animated(&self) -> bool {
         self.is_animated
     }
 
-    /// @brief Updates the watermark coordinates based on the frame size and location setting.
-    /// @input frame_width: Width of the target frame.
-    /// @input frame_height: Height of the target frame.
-    /// @input loc_enum: Integer representation of WatermarkLocation.
     pub fn update_position(&mut self, frame_width: i32, frame_height: i32, loc_enum: i32) {
         if !self.wm_loaded {
             return;
@@ -179,9 +166,6 @@ impl OverlayState {
         }
     }
 
-    /// @brief Creates a Smithay render element representing the watermark.
-    /// @input renderer: The active renderer instance.
-    /// @return Option<MemoryRenderBufferRenderElement>: The renderable element.
     pub fn get_watermark_element<R>(
         &self,
         renderer: &mut R,
@@ -207,11 +191,6 @@ impl OverlayState {
         }
     }
 
-    /// @brief Creates a Smithay render element representing a software cursor.
-    /// @input renderer: The active renderer instance.
-    /// @input image: The cursor image data from xcursor.
-    /// @input pos: The logical position of the cursor.
-    /// @return Option<MemoryRenderBufferRenderElement>: The renderable element.
     pub fn get_cursor_element<R>(
         &self,
         renderer: &mut R,

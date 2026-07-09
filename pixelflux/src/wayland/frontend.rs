@@ -143,18 +143,13 @@ pub fn wayland_utime() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
 }
 
-/// @brief Enum wrapper for supported GPU hardware encoders.
 #[allow(clippy::large_enum_variant)]
 pub enum GpuEncoder {
     Vaapi(VaapiEncoder),
     Nvenc(NvencEncoder),
 }
 
-/// @brief Global application state holding Wayland globals, renderer resources, and capture state.
-///
-/// This struct acts as the central context passed to all Smithay handlers. It manages
-/// the lifecycle of the Wayland compositor, hardware acceleration contexts (GBM/EGL),
-/// and the encoding pipeline state.
+/// Central context passed to all Smithay handlers.
 pub struct AppState {
     pub compositor_state: CompositorState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -370,7 +365,6 @@ impl WlrLayerShellHandler for AppState {
     fn layer_destroyed(&mut self, _surface: WlrLayerSurface) {}
 }
 
-/// @brief Handler for core compositor events like surface creation and commits.
 impl CompositorHandler for AppState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -379,13 +373,7 @@ impl CompositorHandler for AppState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-    /// @brief Called when a client commits a buffer to a surface.
-    ///
-    /// This function is responsible for:
-    /// 1. Triggering Smithay's internal buffer management.
-    /// 2. Detecting if a new window (Toplevel) is ready to be mapped (shown).
-    /// 3. Sending the initial configuration (resolution, state) to new windows.
-    /// 4. Setting initial focus for keyboard/mouse when a window appears.
+    // Also maps newly-ready toplevels and sets their initial config + focus.
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
@@ -510,13 +498,7 @@ impl CompositorHandler for AppState {
 }
 
 
-/// @brief Helper implementations for the global application state.
 impl AppState {
-    /// @brief Resolves the cursor state into image data and sends it to the Python layer.
-    ///
-    /// This method accepts a `CursorImageStatus` (Named, Hidden, or Surface), extracts
-    /// the relevant pixel data (checking the hash cache for surfaces to avoid re-encoding),
-    /// and outputs the final PNG bytes and hotspot coordinates to the registered Python callback.
     // pub(crate): also invoked from the calloop command handlers in lib.rs to replay the retained
     // cursor when a callback (re)registers or a capture (re)starts.
     pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
@@ -816,11 +798,8 @@ impl FractionalScaleHandler for AppState {
     }
 }
 
-/// @brief A wrapper around a generic Window that implements input handling traits.
-///
-/// Smithay requires a specific struct to represent the "target" of an input event
-/// (mouse, keyboard, touch). This struct bridges the gap between the abstract
-/// input event and the concrete Wayland surface contained within a `Window`.
+/// Smithay requires a concrete type as the "target" of an input event; FocusTarget
+/// bridges that to the Wayland surface inside the Window/Popup/LayerSurface.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum FocusTarget {
@@ -868,10 +847,6 @@ impl WaylandFocus for FocusTarget {
     }
 }
 
-/// @brief Routes keyboard events to the underlying Wayland surface.
-///
-/// When a key is pressed, this implementation ensures the event is serialized
-/// into the Wayland protocol and sent to the client that owns the focused window.
 impl KeyboardTarget<AppState> for FocusTarget {
     fn enter(
         &self,
@@ -935,11 +910,6 @@ impl KeyboardTarget<AppState> for FocusTarget {
     }
 }
 
-/// @brief Routes Drag'n'Drop events to the underlying Wayland surface.
-///
-/// This delegates DnD operations (enter, motion, leave, drop) to the specific
-/// Wayland surface, allowing clients to negotiate data transfers (like file drops
-/// or text copy/paste) via the Wayland protocol.
 impl DndFocus<AppState> for FocusTarget {
     type OfferData<S: Source> = <WlSurface as DndFocus<AppState>>::OfferData<S>;
 
@@ -1010,10 +980,6 @@ impl DndFocus<AppState> for FocusTarget {
     }
 }
 
-/// @brief Routes pointer (mouse) events to the underlying Wayland surface.
-///
-/// This handles motion, clicks, scrolling (axis), and gestures. It delegates
-/// the actual protocol generation to `smithay::input::pointer::PointerTarget`.
 impl PointerTarget<AppState> for FocusTarget {
     fn enter(&self, seat: &Seat<AppState>, data: &mut AppState, event: &MotionEvent) {
         if let Some(surface) = self.wl_surface() {
@@ -1188,7 +1154,6 @@ impl PointerTarget<AppState> for FocusTarget {
     }
 }
 
-/// @brief Routes touch events (down, up, motion) to the underlying Wayland surface.
 impl TouchTarget<AppState> for FocusTarget {
     fn down(&self, seat: &Seat<AppState>, data: &mut AppState, event: &DownEvent, serial: Serial) {
         if let Some(surface) = self.wl_surface() {
@@ -1297,7 +1262,6 @@ pub fn cursor_icon_to_str(icon: &CursorIcon) -> &'static str {
     }
 }
 
-/// @brief Handles general seat operations, focusing primarily on cursor updates.
 impl SeatHandler for AppState {
     type KeyboardFocus = FocusTarget;
     type PointerFocus = FocusTarget;
@@ -1306,7 +1270,6 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
-    /// @brief Called when the client requests a cursor change (e.g., hover over text).
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
         self.send_cursor_image(&image);
@@ -1324,7 +1287,6 @@ impl SeatHandler for AppState {
     }
 }
 
-/// @brief Handler for pointer warp requests, enabling clients to reset the cursor position.
 impl PointerWarpHandler for AppState {
     fn warp_pointer(
         &mut self,
@@ -1364,12 +1326,10 @@ impl PointerWarpHandler for AppState {
     }
 }
 
-/// @brief Manages XDG Shell events (application windows).
 impl XdgShellHandler for AppState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.shell_state
     }
-    /// @brief Called when a client creates a new top-level window.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
         self.pending_windows.push(window);

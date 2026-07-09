@@ -21,7 +21,7 @@ use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
 
-/// @brief EGL constants and type definitions for C interop.
+// EGL constants and types for C interop.
 type EGLDisplay = *const c_void;
 type EGLImageKHR = *mut c_void;
 type EGLint = i32;
@@ -40,10 +40,10 @@ const EGL_HEIGHT: EGLint = 0x3056;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
 const EGL_NONE: EGLint = 0x3038;
 
-/// @brief CUDA types specifically used for EGL interop.
+// CUDA type used for EGL interop.
 type CUgraphicsResource = *mut c_void;
 
-/// @brief Represents a frame mapped from EGL to CUDA.
+// A frame mapped from EGL to CUDA.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CUeglFrame {
@@ -59,7 +59,7 @@ struct CUeglFrame {
     cu_format: u32,
 }
 
-/// @brief Union for frame data pointers (array vs pitch linear).
+// Frame-data pointers: array vs pitch-linear.
 #[repr(C)]
 #[derive(Clone, Copy)]
 union CUeglFrameUnion {
@@ -76,7 +76,7 @@ type EglCreateImageKhrFn = unsafe extern "C" fn(
 ) -> EGLImageKHR;
 type EglDestroyImageKhrFn = unsafe extern "C" fn(dpy: EGLDisplay, image: EGLImageKHR) -> EGLBoolean;
 
-/// @brief dynamically loaded EGL function pointers.
+// Dynamically loaded EGL function pointers.
 struct EglFunctions {
     _lib: Library,
     eglGetProcAddress: unsafe extern "C" fn(procname: *const c_char) -> *mut c_void,
@@ -84,7 +84,7 @@ struct EglFunctions {
     eglDestroyImageKHR: EglDestroyImageKhrFn,
 }
 
-/// @brief Dynamically loaded CUDA function pointers.
+// Dynamically loaded CUDA function pointers.
 struct CudaFunctions {
     _lib: Library,
     cuInit: unsafe extern "C" fn(flags: u32) -> CUresult,
@@ -138,7 +138,7 @@ struct CudaFunctions {
     cuGetErrorName: unsafe extern "C" fn(error: CUresult, pStr: *mut *const c_char) -> CUresult,
 }
 
-/// @brief Dynamically loaded NVENC API entry point.
+// Dynamically loaded NVENC API entry point.
 struct NvencLibrary {
     _lib: Library,
     create_instance: unsafe extern "C" fn(
@@ -300,7 +300,7 @@ fn nvenc_negotiate(lib: &NvencLibrary) {
     });
 }
 
-/// @brief Cache entry for repeated DMABuf imports.
+// Cache entry for repeated DMABuf imports.
 struct CachedDmaBuf {
     egl_image: EGLImageKHR,
     cuda_resource: CUgraphicsResource,
@@ -321,10 +321,7 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
     Data4: [0xb8, 0x44, 0x33, 0x9b, 0x26, 0x1a, 0x7d, 0x5c],
 };
 
-/// @brief Manages the NVENC H.264 encoder session and CUDA interop resources.
-///
-/// Handles initialization of CUDA contexts, loading of dynamic libraries,
-/// management of input buffers (both DMABuf and Raw), and the encoding loop.
+// NVENC H.264 encoder session and CUDA interop resources.
 pub struct NvencEncoder {
     encoder_session: *mut c_void,
     cuda_context: CUcontext,
@@ -360,10 +357,6 @@ pub struct NvencEncoder {
 
 unsafe impl Send for NvencEncoder {}
 
-/// @brief Clean up GPU resources on drop.
-///
-/// Unregisters resources, frees CUDA memory, destroys the encoder session,
-/// and cleans up the CUDA context.
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
@@ -458,8 +451,6 @@ fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
 }
 
 impl NvencEncoder {
-    /// @brief Loads the EGL library and required extensions.
-    /// @return Result containing the loaded EGL function table.
     fn load_egl() -> Result<EglFunctions, String> {
         unsafe {
             let lib_name = "libEGL.so.1";
@@ -495,8 +486,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Loads the CUDA library and core symbols.
-    /// @return Result containing the loaded CUDA function table.
     fn load_cuda() -> Result<CudaFunctions, String> {
         unsafe {
             let lib_name = if cfg!(windows) {
@@ -550,8 +539,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Loads the NVENC API library.
-    /// @return Result containing the loaded NVENC library wrapper.
     fn load_nvenc() -> Result<NvencLibrary, String> {
         unsafe {
             let lib_name = NVENC_DLL_NAME;
@@ -575,7 +562,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Helper to convert CUDA error codes to strings.
     unsafe fn get_error_string(cuda: &CudaFunctions, err: CUresult) -> String {
         let mut p_str: *const c_char = ptr::null();
         if (cuda.cuGetErrorName)(err, &mut p_str) == CUresult::CUDA_SUCCESS && !p_str.is_null() {
@@ -585,7 +571,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Enumerates and prints available CUDA devices for debugging.
     unsafe fn probe_devices(cuda: &CudaFunctions) {
         let mut count = 0;
         if (cuda.cuDeviceGetCount)(&mut count) != CUresult::CUDA_SUCCESS {
@@ -602,7 +587,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Retrieves the physical PCI Bus ID for a given DRM render node index.
     fn get_pci_bus_id(render_index: i32) -> Option<String> {
         let path = format!("/sys/class/drm/renderD{}/device", 128 + render_index);
         if let Ok(target) = std::fs::read_link(&path) {
@@ -615,10 +599,6 @@ impl NvencEncoder {
         None
     }
 
-    /// @brief Initializes the NVENC encoder, CUDA context, and primary resources.
-    /// @input settings: Capture settings (resolution, FPS, QP).
-    /// @input egl_display: The EGL display handle for interop.
-    /// @return Result containing the initialized NvencEncoder instance.
     pub fn new(
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
@@ -1209,9 +1189,6 @@ impl NvencEncoder {
         self.recording_sink = sink;
     }
 
-    /// @brief Detects if the quantization parameter (QP) has changed and reconfigures the encoder.
-    /// @input target_qp: The new desired QP value.
-    /// @return bool: True if reconfiguration occurred, false otherwise.
     unsafe fn reconfigure_if_needed(&mut self, target_qp: u32) -> bool {
         // CBR is bitrate-controlled, so QP-based paint-over reconfigures don't apply.
         if self.encode_config.rcParams.rateControlMode
@@ -1297,11 +1274,6 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Submits a frame to NVENC, locks the output bitstream, and retrieves the encoded data.
-    /// @input mapped_buffer: The CUDA-mapped input resource containing the image.
-    /// @input frame_number: Monotonically increasing frame index.
-    /// @input force_idr: If true, forces an IDR (Keyframe).
-    /// @return Result containing the encoded packet with custom header.
     unsafe fn submit_frame(
         &mut self,
         mapped_buffer: NV_ENC_INPUT_PTR,
@@ -1379,12 +1351,7 @@ impl NvencEncoder {
         Ok(output)
     }
 
-    /// @brief Encodes a single DMABuf frame by importing it via EGL and mapping it to CUDA.
-    /// @input dmabuf: The source Linux DMA buffer.
-    /// @input frame_number: Frame index.
-    /// @input target_qp: Desired quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing encoded byte vector.
+    /// Encodes a DMABuf frame by importing it via EGL and mapping it to CUDA.
     pub fn encode(
         &mut self,
         dmabuf: &Dmabuf,
@@ -1512,18 +1479,12 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Encodes a host ARGB frame directly, with no explicit ARGB->NV12 conversion.
+    /// Encodes a host ARGB frame directly, with no explicit ARGB->NV12 conversion.
     ///
     /// Uploads the packed ARGB rows straight into the registered ARGB input surface
     /// and lets NVENC's hardware CSC produce YUV. Bytes must be in NVENC ARGB order
     /// (B,G,R,A in memory), i.e. the host BGRA layout an XShm grab produces.
     /// `src_stride` is the source row stride in bytes (>= width*4).
-    /// @input argb: Host pixel buffer (height rows of width*4 at src_stride).
-    /// @input src_stride: Source row stride in bytes.
-    /// @input frame_number: Frame index.
-    /// @input target_qp: Desired quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing encoded byte vector.
     pub fn encode_cpu_argb(
         &mut self,
         argb: &[u8],
@@ -1586,12 +1547,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Encodes a raw byte array by copying from Host to Device.
-    /// @input raw_data: Slice of raw pixel data (NV12 or YUV444).
-    /// @input frame_number: Frame index.
-    /// @input target_qp: Desired quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing encoded byte vector.
+    /// Encodes a raw NV12 or YUV444 byte array (host-to-device copy).
     pub fn encode_raw(
         &mut self,
         raw_data: &[u8],

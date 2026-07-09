@@ -23,7 +23,6 @@ static FF_INIT: Once = Once::new();
 const AV_DRM_MAX_PLANES: usize = 4;
 const QP_HYSTERESIS_LIMIT: u32 = 60;
 
-/// @brief Describes a DRM object (file descriptor) for FFmpeg interop.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMObjectDescriptor {
@@ -32,7 +31,6 @@ struct AVDRMObjectDescriptor {
     pub format_modifier: u64,
 }
 
-/// @brief Describes a specific plane within a DRM layer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMPlaneDescriptor {
@@ -41,7 +39,6 @@ struct AVDRMPlaneDescriptor {
     pub pitch: isize,
 }
 
-/// @brief Describes a layer in a DRM frame, containing multiple planes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMLayerDescriptor {
@@ -50,7 +47,6 @@ struct AVDRMLayerDescriptor {
     pub planes: [AVDRMPlaneDescriptor; AV_DRM_MAX_PLANES],
 }
 
-/// @brief Top-level descriptor for passing DMA-BUF frames to FFmpeg.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMFrameDescriptor {
@@ -60,12 +56,10 @@ struct AVDRMFrameDescriptor {
     pub layers: [AVDRMLayerDescriptor; AV_DRM_MAX_PLANES],
 }
 
-/// @brief Container for file descriptors to ensure they are closed after use.
 struct DmabufResources {
     fds: Vec<c_int>,
 }
 
-/// @brief Callback function used by FFmpeg to release custom DRM frames.
 unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
     // FFmpeg (C) invokes this on buffer teardown: a panic must not unwind across the extern "C"
     // boundary (the compiler guard would abort the process), so catch it here.
@@ -82,7 +76,6 @@ unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
     }));
 }
 
-/// @brief Helper to convert FFmpeg error codes into Rust strings.
 fn ff_err_str(err: i32) -> String {
     unsafe {
         let mut errbuf = [0 as c_char; 128];
@@ -93,10 +86,7 @@ fn ff_err_str(err: i32) -> String {
     }
 }
 
-/// @brief Handles hardware-accelerated H.264 encoding via VAAPI.
-///
-/// Manages the FFmpeg VAAPI context, hardware device derivation from DRM,
-/// filter graphs for format conversion, and the encoding loop.
+// Hardware-accelerated H.264 encoding via VAAPI (FFmpeg).
 pub struct VaapiEncoder {
     encoder_ctx: *mut ff::AVCodecContext,
     codec: *const ff::AVCodec,
@@ -179,14 +169,10 @@ impl Drop for VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    /// @brief Initializes the VAAPI encoder, deriving context from a DRM render node.
+    /// Initializes the VAAPI encoder, deriving context from a DRM render node.
     ///
     /// Sets up the hardware device context, derives the VAAPI context, allocates
     /// frame contexts, and configures the FFmpeg filter graph for color conversion.
-    ///
-    /// @input settings: Capture configuration (resolution, FPS, QP, render node).
-    /// @input recording_sink: Optional Unix socket sink for encoded output.
-    /// @return Result containing the new VaapiEncoder instance.
     ///
     /// Dmabuf input (Wayland): the source frame is a DRM-PRIME dmabuf mapped into a VAAPI
     /// surface by the filter graph.
@@ -577,7 +563,7 @@ impl VaapiEncoder {
         }
     }
 
-    /// @brief Re-opens the codec context in place, applying the current rate-control state.
+    /// Re-opens the codec context in place, applying the current rate-control state.
     ///
     /// The VA device, encoder frames pool and filter graph persist; only the AVCodecContext is
     /// rebuilt. CBR reprograms bit_rate / rc_max_rate / rc_buffer_size from the tracked bitrate
@@ -644,7 +630,7 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    /// @brief Updates the quantization parameter (QP) with hysteresis.
+    /// Updates the quantization parameter (QP) with hysteresis.
     ///
     /// If QP decreases (higher quality paint-over), it re-opens immediately.
     /// If QP increases (lower quality motion), it waits for the hysteresis limit
@@ -705,7 +691,7 @@ impl VaapiEncoder {
         }
     }
 
-    /// @brief Retrieves encoded packets from the encoder and formats them with the custom header.
+    /// Retrieves encoded packets from the encoder and formats them with the custom header.
     unsafe fn collect_packet(&mut self, frame_number: u64, output: &mut Vec<u8>) {
         while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) == 0 {
             let size = (*self.packet).size as usize;
@@ -733,15 +719,9 @@ impl VaapiEncoder {
         }
     }
 
-    /// @brief Encodes a DMA-BUF frame by importing it via DRM and passing it through the filter graph.
+    /// Encodes a DMA-BUF frame by importing it via DRM and passing it through the filter graph.
     ///
     /// The filter graph handles mapping the DRM frame to a VAAPI surface and converting colorspace.
-    ///
-    /// @input dmabuf: The source DMA buffer.
-    /// @input frame_number: Frame index.
-    /// @input qp: Quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing the encoded packet.
     pub fn encode_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
@@ -853,18 +833,11 @@ impl VaapiEncoder {
         }
     }
 
-    /// @brief Encodes one host BGRA frame using GPU postprocessing (X11 path).
+    /// Encodes one host BGRA frame using GPU postprocessing (X11 path).
     ///
     /// The CPU frame is staged into a VAAPI surface (hwupload) and converted ARGB->NV12 by
     /// VA-VPP (scale_vaapi) on the GPU before encode -- there is no CPU colorspace conversion.
     /// Only valid on an encoder built with `new_host`.
-    ///
-    /// @input bgra: B,G,R,A bytes, `stride` bytes per row (X11 host layout).
-    /// @input stride: Source row stride in bytes (may include padding).
-    /// @input frame_number: Frame index.
-    /// @input qp: Quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing the encoded packet.
     pub fn encode_host_argb(
         &mut self,
         bgra: &[u8],
@@ -928,13 +901,7 @@ impl VaapiEncoder {
         }
     }
 
-    /// @brief Encodes raw NV12 pixel data by uploading it from CPU memory to the GPU.
-    ///
-    /// @input nv12_pixels: Raw byte slice of NV12 data.
-    /// @input frame_number: Frame index.
-    /// @input qp: Quality parameter.
-    /// @input force_idr: Force keyframe generation.
-    /// @return Result containing the encoded packet.
+    /// Encodes raw NV12 pixel data by uploading it from CPU memory to the GPU.
     pub fn encode_raw(
         &mut self,
         nv12_pixels: &[u8],

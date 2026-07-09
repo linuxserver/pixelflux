@@ -176,7 +176,6 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
 }
 
-/// @brief Helper to convert a GBM Buffer Object (GPU memory) into a DMABUF.
 fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier().expect("Failed to get modifier");
@@ -1408,33 +1407,9 @@ fn log_stream_settings(
     println!("{}", log_msg);
 }
 
-/// @brief The main execution loop of the Wayland backend.
-///
-/// This function acts as the central nervous system of the application. It runs in its own thread
-/// and manages the entire lifecycle of the Wayland compositor. Its specific responsibilities include:
-///
-/// 1. **Initialization**: Sets up the `calloop` event loop, initializes the Wayland display,
-///    and establishes the rendering pipeline. It attempts to initialize hardware acceleration
-///    via GBM/EGL (DRM render nodes) and falls back to software rendering (Pixman) if unavailable.
-///
-/// 2. **State Management**: Maintains the `AppState`, which holds Wayland globals (Compositor,
-///    Seat, SHM, etc.), buffer pools, and window management logic.
-///
-/// 3. **Event Dispatch**:
-///    - **Command Channel**: Listens for control messages from the Python thread (Start/Stop,
-///      Input Injection, Configuration changes).
-///    - **Wayland Socket**: Accepts connections from Wayland clients (applications) and handles
-///      protocol events.
-///
-/// 4. **The Render Loop**:
-///    A high-frequency timer triggers the frame generation process:
-///    - **Compositing**: Renders all active windows onto a virtual output framebuffer.
-///    - **Readback Logic**: Determines if the GPU buffer needs to be copied to CPU memory
-///      (e.g., for software encoding or cross-GPU transfer).
-///    - **Encoding**: Passes the frame to the active encoder. This handles the complex
-///      "Zero-Copy" path (sharing DMABUFs directly with hardware encoders) vs the "Readback"
-///      path (copying pixels for CPU-based processing/encoding).
-///    - **Transmission**: Sends the encoded video packets back to the Python layer via callback.
+// Main Wayland backend loop (own thread): owns the calloop event loop (Python
+// command channel + Wayland socket) and the render timer that composites, reads
+// back, encodes, and transmits each frame. GBM/EGL HW accel, Pixman SW fallback.
 fn run_wayland_thread(
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
     initial_width: i32,
@@ -3010,10 +2985,7 @@ impl StripeFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-/// @brief Python interface class.
-///
-/// This class is exposed to Python and spawns the Wayland thread upon instantiation.
-/// It provides methods to control the capture session and inject input events.
+/// Python-exposed class; spawns the Wayland thread on instantiation.
 #[pyclass]
 struct WaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,

@@ -13,7 +13,7 @@ use std::ptr;
 use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
-/// @brief Maximum number of stripes used for CPU encoding.
+// Maximum number of stripes used for CPU encoding.
 pub const MAX_STRIPE_CAPACITY: usize = 64;
 
 /// BGRA/RGBA -> planar YUV, split into up to `bands` horizontal bands converted in
@@ -113,10 +113,7 @@ thread_local! {
 /// never during encode.
 static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// @brief Wrapper around x264-sys for CPU-based H.264 encoding.
-///
-/// Manages the raw C pointer to the x264 encoder state and handles
-/// configuration, cleanup, and frame encoding.
+// Wraps the raw x264-sys encoder pointer for CPU H.264 encoding.
 pub struct H264EncoderWrapper {
     encoder: *mut x264_sys::x264_t,
     pub width: i32,
@@ -144,13 +141,7 @@ impl Drop for H264EncoderWrapper {
 }
 
 impl H264EncoderWrapper {
-    /// @brief Initializes a new x264 encoder instance with zerolatency tuning.
-    /// @input width: The width of the frame to encode.
-    /// @input height: The height of the frame to encode.
-    /// @input crf: The Constant Rate Factor quality setting.
-    /// @input is_i444: True for YUV444 (full color), false for YUV420.
-    /// @input fps: The target framerate.
-    /// @return Option<Self>: The wrapper instance or None if initialization fails.
+    /// Creates an x264 encoder instance tuned for zerolatency.
     #[allow(clippy::too_many_arguments)]
     pub fn new(width: i32, height: i32, crf: i32, is_i444: bool, fps: f64, threads: i32,
                cbr_mode: bool, bitrate_kbps: i32, vbv_kbit: i32,
@@ -237,8 +228,7 @@ impl H264EncoderWrapper {
         }
     }
 
-    /// @brief Updates the Rate Factor (CRF) dynamically without recreating the encoder.
-    /// @input new_crf: The new quality value.
+    /// Updates CRF live, without recreating the encoder.
     pub fn reconfigure_crf(&mut self, new_crf: i32) {
         if self.is_cbr || self.current_crf == new_crf {
             return; // CBR is bitrate-controlled; CRF reconfig doesn't apply.
@@ -253,7 +243,7 @@ impl H264EncoderWrapper {
         }
     }
 
-    /// @brief Applies a runtime bitrate/VBV (CBR only) and framerate change without recreating
+    /// Applies a runtime bitrate/VBV (CBR only) and framerate change without recreating
     /// the encoder. Cheap to call every frame; reconfigures only when a value actually changed.
     pub fn reconfigure_rate(&mut self, bitrate_kbps: i32, vbv_kbit: i32, fps: f64) {
         let bk = bitrate_kbps.saturating_abs();
@@ -288,18 +278,7 @@ impl H264EncoderWrapper {
         }
     }
 
-    /// @brief Encodes YUV planes into H.264 NAL units and prepends a custom header.
-    /// @input y: Luma plane data.
-    /// @input u: Chroma U plane data.
-    /// @input v: Chroma V plane data.
-    /// @input y_stride: Stride for Y plane.
-    /// @input u_stride: Stride for U plane.
-    /// @input v_stride: Stride for V plane.
-    /// @input frame_id: Monotonically increasing frame index.
-    /// @input force_idr: Whether to force an IDR (Keyframe).
-    /// @input fixed_header: Custom header bytes to prepend.
-    /// @input output_buf: Buffer to store the resulting packet.
-    /// @return bool: True if encoding was successful, false otherwise.
+    /// Encodes YUV planes into H.264 NAL units, prepending a custom header.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_with_headers(
         &mut self,
@@ -386,10 +365,7 @@ impl H264EncoderWrapper {
     }
 }
 
-/// @brief State tracking for individual horizontal stripes in CPU encoding mode.
-///
-/// Stores buffers, encoder instances, and motion counters for a specific
-/// slice of the screen to facilitate parallel encoding.
+// Per-stripe state (buffers, encoder, motion counters) for parallel CPU encoding.
 #[derive(Default)]
 pub struct StripeState {
     pub no_motion_frame_count: u32,
@@ -499,23 +475,10 @@ pub struct EncodedStripe {
     pub frame_id: i32,
 }
 
-/// @brief Main CPU encoding logic handling threading, striping, and format conversion.
-///
-/// Divides the screen into horizontal stripes, checks for damage/motion, converts
-/// color formats (RGBA/BGRA to YUV), and encodes using either TurboJPEG or x264.
-///
-/// @input stripes: Mutable vector of state objects for each thread/stripe.
-/// @input raw_pixels: The raw framebuffer data.
-/// @input width: Frame width.
-/// @input height: Frame height.
-/// @input damage_rects: Regions of the screen that changed since last frame.
-/// @input settings: Capture settings (Quality, FPS, etc).
-/// @input frame_counter: Current frame index.
-/// @input use_gpu: Whether the input buffer came from GPU (affects pixel format).
-/// @input force_idr_all: When true, force a send + IDR on every H.264 stripe this frame
-///        (on-demand request, or the optional configured keyframe interval). JPEG
-///        stripes ignore it.
-/// @return Vec<Vec<u8>>: A collection of encoded packets for the changed stripes.
+/// Main CPU encoding entry: divides the screen into horizontal stripes, checks
+/// damage/motion, converts RGBA/BGRA to YUV, and encodes each with TurboJPEG or
+/// x264. `force_idr_all` forces a send + IDR on every H.264 stripe this frame
+/// (on-demand or the configured keyframe interval); JPEG stripes ignore it.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
