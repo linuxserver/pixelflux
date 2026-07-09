@@ -189,7 +189,7 @@ fn filter_ids(ids: &mut [u32; MAX_ATTACHED_GPUS], keep: impl Fn(u32) -> bool) {
 /// ioctl wrapper installed into the NVIDIA libraries' GOT. Our own object's GOT is left
 /// untouched, so this inner `libc::ioctl` reaches libc normally (no recursion).
 unsafe extern "C" fn filtered_ioctl(fd: c_int, req: c_ulong, arg: *mut c_void) -> c_int {
-    let rc = libc::ioctl(fd, req, arg);
+    let rc = libc::ioctl(fd, req as _, arg);
     // Preserve the real ioctl's errno across our /proc + /dev lookups below (a caller may read
     // errno after the syscall). Also: a panic in the filtering logic must NOT unwind across this
     // extern "C" boundary (the compiler guard would abort the whole process), so catch it and
