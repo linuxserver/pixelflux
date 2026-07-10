@@ -134,12 +134,17 @@ impl Openh264Encoder {
         Some(me)
     }
 
-    /// Re-init with four fixed slices per frame: encoder threads can parallelize and
-    /// client decoders slice-parallelize (more than four upsets some Chromium
-    /// decoders). The crate initializes the underlying encoder lazily on the FIRST
-    /// encode and only exposes single/size-limited slicing, so prime it with one
-    /// throwaway frame, patch the then-live parameter set, and re-init. Best-effort:
-    /// any failure leaves a working single-slice encoder.
+    /// Re-init with four fixed slices per frame (encoder threads and client
+    /// decoders both slice-parallelize; more than four upsets some Chromium
+    /// decoders) AND explicit VUI colour signaling: BT.709 limited range, matching
+    /// the CSC. Without VUI, a WebRTC receiver falls back to the SDP profile for
+    /// range — a 4:4:4 (full-range) negotiated session then displays this encoder's
+    /// limited-range output unexpanded, i.e. visibly darker. x264/NVENC already
+    /// write VUI, which is why only OpenH264 showed it.
+    /// The crate initializes the underlying encoder lazily on the FIRST encode and
+    /// exposes neither fixed slicing nor VUI, so prime it with one throwaway frame,
+    /// patch the then-live parameter set, and re-init. Best-effort: any failure
+    /// leaves a working single-slice encoder.
     fn enable_four_slices(&mut self) {
         let slices = YUVSlices::new(
             (&self.y_buf, &self.u_buf, &self.v_buf),
@@ -162,12 +167,22 @@ impl Openh264Encoder {
             params.sSpatialLayers[0].sSliceArgument.uiSliceMode =
                 openh264_sys2::SM_FIXEDSLCNUM_SLICE;
             params.sSpatialLayers[0].sSliceArgument.uiSliceNum = 4;
+            {
+                let layer = &mut params.sSpatialLayers[0];
+                layer.bVideoSignalTypePresent = true;
+                layer.uiVideoFormat = 5; // unspecified
+                layer.bFullRange = false;
+                layer.bColorDescriptionPresent = true;
+                layer.uiColorPrimaries = 1; // BT.709
+                layer.uiTransferCharacteristics = 1;
+                layer.uiColorMatrix = 1;
+            }
             let ret = raw.set_option(
                 openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
                 &mut params as *mut _ as *mut std::ffi::c_void,
             );
             if ret != 0 {
-                eprintln!("[openh264] 4-slice re-init rejected ({ret}); staying single-slice");
+                eprintln!("[openh264] stream-param re-init rejected ({ret}); staying single-slice without VUI");
             }
         }
         // The throwaway frame consumed the initial IDR; the first delivered frame

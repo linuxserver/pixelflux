@@ -97,11 +97,8 @@ pub mod encoders {
     pub mod software;
     pub mod vaapi;
 
-    /// Effective CBR VBV/HRD size in BITS: one frame's bit budget times a multiplier,
-    /// so a live bitrate or framerate change rescales the buffer with it. A multiplier
-    /// <= 0 selects the policy default — 1.5 frames on an infinite GOP, relaxed to 3
-    /// when scheduled keyframes are enabled (IDRs need burst headroom or quality dips
-    /// at every interval).
+    /// CBR VBV/HRD buffer size in bits: one frame's bit budget times `multiplier`.
+    /// `multiplier` <= 0 uses the default (1.5, or 3 when keyframe_interval_s > 0).
     pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier: f64) -> u32 {
         let frame_bits = bitrate_bps as f64 / fps.max(1.0);
         let mult = if multiplier > 0.0 {
@@ -176,6 +173,7 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
 }
 
+/// Wraps a GBM buffer object as a Dmabuf (fd + stride + modifier, single plane).
 fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier().expect("Failed to get modifier");
@@ -434,10 +432,14 @@ pub enum ThreadCommand {
     StartCapture(Py<PyAny>, RustCaptureSettings),
     StopCapture,
     SetCursorCallback(Py<PyAny>),
+    SetClipboardCallback(Py<PyAny>),
+    // Server-side clipboard offer: the compositor owns the selection and serves
+    // `data` as `mime` (plus text aliases) to pasting clients.
+    SetClipboard { mime: String, data: Vec<u8> },
     KeyboardKey { scancode: u32, state: u32 },
-    // Inject by X11/XKB keysym, resolved to a keycode (+ shift level) against our own
-    // smithay xkb keymap. See the KeyboardKeysym handler.
-    KeyboardKeysym { keysym: u32, state: u32 },
+    // Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text); the caller
+    // owns keysym-to-keycode policy and injects the keycodes it defined via KeyboardKey.
+    SetKeymapString(String),
     // Reply with the smithay keyboard's keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a
     // consumer (selkies) can build its reverse keysym map from the IDENTICAL keymap.
     GetXkbKeymap { reply: std::sync::mpsc::Sender<String> },
@@ -454,11 +456,6 @@ pub enum ThreadCommand {
     // settings and mirrored to the readback encode thread -- no capture or encoder restart.
     UpdateTunables(LiveTunables),
 }
-
-/// X11/XKB keycode = Linux evdev keycode + 8. `inject_key` works in evdev space so the
-/// KeyboardKey handler ADDS this; `inject_keysym` resolves against xkb's already-X11 keycodes
-/// (min..=max) and passes them straight to `KeyboardHandle::input`, so it never adds it.
-const EVDEV_TO_XKB_KEYCODE_OFFSET: u32 = 8;
 
 pub(crate) fn get_gpu_driver(card_index: i32) -> String {
     let path = format!("/sys/class/drm/renderD{}/device/driver", 128 + card_index);
@@ -643,142 +640,6 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
     nodes.first().map(|n| format!("/dev/dri/{}", n))
 }
 
-/// Resolve a keysym to an X11 keycode (+ whether Shift is needed) against smithay's own xkb
-/// keymap. Prefers the unshifted level-0 binding, else the shifted level-1 binding. Returns
-/// None if no key in the active layout produces it. Read-only; never panics on the keysym.
-fn resolve_keysym_to_keycode(
-    keymap: &smithay::input::keyboard::xkb::Keymap,
-    layout: smithay::input::keyboard::Layout,
-    target_keysym: u32,
-) -> Option<(u32, u8)> {
-    use smithay::input::keyboard::xkb;
-    let min_kc = keymap.min_keycode().raw();
-    let max_kc = keymap.max_keycode().raw();
-    if min_kc > max_kc {
-        return None;
-    }
-    // Scan shift-levels in preference order (0 = unshifted, preferred; 1 = Shift; 2 =
-    // AltGr / ISO_Level3_Shift; 3 = Shift+AltGr) so AltGr-only glyphs on non-US layouts
-    // (e.g. @ € | \ ~ on many EU layouts) resolve instead of being dropped. Returns the
-    // level so the caller can synthesize the matching modifier(s).
-    for level in 0u32..4 {
-        for raw_kc in min_kc..=max_kc {
-            let kc = xkb::Keycode::new(raw_kc);
-            let syms = keymap.key_get_syms_by_level(kc, layout.0, level);
-            if syms.iter().any(|s| s.raw() == target_keysym) {
-                return Some((raw_kc, level as u8));
-            }
-        }
-    }
-    None
-}
-
-/// Number of dynamic overlay keycodes appended past the base keymap range.
-pub(crate) const OVERLAY_SLOTS: usize = 16;
-/// First overlay keycode (xkb numbering): the evdev/pc105 base map ends at 256.
-/// Pure-Wayland clients look keycodes up in the delivered keymap, so exceeding the
-/// X11 core 255 limit is safe here (this compositor has no XWayland).
-const OVERLAY_BASE_KEYCODE: u32 = 257;
-
-/// Rebuild the base keymap text with the overlay keycodes appended and every occupied
-/// slot bound to its keysym at level 0. String surgery on the xkbcommon TEXT_V1
-/// serialization; returns None if the base text has an unexpected shape.
-fn build_overlay_keymap(base: &str, slots: &[u32; OVERLAY_SLOTS]) -> Option<String> {
-    let mut s = String::with_capacity(base.len() + 1024);
-    // Raise the keycode ceiling to cover the overlay range.
-    let max_at = base.find("maximum = ")?;
-    let max_end = max_at + base[max_at..].find(';')?;
-    s.push_str(&base[..max_at]);
-    s.push_str(&format!("maximum = {}", OVERLAY_BASE_KEYCODE as usize + OVERLAY_SLOTS));
-    let rest = &base[max_end..];
-    // Name the overlay keycodes at the end of the xkb_keycodes section ("maximum ="
-    // sits inside it, so its closing brace is the first "};" from here).
-    let kc_end = rest.find("};")?;
-    s.push_str(&rest[..kc_end]);
-    for i in 0..OVERLAY_SLOTS {
-        s.push_str(&format!("\t<UC{:02}> = {};\n", i + 1, OVERLAY_BASE_KEYCODE as usize + i));
-    }
-    let rest = &rest[kc_end..];
-    // Bind occupied slots at the end of the xkb_symbols section (brace-matched close;
-    // xkb accepts hex keysym literals, so no name lookup is needed).
-    let sym_at = rest.find("xkb_symbols")?;
-    let open = sym_at + rest[sym_at..].find('{')?;
-    let mut depth = 0usize;
-    let mut close = None;
-    for (idx, ch) in rest[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    close = Some(open + idx);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close?;
-    s.push_str(&rest[..close]);
-    for (i, &ks) in slots.iter().enumerate() {
-        if ks != 0 {
-            s.push_str(&format!("\tkey <UC{:02}> {{ [ {:#x} ] }};\n", i + 1, ks));
-        }
-    }
-    s.push_str(&rest[close..]);
-    Some(s)
-}
-
-/// Bind a keysym absent from the layout to a spare overlay keycode by swapping in a
-/// rebuilt keymap (clients receive the new map before the key event that uses it).
-/// Slots recycle round-robin; a keysym already bound reuses its slot.
-fn bind_overlay_keysym(
-    state: &mut AppState,
-    keyboard: &smithay::input::keyboard::KeyboardHandle<AppState>,
-    keysym: u32,
-) -> Option<u32> {
-    if keysym == 0 {
-        return None;
-    }
-    if let Some(i) = state.overlay_slots.iter().position(|&s| s == keysym) {
-        return Some(OVERLAY_BASE_KEYCODE + i as u32);
-    }
-    if state.base_keymap_string.is_none() {
-        let base = keyboard.with_xkb_state(state, |context| match context.xkb().lock() {
-            Ok(guard) => {
-                // SAFETY: read-only use of the &Keymap within the guard scope.
-                let keymap = unsafe { guard.keymap() };
-                keymap.get_as_string(smithay::input::keyboard::xkb::KEYMAP_FORMAT_TEXT_V1)
-            }
-            Err(_) => String::new(),
-        });
-        if base.is_empty() {
-            return None;
-        }
-        state.base_keymap_string = Some(base);
-    }
-    let i = state.overlay_next % OVERLAY_SLOTS;
-    let prev = state.overlay_slots[i];
-    state.overlay_slots[i] = keysym;
-    let text = match state
-        .base_keymap_string
-        .as_ref()
-        .and_then(|b| build_overlay_keymap(b, &state.overlay_slots))
-    {
-        Some(t) => t,
-        None => {
-            state.overlay_slots[i] = prev;
-            return None;
-        }
-    };
-    if let Err(e) = keyboard.set_keymap_from_string(state, text) {
-        eprintln!("[Wayland] overlay keymap swap failed: {e:?}");
-        state.overlay_slots[i] = prev;
-        return None;
-    }
-    state.overlay_next = state.overlay_next.wrapping_add(1);
-    Some(OVERLAY_BASE_KEYCODE + i as u32)
-}
 
 /// One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
 /// encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
@@ -1228,9 +1089,11 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 damage.push(Rectangle::new((0, 0).into(), (width, height).into()));
             }
             // Infinite GOP by default for the software H.264 path: stripes IDR on an explicit
-            // request or the optional configured interval (JPEG ignores it).
-            let force_idr_all = settings.output_mode == 1
-                && (requested_idr || crate::pipeline::periodic_idr_due(&settings, f.frame_id));
+            // request or the optional configured interval. An explicit request also forces a
+            // JPEG full resend so a joining viewer gets every stripe.
+            let force_idr_all = requested_idr
+                || (settings.output_mode == 1
+                    && crate::pipeline::periodic_idr_due(&settings, f.frame_id));
             out = encoders::software::encode_cpu(
                 &mut stripes,
                 &f.buf,
@@ -1418,21 +1281,10 @@ fn run_wayland_thread(
     auto_gpu_selected: bool,
     cursor_size: i32,
 ) {
-    // Initial framebuffer size comes from selkies (the server owns resolution policy
+    // Initial framebuffer size comes from the caller (selkies owns resolution policy
     // and forwards it via the WaylandBackend constructor); first StartCapture resizes.
-    let mut width: i32 = if initial_width > 0 { initial_width } else { 1024 };
-    let mut height: i32 = if initial_height > 0 { initial_height } else { 768 };
-
-    if let Ok(w_str) = std::env::var("SELKIES_MANUAL_WIDTH") {
-        if let Ok(w) = w_str.parse::<i32>() {
-            width = w;
-        }
-    }
-    if let Ok(h_str) = std::env::var("SELKIES_MANUAL_HEIGHT") {
-        if let Ok(h) = h_str.parse::<i32>() {
-            height = h;
-        }
-    }
+    let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
+    let height: i32 = if initial_height > 0 { initial_height } else { 768 };
 
     let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
     let display: Display<AppState> = Display::new().unwrap();
@@ -1612,13 +1464,13 @@ fn run_wayland_thread(
         },
         callback: None,
         cursor_callback: None,
+        clipboard_callback: None,
+        pending_clipboard_read: None,
         last_log_time: Instant::now(),
         start_time: Instant::now(),
         clock: Clock::new(),
         frame_counter: 0,
         pending_force_idr: false,
-        synthetic_shift_keysyms: std::collections::HashMap::new(),
-        synthetic_mod_refcounts: std::collections::HashMap::new(),
         use_gpu,
         video_encoder: None,
         vaapi_state: StripeState::default(),
@@ -1627,9 +1479,6 @@ fn run_wayland_thread(
         current_cursor_icon: None,
         cursor_buffer: None,
         cursor_cache: std::collections::HashMap::new(),
-        base_keymap_string: None,
-        overlay_slots: [0; OVERLAY_SLOTS],
-        overlay_next: 0,
         render_cursor_on_framebuffer: false,
         render_node_path,
         auto_gpu_selected,
@@ -1679,8 +1528,9 @@ fn run_wayland_thread(
                 CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
                     // AUTO_GPU aims the encoder at the auto-picked render node. An explicit
                     // render_node_path (which sets auto_gpu_selected = false) is respected.
-                    // Operator choice (encode_node_index >= 0, e.g. --encode-dri) always wins.
-                    if state.auto_gpu_selected {
+                    // Operator choice (encode_node_index = -1 software / >= 0 device) always wins;
+                    // only the unset sentinel (-2) is resolved here.
+                    if state.auto_gpu_selected && settings.encode_node_index < -1 {
                         if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
                             if let Ok(idx) = idx_str.parse::<i32>() {
                                 settings.encode_node_index = idx - 128;
@@ -2013,10 +1863,12 @@ fn run_wayland_thread(
                     state.is_capturing = false;
                     WAYLAND_CAPTURE_ALIVE.store(false, Ordering::Release);
                     state.callback = None;
-                    // Drop the cursor callback: this thread outlives the interpreter, so a
-                    // retained one could fire into a finalizing interpreter (the off-GIL drop
-                    // defers the decref). Callers re-register it before the next start.
+                    // Drop the cursor/clipboard callbacks: this thread outlives the
+                    // interpreter, so a retained one could fire into a finalizing
+                    // interpreter (the off-GIL drop defers the decref). Callers
+                    // re-register them before the next start.
                     state.cursor_callback = None;
+                    state.clipboard_callback = None;
                     state.video_encoder = None;
                     state.vaapi_state = StripeState::default();
                     // Stop the encode thread FIRST (it releases every readback encoder --
@@ -2031,6 +1883,24 @@ fn run_wayland_thread(
                     *state.encode_stats.desc.lock().unwrap() = String::new();
                     if let Some(tx) = state.deliver_tx.take() { drop(tx); }
                     if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
+                }
+                CalloopEvent::Msg(ThreadCommand::SetClipboardCallback(cb)) => {
+                    state.clipboard_callback = Some(cb);
+                }
+                CalloopEvent::Msg(ThreadCommand::SetClipboard { mime, data }) => {
+                    let mimes: Vec<String> = if mime.starts_with("text/plain") {
+                        // Text aliases so every toolkit finds a target it knows.
+                        ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
+                         "STRING", "TEXT"].iter().map(|s| s.to_string()).collect()
+                    } else {
+                        vec![mime.clone()]
+                    };
+                    smithay::wayland::selection::data_device::set_data_device_selection(
+                        &state.dh,
+                        &state.seat.clone(),
+                        mimes,
+                        std::sync::Arc::new((mime, data)),
+                    );
                 }
                 CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
                     state.cursor_callback = Some(cb);
@@ -2052,117 +1922,13 @@ fn run_wayland_thread(
                         });
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::KeyboardKeysym { keysym, state: key_state_val }) => {
-                    // Inject by keysym against our own live xkb keymap: resolve to an X11 keycode
-                    // (+ Shift), then inject, synthesizing a Shift press/release for shifted keysyms.
-                    let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
+                CalloopEvent::Msg(ThreadCommand::SetKeymapString(text)) => {
+                    // Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1).
+                    // Clients receive the new map before any later key event, so the
+                    // caller may inject keycodes it defined immediately afterwards.
                     if let Some(keyboard) = state.seat.get_keyboard() {
-                        let inject = |state: &mut AppState, x11_kc: u32, ks: KeyState| {
-                            let serial = next_serial();
-                            let time = wayland_time();
-                            keyboard.input(state, Keycode::new(x11_kc), ks, serial, time, |_, _, _| {
-                                FilterResult::<()>::Forward
-                            });
-                        };
-
-                        match key_state {
-                            KeyState::Pressed => {
-                                // Phase 1: resolve against the live keymap (read-only) -> (target
-                                // keycode, the modifier keycodes that select its shift-level). No
-                                // `.unwrap()` on attacker-supplied data.
-                                let resolved: Option<(u32, Vec<u32>)> =
-                                    keyboard.with_xkb_state(state, |context| {
-                                        let xkb_guard = match context.xkb().lock() {
-                                            Ok(g) => g,
-                                            Err(_) => return None,
-                                        };
-                                        let layout = xkb_guard.active_layout();
-                                        // SAFETY: the &Keymap borrow stays within this guard's scope
-                                        // and is only read; we never store it past the lock.
-                                        let keymap = unsafe { xkb_guard.keymap() };
-                                        let (kc, level) = resolve_keysym_to_keycode(keymap, layout, keysym)?;
-                                        // Resolve a modifier keysym to its keycode, falling back to the
-                                        // conventional X11 keycode when the layout lacks it.
-                                        let resolve_mod = |ks: u32, fallback: u32| {
-                                            resolve_keysym_to_keycode(keymap, layout, ks)
-                                                .map(|(c, _)| c)
-                                                .unwrap_or(fallback)
-                                        };
-                                        // Standard ISO convention: level 1 = Shift, level 2 = AltGr
-                                        // (ISO_Level3_Shift), level 3 = Shift+AltGr.
-                                        let mut mods: Vec<u32> = Vec::new();
-                                        if level == 1 || level == 3 {
-                                            // Shift_L (0xFFE1); fallback evdev KEY_LEFTSHIFT 42 + offset.
-                                            mods.push(resolve_mod(0xFFE1, 42 + EVDEV_TO_XKB_KEYCODE_OFFSET));
-                                        }
-                                        if level == 2 || level == 3 {
-                                            // ISO_Level3_Shift / AltGr (0xFE03); fallback evdev KEY_RIGHTALT 100 + offset.
-                                            mods.push(resolve_mod(0xFE03, 100 + EVDEV_TO_XKB_KEYCODE_OFFSET));
-                                        }
-                                        Some((kc, mods))
-                                    });
-
-                                // Phase 2: inject and RECORD the injected keycodes so the matching
-                                // key-up releases exactly these, regardless of later layout changes.
-                                // Synthetic modifiers are ref-counted so two simultaneously-held
-                                // shifted/AltGr keys don't release each other's modifier early.
-                                if let Some((kc, mods)) = resolved {
-                                    // Auto-repeat (~25Hz) re-presses the same keysym without an
-                                    // intervening release. Only the FIRST press touches modifier
-                                    // refcounts + the held-key map; otherwise the refcount would
-                                    // climb while the single map entry (and its one release)
-                                    // stayed at 1, leaving Shift/AltGr stuck held. Re-presses still
-                                    // re-inject the key-down so auto-repeat key events flow through.
-                                    if !state.synthetic_shift_keysyms.contains_key(&keysym) {
-                                        for &m in &mods {
-                                            let first = {
-                                                let c = state.synthetic_mod_refcounts.entry(m).or_insert(0);
-                                                *c += 1;
-                                                *c == 1
-                                            };
-                                            if first {
-                                                inject(state, m, KeyState::Pressed);
-                                            }
-                                        }
-                                        state.synthetic_shift_keysyms.insert(keysym, (kc, mods));
-                                    }
-                                    inject(state, kc, KeyState::Pressed);
-                                } else if let Some(kc) = bind_overlay_keysym(state, &keyboard, keysym) {
-                                    // Not in the layout (Unicode etc.): bind it to an
-                                    // overlay keycode in a rebuilt keymap and press that,
-                                    // modifier-free (level 0).
-                                    state.synthetic_shift_keysyms.insert(keysym, (kc, Vec::new()));
-                                    inject(state, kc, KeyState::Pressed);
-                                } else {
-                                    eprintln!(
-                                        "[Wayland] inject_keysym: keysym {:#06x} not in the layout and overlay bind failed; ignoring",
-                                        keysym
-                                    );
-                                }
-                            }
-                            KeyState::Released => {
-                                // Release the keycodes recorded at PRESS time; do NOT re-resolve
-                                // (the layout may have changed mid-keystroke). A synthetic modifier
-                                // is released only when its last holder is released (ref-counted).
-                                if let Some((kc, mods)) =
-                                    state.synthetic_shift_keysyms.remove(&keysym)
-                                {
-                                    inject(state, kc, KeyState::Released);
-                                    for &m in &mods {
-                                        let last = match state.synthetic_mod_refcounts.get_mut(&m) {
-                                            Some(c) => {
-                                                *c = c.saturating_sub(1);
-                                                *c == 0
-                                            }
-                                            None => false,
-                                        };
-                                        if last {
-                                            state.synthetic_mod_refcounts.remove(&m);
-                                            inject(state, m, KeyState::Released);
-                                        }
-                                    }
-                                }
-                            }
+                        if let Err(e) = keyboard.set_keymap_from_string(state, text) {
+                            eprintln!("[Wayland] keymap swap failed: {e:?}");
                         }
                     }
                 }
@@ -2484,6 +2250,8 @@ fn run_wayland_thread(
             );
 
             let mut render_success = false;
+            // GLES render completion fence, consumed by the zero-copy encode below.
+            let mut render_sync = None;
             let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
             let width = state.settings.width;
             let height = state.settings.height;
@@ -2621,24 +2389,38 @@ fn run_wayland_thread(
                                             if let Some(damage) = result.damage {
                                                 damage_rects = damage.clone();
                                             }
+                                            render_sync = Some(result.sync);
                                         },
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
-                                    // Readback goes straight into the pooled buffer; CSC and
-                                    // encode happen on the encode thread. Throttling skips the
-                                    // readback entirely (no reservation was made).
-                                    if let Some((_, ref mut buf)) = pool_slot {
-                                        let _ = renderer.with_context(|gl| unsafe {
-                                            gl.ReadPixels(
-                                                0, // x
-                                                0, // y
-                                                width,
-                                                height,
-                                                smithay::backend::renderer::gles::ffi::RGBA,
-                                                smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
-                                                buf.as_mut_ptr() as *mut std::ffi::c_void,
-                                            );
-                                        });
+                                    // Readback into the pooled buffer via ExportMem: unlike a raw
+                                    // glReadPixels it re-makes the target current and selects
+                                    // COLOR_ATTACHMENT0 explicitly, so a READ-framebuffer left
+                                    // pointing elsewhere by the render pass can't yield a stale
+                                    // (black) capture. Bytes are RGBA, identical to the old path.
+                                    // On failure the reservation is canceled: skipping a tick is
+                                    // recoverable, publishing a black frame is not.
+                                    if pool_slot.is_some() {
+                                        use smithay::backend::renderer::ExportMem;
+                                        let region = Rectangle::from_size((width, height).into());
+                                        let copied = renderer
+                                            .copy_framebuffer(&frame, region, Fourcc::Abgr8888)
+                                            .and_then(|mapping| {
+                                                renderer.map_texture(&mapping).map(|slice| {
+                                                    if let Some((_, ref mut buf)) = pool_slot {
+                                                        let n = slice.len().min(buf.len());
+                                                        buf[..n].copy_from_slice(&slice[..n]);
+                                                    }
+                                                })
+                                            });
+                                        if let Err(e) = copied {
+                                            eprintln!("[Wayland] GLES readback failed: {e:?}");
+                                            if let Some((id, buf)) = pool_slot.take() {
+                                                if let Some(ref pool) = state.encode_pool {
+                                                    pool.cancel(id, buf);
+                                                }
+                                            }
+                                        }
                                     }
                                 },
                                 Err(e) => eprintln!("Failed to bind buffer: {:?}", e)
@@ -2858,6 +2640,13 @@ fn run_wayland_thread(
                         let target_qp = decision.target_qp;
 
                         if send_frame {
+                            // NVENC/VA-API read the offscreen dmabuf through CUDA/VA, which
+                            // cannot see the GL command queue: wait the render's sync point
+                            // so the encoder never maps a half-rasterized frame (a mid-frame
+                            // horizontal tear). wait() only errs on signal interrupt; retry.
+                            if let Some(sync) = render_sync.take() {
+                                while sync.wait().is_err() {}
+                            }
                             let force_idr_for_recording = state
                                 .recording_sink
                                 .as_ref()
@@ -2930,7 +2719,10 @@ fn run_wayland_thread(
         })
         .unwrap();
 
-    event_loop.run(None, &mut state, |state| { state.dh.flush_clients().unwrap(); }).unwrap();
+    event_loop.run(None, &mut state, |state| {
+        state.process_pending_clipboard_read();
+        state.dh.flush_clients().unwrap();
+    }).unwrap();
 }
 
 /// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
@@ -3048,6 +2840,22 @@ impl WaylandBackend {
         Ok(())
     }
 
+    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+        self.tx
+            .send(ThreadCommand::SetClipboardCallback(callback))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard callback: {}", e)))?;
+        Ok(())
+    }
+
+    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    fn set_clipboard(&self, mime: String, data: Vec<u8>) -> PyResult<()> {
+        self.tx
+            .send(ThreadCommand::SetClipboard { mime, data })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard: {}", e)))?;
+        Ok(())
+    }
+
     fn inject_key(&self, scancode: u32, state: u32) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::KeyboardKey { scancode, state })
@@ -3055,13 +2863,13 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Inject a key by X11/XKB keysym (e.g. 0x41 'A', 0xFF0D Return), resolved against our own
-    /// xkb keymap. Prefer over `inject_key` when you have a keysym. A shifted keysym gets a
-    /// synthetic Shift press/release. `state`: 1 = press, 0 = release.
-    fn inject_keysym(&self, keysym: u32, state: u32) -> PyResult<()> {
+    /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
+    /// owns keysym-to-keycode policy: define keycodes here, then press them via
+    /// `inject_key`. Ordered with key events on the one compositor channel.
+    fn set_keymap_string(&self, text: String) -> PyResult<()> {
         self.tx
-            .send(ThreadCommand::KeyboardKeysym { keysym, state })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject keysym: {}", e)))?;
+            .send(ThreadCommand::SetKeymapString(text))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set keymap: {}", e)))?;
         Ok(())
     }
 
@@ -3307,8 +3115,8 @@ fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
 }
 
 /// Get-or-create the singleton Wayland backend (idempotent; first dims + render node win,
-/// capture resizes). Only capture start calls this: creation fixes the compositor's render
-/// node, and start is the one entry point that knows the operator's real node.
+/// capture resizes). Called from capture start (which knows the operator's real node) and
+/// from the import-time bootstrap when the deployment opts into pixelflux-as-compositor.
 fn ensure_wayland_backend(
     py: Python<'_>,
     width: i32,
@@ -3521,11 +3329,12 @@ impl ScreenCapture {
             return Ok(());
         }
 
-        // AUTO_GPU on X11: with no explicit encode device chosen (encode_node_index < 0),
+        // AUTO_GPU on X11: with no explicit encode device chosen (encode_node_index = -2),
         // resolve the requested GPU to a render node and aim the encoder at it so a
-        // multi-GPU host doesn't silently default to device 0. Explicit --encode-dri wins.
+        // multi-GPU host doesn't silently default to device 0. Explicit --encode-dri /
+        // -1 (software) / >= 0 (device) win.
         let mut rs = rs;
-        if rs.encode_node_index < 0 {
+        if rs.encode_node_index < -1 {
             let auto_gpu = settings
                 .getattr("auto_gpu")
                 .ok()
@@ -3798,8 +3607,8 @@ impl ScreenCapture {
     fn inject_key(&self, py: Python<'_>, scancode: u32, state: u32) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_key(scancode, state))
     }
-    fn inject_keysym(&self, py: Python<'_>, keysym: u32, state: u32) -> PyResult<()> {
-        wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_keysym(keysym, state))
+    fn set_keymap_string(&self, py: Python<'_>, text: String) -> PyResult<()> {
+        wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_string(text))
     }
     fn inject_mouse_move(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_move(x, y))
@@ -3833,6 +3642,24 @@ impl ScreenCapture {
         wayland_backend_running(py)
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))
     }
+    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    fn set_clipboard_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        match wayland_backend_running(py) {
+            Some(be) => be.bind(py).borrow().set_clipboard_callback(callback),
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "wayland backend not running",
+            )),
+        }
+    }
+    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    fn set_clipboard(&self, py: Python<'_>, mime: String, data: Vec<u8>) -> PyResult<()> {
+        match wayland_backend_running(py) {
+            Some(be) => be.bind(py).borrow().set_clipboard(mime, data),
+            None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "wayland backend not running",
+            )),
+        }
+    }
 }
 
 impl Drop for ScreenCapture {
@@ -3846,6 +3673,25 @@ impl Drop for ScreenCapture {
             }
         }
     }
+}
+
+/// Bring the Wayland compositor socket up before any capture so apps launched early can
+/// connect (sets WAYLAND_DISPLAY for children of this process). Idempotent; the running
+/// backend keeps its node/dimensions on later calls. `render_node` is an explicit
+/// /dev/dri/renderD* path; `auto_gpu` is a truthy string or vendor/driver token; empty
+/// values mean software rendering.
+#[pyfunction]
+#[pyo3(signature = (width = 0, height = 0, render_node = String::new(), auto_gpu = String::new(), cursor_size = -1))]
+fn ensure_wayland_display(
+    py: Python<'_>,
+    width: i32,
+    height: i32,
+    render_node: String,
+    auto_gpu: String,
+    cursor_size: i32,
+) -> PyResult<()> {
+    ensure_wayland_backend(py, width, height, render_node, auto_gpu, String::new(), cursor_size)
+        .map(|_| ())
 }
 
 /// Stop every live X11 capture (registered with atexit). Sets each stop flag and gives the
@@ -3882,6 +3728,7 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CaptureSettings>()?;
     m.add_class::<ScreenCapture>()?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
     // Register _stop_all_captures with atexit so every live capture is stopped before
     // interpreter shutdown, ensuring no capture thread calls into Python during finalization.
@@ -3889,239 +3736,8 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));
     }
 
-    {
-        let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
-        if slot.lock().unwrap().is_none() {
-            let width = 0;
-            let height = 0;
-            let mut dri_node = String::new();
-            let mut auto_gpu_selected = false;
-
-            if let Ok(node) = std::env::var("SELKIES_RENDER_DRI") {
-                dri_node = node;
-            } else if let Ok(node) = std::env::var("DRINODE") {
-                dri_node = node;
-            }
-
-            if dri_node.is_empty() {
-                let auto_val = std::env::var("SELKIES_AUTO_GPU")
-                    .or_else(|_| std::env::var("AUTO_GPU"))
-                    .unwrap_or_default();
-                if matches!(auto_val.as_str(), "1" | "true" | "yes" | "on") {
-                    if let Some(picked) = auto_select_render_node(None) {
-                        dri_node = picked;
-                        auto_gpu_selected = true;
-                    }
-                }
-            }
-
-            let be = Py::new(
-                m.py(),
-                WaylandBackend::new(width, height, dri_node, auto_gpu_selected, -1),
-            )?;
-            *slot.lock().unwrap() = Some(be);
-        }
-    }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod keysym_release_replay_tests {
-    //! Invariant under test: `inject_keysym` records the keycodes injected at PRESS time into
-    //! `synthetic_shift_keysyms` (a `HashMap<u32, (u32, u32)>`) so the matching key-up releases
-    //! the SAME physical keycodes, even if the active xkb layout changed mid-keystroke. The
-    //! release path must read the recorded mapping and must NOT re-resolve the keysym against
-    //! the (possibly different) live layout.
-    //!
-    //! The production record/replay lives inside the calloop loop in `run_wayland_thread` and
-    //! resolves against a live `xkb::Keymap`, which needs a connected keyboard. These tests
-    //! model the identical state machine with the same map type and a deterministic 2-layout
-    //! resolver so the invariant is provable in isolation.
-
-    use std::collections::HashMap;
-
-    /// Simulated key-up actions emitted by the release path, in order.
-    /// Mirrors the real `inject(state, kc, KeyState::Released)` calls.
-    #[derive(Debug, PartialEq, Eq)]
-    enum Release {
-        Key(u32),
-        Shift(u32),
-    }
-
-    /// Deterministic stand-in for `resolve_keysym_to_keycode`, parameterized by layout.
-    /// Returns (keycode, needs_shift). Two layouts deliberately map the same keysym to
-    /// DIFFERENT keycodes / shift-requirements to model a layout switch mid-keystroke.
-    ///
-    /// Layout 0 ("us"):    keysym 0x41 ('A') -> kc 38, needs_shift=true ; Shift_L -> kc 50
-    /// Layout 1 ("de"):    keysym 0x41 ('A') -> kc 24, needs_shift=false (different key!)
-    fn resolve(layout: u32, keysym: u32) -> Option<(u32, bool)> {
-        match (layout, keysym) {
-            (0, 0x41) => Some((38, true)),
-            (0, 0xFFE1) => Some((50, false)), // Shift_L on layout 0
-            (1, 0x41) => Some((24, false)),
-            (1, 0xFFE1) => Some((62, false)), // Shift_L on layout 0 -> different kc on layout 1
-            (_, 0xFF0D) => Some((36, false)), // Return: same on both, never shifted
-            _ => None,
-        }
-    }
-
-    const SHIFT_L: u32 = 0xFFE1;
-
-    /// Models the press branch: resolve against the *current* layout, then RECORD
-    /// (kc, shift_kc_or_0) keyed by keysym. Returns false if unresolved.
-    fn press(map: &mut HashMap<u32, (u32, u32)>, current_layout: u32, keysym: u32) -> bool {
-        let Some((kc, needs_shift)) = resolve(current_layout, keysym) else {
-            return false;
-        };
-        let shift_kc = if needs_shift {
-            resolve(current_layout, SHIFT_L).map(|(kc, _)| kc).unwrap_or(50)
-        } else {
-            0
-        };
-        map.insert(keysym, (kc, if needs_shift { shift_kc } else { 0 }));
-        true
-    }
-
-    /// Models the correct release branch: read the recorded keycodes and release exactly
-    /// those; key first, then synthetic Shift if shift_kc != 0.
-    fn release_fixed(map: &mut HashMap<u32, (u32, u32)>, keysym: u32) -> Vec<Release> {
-        let mut out = Vec::new();
-        if let Some((kc, shift_kc)) = map.remove(&keysym) {
-            out.push(Release::Key(kc));
-            if shift_kc != 0 {
-                out.push(Release::Shift(shift_kc));
-            }
-        }
-        out
-    }
-
-    /// Models the incorrect alternative: ignore the record and RE-RESOLVE against the live
-    /// (possibly changed) layout. Kept only to prove the correct path diverges from it
-    /// exactly when the layout changes mid-keystroke.
-    fn release_reresolve(current_layout: u32, keysym: u32) -> Vec<Release> {
-        let mut out = Vec::new();
-        if let Some((kc, needs_shift)) = resolve(current_layout, keysym) {
-            out.push(Release::Key(kc));
-            if needs_shift {
-                let shift_kc = resolve(current_layout, SHIFT_L).map(|(kc, _)| kc).unwrap_or(50);
-                out.push(Release::Shift(shift_kc));
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn press_records_keycode_and_shift() {
-        // 'A' on layout 0 needs Shift -> must record both the key kc and the Shift_L kc.
-        let mut map = HashMap::new();
-        assert!(press(&mut map, 0, 0x41));
-        assert_eq!(map.get(&0x41), Some(&(38u32, 50u32)));
-    }
-
-    #[test]
-    fn press_records_zero_shift_when_unshifted() {
-        // Return is unshifted -> shift_kc sentinel must be 0 so release skips synthetic Shift.
-        let mut map = HashMap::new();
-        assert!(press(&mut map, 0, 0xFF0D));
-        assert_eq!(map.get(&0xFF0D), Some(&(36u32, 0u32)));
-    }
-
-    #[test]
-    fn unresolved_keysym_records_nothing() {
-        let mut map = HashMap::new();
-        assert!(!press(&mut map, 0, 0xDEAD));
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn release_replays_recorded_keycodes_not_a_reresolve() {
-        // Press 'A' on layout 0 (kc 38 + Shift 50). THEN the layout switches to 1 mid-keystroke.
-        let mut map = HashMap::new();
-        assert!(press(&mut map, 0, 0x41));
-
-        let layout_at_release = 1; // user/compositor switched layout after press
-
-        let fixed = release_fixed(&mut map, 0x41);
-        let buggy = release_reresolve(layout_at_release, 0x41);
-
-        // The recorded-replay path releases exactly what was pressed: kc 38 then Shift 50.
-        assert_eq!(fixed, vec![Release::Key(38), Release::Shift(50)]);
-
-        // A re-resolve would release kc 24 (layout 1's 'A') and NO shift -> kc 38 and
-        // Shift 50 stay logically held down. Prove the two paths diverge here.
-        assert_eq!(buggy, vec![Release::Key(24)]);
-        assert_ne!(fixed, buggy, "recorded replay must NOT match the re-resolve path under a layout switch");
-    }
-
-    #[test]
-    fn release_consumes_the_record_no_double_release() {
-        // remove() must take the entry so a duplicate key-up is a no-op (no phantom release).
-        let mut map = HashMap::new();
-        assert!(press(&mut map, 0, 0x41));
-        let first = release_fixed(&mut map, 0x41);
-        assert_eq!(first, vec![Release::Key(38), Release::Shift(50)]);
-        assert!(map.is_empty());
-        let second = release_fixed(&mut map, 0x41);
-        assert!(second.is_empty(), "second key-up must release nothing");
-    }
-
-    #[test]
-    fn release_without_prior_press_is_noop() {
-        // A stray key-up that was never recorded must not inject anything.
-        let mut map = HashMap::new();
-        assert!(release_fixed(&mut map, 0x41).is_empty());
-    }
-
-    #[test]
-    fn no_layout_change_fix_and_reresolve_agree() {
-        // Sanity: when the layout is stable, the recorded-replay path and a re-resolve must
-        // agree, so recording the keycodes does not change behavior in the common case.
-        let mut map = HashMap::new();
-        assert!(press(&mut map, 0, 0x41));
-        let fixed = release_fixed(&mut map, 0x41);
-        let same_layout = release_reresolve(0, 0x41);
-        assert_eq!(fixed, same_layout);
-    }
-
-    #[test]
-    fn overlay_keymap_binds_unmapped_keysyms() {
-        use smithay::input::keyboard::xkb;
-        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let base_map = xkb::Keymap::new_from_names(
-            &ctx,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .expect("base keymap");
-        let base = base_map.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-
-        let mut slots = [0u32; crate::OVERLAY_SLOTS];
-        slots[0] = 0xE9; // eacute
-        slots[1] = 0x20AC; // EuroSign
-        slots[2] = 0x0100_1F60; // Unicode-range keysym
-        let text = crate::build_overlay_keymap(&base, &slots).expect("overlay build");
-        let rebuilt = xkb::Keymap::new_from_string(
-            &ctx,
-            text,
-            xkb::KEYMAP_FORMAT_TEXT_V1,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .expect("overlay recompiles");
-        for (i, want) in [(0u32, 0xE9u32), (1, 0x20AC), (2, 0x0100_1F60)] {
-            let kc = xkb::Keycode::new(257 + i);
-            let syms = rebuilt.key_get_syms_by_level(kc, 0, 0);
-            assert_eq!(syms.len(), 1, "slot {i} bound");
-            assert_eq!(syms[0].raw(), want, "slot {i} keysym");
-        }
-        // Base bindings survive: 'a' (evdev 30 -> xkb 38) still resolves.
-        let a = rebuilt.key_get_syms_by_level(xkb::Keycode::new(38), 0, 0);
-        assert_eq!(a[0].raw(), 0x61);
-    }
 }
 
 #[cfg(test)]

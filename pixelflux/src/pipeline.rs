@@ -367,9 +367,11 @@ impl X11Pipeline {
             );
             // Infinite GOP by default: stripes IDR on demand (or on the optional
             // configured interval). Each stripe encoder keyframes its own first frame
-            // at (re)init, so no first-frame force is needed here.
-            let force_idr_all = self.settings.output_mode == 1
-                && (requested || periodic_idr_due(&self.settings, self.frame_counter));
+            // at (re)init, so no first-frame force is needed here. An explicit request
+            // also forces a JPEG full resend so a joining viewer gets every stripe.
+            let force_idr_all = requested
+                || (self.settings.output_mode == 1
+                    && periodic_idr_due(&self.settings, self.frame_counter));
             encode_cpu(
                 &mut self.stripes,
                 argb,

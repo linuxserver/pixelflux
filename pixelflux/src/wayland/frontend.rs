@@ -101,9 +101,10 @@ use smithay::{
         seat::WaylandFocus,
         selection::{
             data_device::{
-                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+                request_data_device_client_selection, DataDeviceHandler, DataDeviceState,
+                WaylandDndGrabHandler,
             },
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -143,13 +144,15 @@ pub fn wayland_utime() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
 }
 
+/// The active hardware encoder session, if any.
 #[allow(clippy::large_enum_variant)]
 pub enum GpuEncoder {
     Vaapi(VaapiEncoder),
     Nvenc(NvencEncoder),
 }
 
-/// Central context passed to all Smithay handlers.
+/// Central context passed to all Smithay handlers; owns the Wayland globals,
+/// the GBM/EGL renderer state, and the encode pipeline state.
 pub struct AppState {
     pub compositor_state: CompositorState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -192,6 +195,10 @@ pub struct AppState {
     pub settings: RustCaptureSettings,
     pub callback: Option<Py<PyAny>>,
     pub cursor_callback: Option<Py<PyAny>>,
+    pub clipboard_callback: Option<Py<PyAny>>,
+    // Mime staged by new_selection; the loop drains it AFTER the dispatch that
+    // stores the new source (requesting inside the handler reads the OLD selection).
+    pub pending_clipboard_read: Option<String>,
 
     pub last_log_time: Instant,
     pub start_time: Instant,
@@ -201,14 +208,6 @@ pub struct AppState {
     // Set by ThreadCommand::RequestIdr (client reconnect / decoder reset),
     // consumed once on the next captured frame to force an immediate keyframe.
     pub pending_force_idr: bool,
-    // Keycodes injected on key-down by inject_keysym, recorded so the matching key-up
-    // releases the SAME keycodes (and synthetic modifiers) even if the xkb layout changed
-    // mid-keystroke. Maps keysym -> (main keycode, modifier keycodes used: Shift and/or AltGr).
-    pub synthetic_shift_keysyms: std::collections::HashMap<u32, (u32, Vec<u32>)>,
-    // Ref-count of currently-held synthetic modifier keycodes (Shift_L / ISO_Level3_Shift)
-    // so a modifier is released only when the LAST keysym using it is released (releasing one
-    // of two simultaneously-held shifted/AltGr keys must not drop the modifier for the other).
-    pub synthetic_mod_refcounts: std::collections::HashMap<u32, u32>,
     pub use_gpu: bool,
 
     // ZERO-COPY GPU session only (GLES render + same-GPU dmabuf encode); its EGL/dmabuf
@@ -226,12 +225,6 @@ pub struct AppState {
     pub current_cursor_icon: Option<CursorImageStatus>,
     pub cursor_buffer: Option<WlBuffer>,
     pub cursor_cache: std::collections::HashMap<u64, Vec<u8>>,
-    // Dynamic keymap overlay for keysyms absent from the base layout (Unicode
-    // codepoints, symbols): spare keycodes past the base range, bound on demand and
-    // round-robin recycled. base_keymap_string caches the pristine pre-overlay map.
-    pub base_keymap_string: Option<String>,
-    pub overlay_slots: [u32; crate::OVERLAY_SLOTS],
-    pub overlay_next: usize,
     pub render_cursor_on_framebuffer: bool,
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
@@ -499,6 +492,47 @@ impl CompositorHandler for AppState {
 
 
 impl AppState {
+    /// Drain a selection read staged by new_selection: ask the (now current)
+    /// client source to write into a pipe and hand (mime, bytes) to Python
+    /// from a reader thread.
+    pub(crate) fn process_pending_clipboard_read(&mut self) {
+        let Some(mime) = self.pending_clipboard_read.take() else { return };
+        if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(cb) = self
+            .clipboard_callback
+            .as_ref()
+            .map(|c| Python::attach(|py| c.clone_ref(py)))
+        else {
+            return;
+        };
+        let Ok((reader, writer)) = std::io::pipe() else { return };
+        if request_data_device_client_selection::<AppState>(&self.seat, mime.clone(), writer.into())
+            .is_err()
+        {
+            return;
+        }
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            // Bound the read so a hostile client can't balloon memory.
+            if (&reader).take(64 * 1024 * 1024).read_to_end(&mut buf).is_err() || buf.is_empty() {
+                return;
+            }
+            if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            Python::attach(|py| {
+                let bytes = PyBytes::new(py, &buf);
+                let _ = cb.call1(py, (mime.as_str(), bytes));
+            });
+        });
+    }
+
+
+    // Resolves a CursorImageStatus (named / hidden / surface-backed) to PNG bytes
+    // plus hotspot and invokes the Python cursor callback.
     // pub(crate): also invoked from the calloop command handlers in lib.rs to replay the retained
     // cursor when a callback (re)registers or a capture (re)starts.
     pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
@@ -734,8 +768,75 @@ impl AppState {
     }
 }
 
+// Clipboard mimes we can hand to Python, most specific first.
+const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/bmp",
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
+
 impl SelectionHandler for AppState {
-    type SelectionUserData = ();
+    // Server-set selection payload: (mime, bytes) served to pasting clients.
+    type SelectionUserData = std::sync::Arc<(String, Vec<u8>)>;
+
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        seat: Seat<Self>,
+    ) {
+        // A client app copied: read the offer off-thread and hand (mime, bytes)
+        // to the Python callback. Server-set selections don't come through here.
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
+        if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if self.clipboard_callback.is_none() {
+            return;
+        }
+        let Some(source) = source else { return };
+        let mimes = source.mime_types();
+        let Some(mime) = CLIPBOARD_MIME_PREFERENCE
+            .iter()
+            .find(|want| mimes.iter().any(|m| m == *want))
+            .map(|s| s.to_string())
+        else {
+            return;
+        };
+        // The new source is stored only after this handler returns; the loop's
+        // post-dispatch drain performs the actual read.
+        self.pending_clipboard_read = Some(mime);
+        let _ = seat;
+    }
+
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        _mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
+    ) {
+        // A client pastes the server-set selection: stream our bytes into its fd
+        // off-thread (the pipe may backpressure).
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
+        let payload = user_data.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::File::from(fd);
+            let _ = f.write_all(&payload.1);
+        });
+    }
 }
 
 impl DataDeviceHandler for AppState {
@@ -800,6 +901,9 @@ impl FractionalScaleHandler for AppState {
 
 /// Smithay requires a concrete type as the "target" of an input event; FocusTarget
 /// bridges that to the Wayland surface inside the Window/Popup/LayerSurface.
+/// Input-event target for Smithay's seat handlers: bridges keyboard, pointer,
+/// and touch events to the concrete Wayland surface behind a window, popup, or
+/// layer surface.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum FocusTarget {
@@ -1270,6 +1374,7 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
+    // Client-requested cursor change (named, hidden, or surface-backed).
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
         self.send_cursor_image(&image);
@@ -1287,6 +1392,7 @@ impl SeatHandler for AppState {
     }
 }
 
+// Lets clients reposition the pointer (games/remote-desktop style warps).
 impl PointerWarpHandler for AppState {
     fn warp_pointer(
         &mut self,

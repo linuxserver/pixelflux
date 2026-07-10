@@ -20,7 +20,7 @@ import websockets.asyncio.server as ws_async
 import threading
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture
+from pixelflux import CaptureSettings, ScreenCapture, ensure_wayland_display
 
 # ==============================================================================
 # --- BASE CONFIGURATION SETTINGS ---
@@ -154,6 +154,18 @@ if _recording:
 _cursor_size = _env("SELKIES_CURSOR_SIZE", "XCURSOR_SIZE")
 if _cursor_size.isdigit():
     base_capture_settings.cursor_size = int(_cursor_size)
+
+# Wayland: bring the compositor socket up now, before the capture starts, so apps
+# launched alongside this script can already connect to WAYLAND_DISPLAY.
+if getattr(base_capture_settings, "use_wayland", False):
+    _dim = lambda name: int(os.environ.get(name) or 0) if str(os.environ.get(name) or "").isdigit() else 0
+    ensure_wayland_display(
+        width=_dim("SELKIES_MANUAL_WIDTH"),
+        height=_dim("SELKIES_MANUAL_HEIGHT"),
+        render_node=_render_dri,
+        auto_gpu=base_capture_settings.auto_gpu,
+        cursor_size=int(_cursor_size) if _cursor_size.isdigit() else -1,
+    )
 
 # ==============================================================================
 # --- Multi-Client State Management ---

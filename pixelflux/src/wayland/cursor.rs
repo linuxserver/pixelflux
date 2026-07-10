@@ -13,6 +13,8 @@ use xcursor::{
     CursorTheme,
 };
 
+// Loaded XCursor theme: default-cursor frames plus the theme handle for
+// named lookups, all at the resolved pixel size.
 pub struct Cursor {
     icons: Vec<Image>,
     theme: CursorTheme,
@@ -60,6 +62,7 @@ impl Cursor {
         Some(frame(time.as_millis() as u32, size, &icons))
     }
 
+    /// Named cursor icon as PNG bytes plus hotspot (x, y), for web clients.
     pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
@@ -80,6 +83,7 @@ impl Cursor {
     }
 }
 
+// All frames of the variant whose size is closest to the requested size.
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
     let nearest_image = images
         .iter()
@@ -90,6 +94,7 @@ fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
         .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
 }
 
+// Picks the animation frame for the elapsed time by cycling cumulative delays.
 fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     let total = nearest_images(size, images).fold(0, |acc, image| acc + image.delay);
     if total == 0 {

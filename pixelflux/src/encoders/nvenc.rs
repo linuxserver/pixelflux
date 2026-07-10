@@ -357,6 +357,8 @@ pub struct NvencEncoder {
 
 unsafe impl Send for NvencEncoder {}
 
+// Teardown runs with the CUDA context pushed current: unmap/unregister inputs,
+// free device buffers, destroy the session, then release the context.
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
@@ -571,6 +573,7 @@ impl NvencEncoder {
         }
     }
 
+    /// Logs the available CUDA devices (debug aid on init failures).
     unsafe fn probe_devices(cuda: &CudaFunctions) {
         let mut count = 0;
         if (cuda.cuDeviceGetCount)(&mut count) != CUresult::CUDA_SUCCESS {
@@ -587,6 +590,8 @@ impl NvencEncoder {
         }
     }
 
+    /// PCI bus ID behind /dev/dri/renderD<128+index>, used to bind CUDA to the
+    /// same physical GPU the capture render node lives on.
     fn get_pci_bus_id(render_index: i32) -> Option<String> {
         let path = format!("/sys/class/drm/renderD{}/device", 128 + render_index);
         if let Ok(target) = std::fs::read_link(&path) {
@@ -599,6 +604,8 @@ impl NvencEncoder {
         None
     }
 
+    /// Initializes the CUDA context on the GPU backing the configured render node,
+    /// opens the NVENC session, and allocates the input/output buffers.
     pub fn new(
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
@@ -1189,6 +1196,8 @@ impl NvencEncoder {
         self.recording_sink = sink;
     }
 
+    /// Reconfigures the session when `target_qp` changed; returns whether a
+    /// reconfigure happened (CRF/QP mode only).
     unsafe fn reconfigure_if_needed(&mut self, target_qp: u32) -> bool {
         // CBR is bitrate-controlled, so QP-based paint-over reconfigures don't apply.
         if self.encode_config.rcParams.rateControlMode
@@ -1274,6 +1283,9 @@ impl NvencEncoder {
         }
     }
 
+    /// Submits a mapped input picture to NVENC, locks the output bitstream, and
+    /// returns the encoded bytes behind the custom header; `force_idr` requests a
+    /// keyframe.
     unsafe fn submit_frame(
         &mut self,
         mapped_buffer: NV_ENC_INPUT_PTR,

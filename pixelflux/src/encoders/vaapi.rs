@@ -23,6 +23,8 @@ static FF_INIT: Once = Once::new();
 const AV_DRM_MAX_PLANES: usize = 4;
 const QP_HYSTERESIS_LIMIT: u32 = 60;
 
+// The AVDRM* structs mirror FFmpeg's libavutil/hwcontext_drm.h ABI for passing
+// DMA-BUF frames; their layout must stay bit-identical to the C definitions.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMObjectDescriptor {
@@ -56,10 +58,14 @@ struct AVDRMFrameDescriptor {
     pub layers: [AVDRMLayerDescriptor; AV_DRM_MAX_PLANES],
 }
 
+// Owns the duplicated dmabuf fds for one in-flight frame; closed by
+// `release_drm_frame` when FFmpeg tears the buffer down.
 struct DmabufResources {
     fds: Vec<c_int>,
 }
 
+/// FFmpeg buffer-free callback for custom DRM frames: closes the dmabuf fds and
+/// frees the descriptor.
 unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
     // FFmpeg (C) invokes this on buffer teardown: a panic must not unwind across the extern "C"
     // boundary (the compiler guard would abort the process), so catch it here.
@@ -837,7 +843,8 @@ impl VaapiEncoder {
     ///
     /// The CPU frame is staged into a VAAPI surface (hwupload) and converted ARGB->NV12 by
     /// VA-VPP (scale_vaapi) on the GPU before encode -- there is no CPU colorspace conversion.
-    /// Only valid on an encoder built with `new_host`.
+    /// `bgra` is B,G,R,A in memory (X11 host layout) at `stride` bytes per row (may
+    /// include padding). Only valid on an encoder built with `new_host`.
     pub fn encode_host_argb(
         &mut self,
         bgra: &[u8],

@@ -14,6 +14,9 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Sender, TrySendError};
 
+// Out-of-band H.264 recording sink: multiplexes the elementary stream to every
+// client connected on the configured Unix socket.
+
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_KEYINT_FRAMES: u32 = 60;
@@ -134,7 +137,8 @@ impl RecordingSink {
         })
     }
 
-    /// Advisory; also advances the internal keyframe counter.
+    /// True when the next encode should be an IDR so joining clients get a
+    /// decodable stream; each call advances the internal keyframe counter.
     pub fn should_force_idr(&self) -> bool {
         let prev = self.frames_since_idr.fetch_add(1, Ordering::Relaxed);
         if idr_due(prev, self.keyint_frames) {

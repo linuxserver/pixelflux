@@ -477,8 +477,8 @@ pub struct EncodedStripe {
 
 /// Main CPU encoding entry: divides the screen into horizontal stripes, checks
 /// damage/motion, converts RGBA/BGRA to YUV, and encodes each with TurboJPEG or
-/// x264. `force_idr_all` forces a send + IDR on every H.264 stripe this frame
-/// (on-demand or the configured keyframe interval); JPEG stripes ignore it.
+/// x264. `force_idr_all` forces a send on every stripe this frame: an IDR for
+/// H.264 stripes, a full resend for JPEG stripes.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
@@ -641,12 +641,18 @@ pub fn encode_cpu(
             // it (turbo/streaming mode never hits this). Arm a burst so the encoder keeps
             // streaming briefly and recovers; skip if a burst/paint-over is already pending so
             // it can't preempt one. no_motion_frame_count is left alone.
-            if force_idr_all && output_mode == 1 {
+            if force_idr_all {
                 send_this_stripe = true;
-                force_idr = true;
-                if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
-                    stripe_state.paint_over_sent = true;
-                    stripe_state.h264_burst_frames_remaining = video_burst;
+                if output_mode == 1 {
+                    force_idr = true;
+                    if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
+                        stripe_state.paint_over_sent = true;
+                        stripe_state.h264_burst_frames_remaining = video_burst;
+                    }
+                } else if stripe_state.paint_over_sent && use_paint_over && paint_q > jpeg_q {
+                    // JPEG resync: every stripe is intra; resend at the quality already
+                    // on screen so a joining viewer doesn't downgrade existing ones.
+                    quality_or_crf = paint_q;
                 }
             }
 
