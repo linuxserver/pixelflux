@@ -256,6 +256,159 @@ ffmpeg -f h264 -i unix:///tmp/pixelflux_record -c:v copy test.h264
 ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p test.mp4
 ```
 
+## Computer Use Interface (Wayland)
+
+The Wayland backend implements the [Anthropic Computer Use specification](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo), providing an HTTP API for AI agents to control the desktop. Enable it by setting the `PIXELFLUX_CU` environment variable to the port the server should listen on:
+
+```bash
+export PIXELFLUX_CU=5000
+```
+
+When using Computer Use, call `ensure_wayland_display()` before starting a capture to bring the compositor socket up early — this lets apps launched alongside your script connect to `WAYLAND_DISPLAY` immediately. GPU auto-selection (`SELKIES_AUTO_GPU=true` / `auto_gpu` on `CaptureSettings`) works normally; the screenshot path forces a single-frame CPU readback when the GPU is in zero-copy mode.
+
+The Computer Use server listens for `POST` requests on `/computer-use` and responds with JSON. Unless otherwise noted, successful actions return:
+
+```json
+{"result":"ok"}
+```
+
+Coordinates are specified in absolute framebuffer pixels. Any coordinates outside the framebuffer are automatically clamped to the nearest valid pixel.
+
+### Actions
+
+All actions are `POST` requests to `/computer-use` with a JSON body.
+
+**`screenshot`** - Capture the current display as a base64-encoded PNG:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"screenshot"}' | jq -r '.data' | base64 -d > screen.png
+```
+
+**`mouse_move`** - Move the cursor to absolute pixel coordinates:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"mouse_move","coordinate":[500,300]}'
+```
+
+**`left_click`** / **`right_click`** / **`middle_click`** - Click a mouse button, optionally at a coordinate and/or while holding a keyboard modifier:
+
+```bash
+# Simple click
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"left_click"}'
+
+# Right click at a specific position while holding Shift
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"right_click","coordinate":[800,600],"text":"shift"}'
+```
+
+**`double_click`** / **`triple_click`** - Perform multiple left mouse clicks, optionally while holding a modifier:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"double_click","coordinate":[400,300]}'
+
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"triple_click","text":"ctrl"}'
+```
+
+**`left_click_drag`** - Press the left mouse button at `start_coordinate`, drag to `coordinate`, then release:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"left_click_drag","start_coordinate":[100,100],"coordinate":[500,300]}'
+```
+
+**`left_mouse_down`** / **`left_mouse_up`** - Press or release the left mouse button without moving the pointer:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"left_mouse_down"}'
+```
+
+**`type`** - Type a string of text:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"type","text":"Hello, world!"}'
+```
+
+**`key`** - Press a key or key combination. Key combinations are specified using `+` separators:
+
+```bash
+# Single key
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"key","text":"Return"}'
+
+# Key combination
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"key","text":"ctrl+s"}'
+
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"key","text":"ctrl+alt+Delete"}'
+```
+
+**`hold_key`** - Hold a key for the specified duration (seconds). Durations are capped at 100 seconds.
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"hold_key","text":"ctrl","duration":2.0}'
+```
+
+**`scroll`** - Scroll vertically or horizontally, optionally at a coordinate and/or while holding a keyboard modifier:
+
+```bash
+# Scroll down 3 clicks
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"scroll","scroll_direction":"down","scroll_amount":3}'
+
+# Scroll at a position while holding Shift
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"scroll","coordinate":[500,400],"scroll_direction":"up","scroll_amount":5,"text":"shift"}'
+```
+
+**`cursor_position`** - Return the current cursor position:
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"cursor_position"}' | jq -r '.text'
+# → X=500,Y=300
+```
+
+**`wait`** - Pause execution for the specified duration (seconds). Durations are capped at 100 seconds.
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"wait","duration":0.5}'
+```
+
+**`zoom`** - Capture and return a cropped base64-encoded PNG of the specified framebuffer region (`[left, top, right, bottom]`):
+
+```bash
+curl -s -X POST http://localhost:5000/computer-use \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"zoom","region":[100,200,400,350]}' | jq -r '.data' | base64 -d > zoomed.png
+```
+
 ## NVIDIA NVENC (X11)
 
 *   **Multi-GPU containers:** When several GPUs are exposed to a container, NVENC is filtered
@@ -293,6 +446,7 @@ install at build or runtime beyond the driver.
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.
 *   **Recording Sink:** Direct Unix socket output of full-frame H.264 streams for local capture.
+*   **AI Agent Control:** Computer Use API to dump screenshots and drive all facets of a desktop environment.
 
 ## License
 

@@ -76,3 +76,4 @@ cython_debug/
 .ruff_cache/
 .pypirc
 codeto*
+pixelflux/Cargo.lock

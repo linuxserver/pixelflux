@@ -114,6 +114,7 @@ pub mod encoders {
 
 pub mod wayland;
 pub mod recording_sink;
+pub mod computer_use;
 pub mod pipeline;
 pub mod x11;
 pub mod nvgpufilter;
@@ -455,6 +456,9 @@ pub enum ThreadCommand {
     // Live per-frame tunables (quality/paint-over/streaming/cursor), applied to the calloop's
     // settings and mirrored to the readback encode thread -- no capture or encoder restart.
     UpdateTunables(LiveTunables),
+    CuScreenshot { resp: std::sync::mpsc::Sender<Vec<u8>> },
+    CuCursorPosition { resp: std::sync::mpsc::Sender<(f64, f64)> },
+    CuGetInfo { resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
 }
 
 pub(crate) fn get_gpu_driver(card_index: i32) -> String {
@@ -1275,6 +1279,7 @@ fn log_stream_settings(
 // back, encodes, and transmits each frame. GBM/EGL HW accel, Pixman SW fallback.
 fn run_wayland_thread(
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
+    command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     initial_width: i32,
     initial_height: i32,
     explicit_dri_node: String,
@@ -1491,6 +1496,7 @@ fn run_wayland_thread(
         encode_stats: Arc::new(WlEncodeStats::new()),
         pool_last_render: Vec::new(),
         render_seq: 0,
+        pending_screenshot: None,
     };
 
     let output = Output::new(
@@ -2154,6 +2160,25 @@ fn run_wayland_thread(
                     *state.encode_controls.tunables.lock().unwrap() = Some(t);
                     state.encode_controls.tunables_dirty.store(true, Ordering::Release);
                 }
+                CalloopEvent::Msg(ThreadCommand::CuScreenshot { resp }) => {
+                    state.pending_screenshot = Some(resp);
+                }
+                CalloopEvent::Msg(ThreadCommand::CuCursorPosition { resp }) => {
+                    let pos = state.seat.get_pointer()
+                        .map(|p| p.current_location())
+                        .unwrap_or_else(|| (0.0f64, 0.0f64).into());
+                    let scale = state.settings.scale;
+                    let fb_x = pos.x * scale;
+                    let fb_y = pos.y * scale;
+                    let _ = resp.send((fb_x, fb_y));
+                }
+                CalloopEvent::Msg(ThreadCommand::CuGetInfo { resp }) => {
+                    let _ = resp.send((
+                        state.settings.width,
+                        state.settings.height,
+                        state.settings.scale,
+                    ));
+                }
                 CalloopEvent::Closed => {}
             }
         })
@@ -2220,7 +2245,7 @@ fn run_wayland_thread(
                 state.last_log_time = now;
             }
 
-            if !state.is_capturing {
+            if !state.is_capturing && state.pending_screenshot.is_none() {
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
@@ -2421,6 +2446,20 @@ fn run_wayland_thread(
                                                 }
                                             }
                                         }
+                                    } else if state.pending_screenshot.is_some() {
+                                        use smithay::backend::renderer::ExportMem;
+                                        let region = Rectangle::from_size((width, height).into());
+                                        let copied = renderer
+                                            .copy_framebuffer(&frame, region, Fourcc::Abgr8888)
+                                            .and_then(|mapping| {
+                                                renderer.map_texture(&mapping).map(|slice| {
+                                                    let n = slice.len().min(state.frame_buffer.len());
+                                                    state.frame_buffer[..n].copy_from_slice(&slice[..n]);
+                                                })
+                                            });
+                                        if let Err(e) = copied {
+                                            eprintln!("[Wayland] GLES screenshot readback failed: {e:?}");
+                                        }
                                     }
                                 },
                                 Err(e) => eprintln!("Failed to bind buffer: {:?}", e)
@@ -2611,6 +2650,12 @@ fn run_wayland_thread(
                         // thread's next render. The IDR request travels via the controls
                         // atomic (swapped pre-encode), not with the frame: every published
                         // frame IS encoded, in order (non-dropping pool).
+                        if state.pending_screenshot.is_some() {
+                            if let Some((_, ref buf)) = pool_slot {
+                                let n = buf.len().min(state.frame_buffer.len());
+                                state.frame_buffer[..n].copy_from_slice(&buf[..n]);
+                            }
+                        }
                         if let Some((id, buf)) = pool_slot.take() {
                             let is_animated = state.overlay_state.is_animated();
                             state.encode_pool.as_ref().unwrap().publish(WlFrame {
@@ -2692,6 +2737,27 @@ fn run_wayland_thread(
                         state.pending_force_idr = false;
                         state.frame_counter = state.frame_counter.wrapping_add(1);
                     }
+                    if let Some(resp) = state.pending_screenshot.take() {
+                        if !state.frame_buffer.is_empty() {
+                            let w = state.settings.width as u32;
+                            let h = state.settings.height as u32;
+                            let png = if state.use_gpu {
+                                crate::computer_use::encode_png_rgba(&state.frame_buffer, w, h)
+                            } else {
+                                let mut rgba = state.frame_buffer.clone();
+                                for px in rgba.chunks_exact_mut(4) {
+                                    px.swap(0, 2);
+                                }
+                                crate::computer_use::encode_png_rgba(&rgba, w, h)
+                            };
+                            match png {
+                                Ok(data) => { let _ = resp.send(data); }
+                                Err(e) => { let _ = resp.send(Vec::new()); eprintln!("[ComputerUse] PNG encode error: {}", e); }
+                            }
+                        } else {
+                            let _ = resp.send(Vec::new());
+                        }
+                    }
                 }
             }
             // A reservation that never reached publish (render failure, no output) goes back
@@ -2718,6 +2784,18 @@ fn run_wayland_thread(
             Ok(PostAction::Continue)
         })
         .unwrap();
+
+    if let Ok(port_str) = std::env::var("PIXELFLUX_CU") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            println!("[ComputerUse] Starting server on port {} (PIXELFLUX_CU={})", port, port);
+            let cu_tx = command_tx.clone();
+            thread::spawn(move || {
+                crate::computer_use::run_cu_server(cu_tx, port);
+            });
+        } else {
+            println!("[ComputerUse] Invalid PIXELFLUX_CU value: '{}' - expected a port number", port_str);
+        }
+    }
 
     event_loop.run(None, &mut state, |state| {
         state.process_pending_clipboard_read();
@@ -2807,10 +2885,11 @@ impl WaylandBackend {
         cursor_size: i32,
     ) -> Self {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
+        let cu_tx = tx.clone();
         thread::spawn(move || {
             // The calloop thread captures, renders and encodes; give it the strongest edge.
             crate::boost_thread_priority(-15);
-            run_wayland_thread(rx, width, height, dri_node, auto_gpu_selected, cursor_size);
+            run_wayland_thread(rx, cu_tx, width, height, dri_node, auto_gpu_selected, cursor_size);
         });
         WaylandBackend { tx }
     }

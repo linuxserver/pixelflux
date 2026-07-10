@@ -252,6 +252,7 @@ pub struct AppState {
     // offscreen buffer and never consults these.
     pub pool_last_render: Vec<u64>,
     pub render_seq: u64,
+    pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl PointerConstraintsHandler for AppState {
