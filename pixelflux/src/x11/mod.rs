@@ -170,6 +170,11 @@ impl ShmSurface {
         unsafe { std::slice::from_raw_parts_mut(self.addr, self.size) }
     }
 
+    /// @brief Borrow the mapped segment read-only, for the stability comparison.
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.addr, self.size) }
+    }
+
     /// @brief Detach the segment from the X server and then locally, clearing the mapped pointer.
     ///
     /// This is a manual method rather than a `Drop` impl because releasing the server-side
@@ -220,6 +225,269 @@ fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16)
         h &= !1;
     }
     (w as u16, h as u16)
+}
+
+/// Rows per stability-verification strip.
+const VERIFY_STRIP_ROWS: usize = 2;
+/// Number of verification strips spread over the frame height.
+const VERIFY_STRIPS: usize = 16;
+/// Pause between the frame grab and the verification strips, so an in-flight paint
+/// front advances far enough to cross a sampled strip.
+const VERIFY_SETTLE: Duration = Duration::from_micros(500);
+/// How long the screen must be observed quiet before a CHANGED frame is accepted.
+/// This is what separates a mid-paint pause from a completed frame: a sane painter's
+/// gap between frames exceeds the gaps inside one, and a painter idling beyond this
+/// window holds its partial state long enough to be visible on a real monitor — at
+/// that point it is content, not a tear.
+const VERIFY_QUIET: Duration = Duration::from_micros(4000);
+
+/// @brief Row origins for the stability-verification strips: up to `n` strips of
+/// `rows` height spread evenly from the top edge to the bottom edge inclusive.
+fn verify_strip_rows(height: usize, n: usize, rows: usize) -> Vec<usize> {
+    if height <= rows * 2 {
+        return vec![0];
+    }
+    let n = n.max(2);
+    (0..n).map(|i| i * (height - rows) / (n - 1)).collect()
+}
+
+/// @brief Compare each verification strip against the same rows of the grabbed frame;
+/// `true` when every sampled row is byte-identical, i.e. no client painted the sampled
+/// rows between the two grabs.
+fn verify_strips_match(frame: &[u8], stride: usize, verify: &[u8], ys: &[usize], rows: usize) -> bool {
+    ys.iter().enumerate().all(|(i, &y)| {
+        let f = &frame[y * stride..(y + rows) * stride];
+        let v = &verify[i * rows * stride..(i + 1) * rows * stride];
+        f == v
+    })
+}
+
+/// @brief Copy the strip rows out of the grabbed frame into `dst` (strip-packed, the
+/// same layout the verify segment uses), recording what was published for the next
+/// frame's changed-content check.
+fn pack_frame_strips(frame: &[u8], stride: usize, ys: &[usize], rows: usize, dst: &mut Vec<u8>) {
+    dst.clear();
+    for &y in ys {
+        dst.extend_from_slice(&frame[y * stride..(y + rows) * stride]);
+    }
+}
+
+/// @brief Outcome of [`grab_stable_frame`]: how the accepted grab was reached, whether
+/// the content changed since the last accepted frame, whether it was actually verified
+/// stable (false only when the budget ran out), and the pacing `anchor` — the instant
+/// one frame period before the moment the next grab should be issued. For a grab that
+/// followed an observed quiet window this is the content's completion time plus a
+/// small lead; otherwise it is the grab's own start.
+struct StableGrab {
+    retries: u32,
+    changed: bool,
+    verified: bool,
+    anchor: Instant,
+}
+
+/// @brief Grab one frame into `surface` and only accept it once the screen has been
+/// verified STABLE across the grab, re-grabbing (bounded by `budget`) while a client
+/// paint is caught in flight.
+///
+/// This is the anti-tearing mechanism, and it exists because `shm_get_image` alone
+/// cannot avoid tearing: applications paint a frame as a burst of separate requests
+/// (a big `XPutImage` is split into ~32-row chunks, scrolls are copy+fill pairs, and
+/// painters may pause mid-frame between bursts), so a grab scheduled between them
+/// captures half-painted content. Content animating at the capture rate phase-locks
+/// against the capture timer, which turns that half-painted state into a STANDING
+/// tear line instead of a transient glitch. Reading the scanout buffer (KMS/NvFBC —
+/// how Sunshine and gpu-screen-recorder avoid tearing) is not available on the
+/// virtual displays this path serves, so stability is established by observation:
+///
+/// A single `shm_get_image` request is atomic (the server never interleaves another
+/// client inside one request), so a torn grab always means the SCREEN itself held a
+/// half-painted state at the grab instant. Verification therefore establishes quiet
+/// around the grab:
+///
+/// 1. Grab the full frame, wait `VERIFY_SETTLE`, then re-grab `VERIFY_STRIPS` thin
+///    strips (pipelined into one round-trip batch, landing in the small `verify`
+///    segment) and compare them to the same rows of the frame. A difference means a
+///    paint was in flight across the grab. Matching strips on an UNCHANGED frame
+///    (vs `prev_strips`) accept immediately — the cheap static path.
+/// 2. Matching strips on a CHANGED frame are not enough: the painter may merely be
+///    PAUSING mid-frame. The frame is accepted only once the screen stays quiet for
+///    a full `VERIFY_QUIET` window measured from the grab. That window is what
+///    separates a mid-paint pause from a completed frame: a sane painter's gap
+///    between frames exceeds the gaps inside one, and a painter idling beyond the
+///    window holds its partial state long enough to be visible on a real monitor —
+///    at that point it is content, not a tear.
+/// 3. On failure, seek the painter's quiet window with cheap strip polls until the
+///    screen has been still for `VERIFY_QUIET`, then re-grab. A grab issued right
+///    after an observed-quiet window cannot be mid-paint; anything painted from then
+///    on is the NEXT frame, ordered after the grab, so only an immediate strip check
+///    (closing the race between the last poll and the grab request) is needed —
+///    crucially, a new frame starting during that check must NOT reject this one.
+/// 4. Give up once `budget` is spent (a client repainting continuously for longer
+///    than a frame period has no stable state to capture) and accept the latest grab
+///    — the pre-verification behavior, so pathological content degrades instead of
+///    stalling.
+///
+/// The caller locks its pacing to the returned `anchor` (the content's completion
+/// time when a quiet-seek observed it), so capture converges to grabbing just after
+/// the content finishes each frame — the freshest possible complete frame at
+/// near-zero re-grab cost — and clock drift between content and capture
+/// self-corrects through the next verification. The caller applies cursor/watermark
+/// overlays AFTER this returns, since they mutate the frame.
+#[allow(clippy::too_many_arguments)]
+fn grab_stable_frame(
+    conn: &RustConnection,
+    root: u32,
+    surface: &mut ShmSurface,
+    verify: &mut ShmSurface,
+    prev_strips: &mut Vec<u8>,
+    cap_x: i16,
+    cap_y: i16,
+    cap_w: u16,
+    cap_h: u16,
+    budget: Duration,
+) -> Result<StableGrab, String> {
+    let start = Instant::now();
+    let stride = surface.stride;
+    let ys = verify_strip_rows(cap_h as usize, VERIFY_STRIPS, VERIFY_STRIP_ROWS);
+    let strips_len = ys.len() * VERIFY_STRIP_ROWS * stride;
+
+    let grab_strips = |verify: &mut ShmSurface| -> Result<(), String> {
+        let mut cookies = Vec::with_capacity(ys.len());
+        for (i, &y) in ys.iter().enumerate() {
+            let rows = VERIFY_STRIP_ROWS.min(cap_h as usize - y) as u16;
+            cookies.push(
+                conn.shm_get_image(
+                    root,
+                    cap_x,
+                    (cap_y as i32 + y as i32) as i16,
+                    cap_w,
+                    rows,
+                    !0u32,
+                    ImageFormat::Z_PIXMAP.into(),
+                    verify.shmseg,
+                    (i * VERIFY_STRIP_ROWS * stride) as u32,
+                )
+                .map_err(|e| format!("verify shm_get_image: {e}"))?,
+            );
+        }
+        for c in cookies {
+            c.reply().map_err(|e| format!("verify shm_get_image reply: {e}"))?;
+        }
+        Ok(())
+    };
+
+    let full_grab = |surface: &mut ShmSurface| -> Result<(), String> {
+        conn.shm_get_image(
+            root,
+            cap_x,
+            cap_y,
+            cap_w,
+            cap_h,
+            !0u32,
+            ImageFormat::Z_PIXMAP.into(),
+            surface.shmseg,
+            0,
+        )
+        .map_err(|e| format!("shm_get_image: {e}"))?
+        .reply()
+        .map_err(|e| format!("shm_get_image reply: {e}"))?;
+        Ok(())
+    };
+
+    let mut retries = 0u32;
+    let mut quiet_scratch: Vec<u8> = Vec::new();
+    // Completion instant observed by the last quiet-seek; None on the first attempt.
+    let mut quiet_start: Option<Instant> = None;
+    loop {
+        let grab_start = Instant::now();
+        full_grab(surface)?;
+
+        let accept = |surface: &ShmSurface,
+                      prev_strips: &mut Vec<u8>,
+                      retries: u32,
+                      verified: bool,
+                      anchor: Instant| {
+            let changed = prev_strips.len() != strips_len
+                || !verify_strips_match(surface.as_slice(), stride, prev_strips, &ys, VERIFY_STRIP_ROWS);
+            pack_frame_strips(surface.as_slice(), stride, &ys, VERIFY_STRIP_ROWS, prev_strips);
+            StableGrab { retries, changed, verified, anchor }
+        };
+
+        if let Some(qs) = quiet_start {
+            // Quiet-primed re-grab: the screen was still for a full VERIFY_QUIET
+            // window right up to this grab, so it cannot be mid-paint — anything
+            // painted from here on is the NEXT frame, which server request ordering
+            // places after the grab. The immediate strips only close the tiny race
+            // between the last quiet poll and the grab request itself.
+            grab_strips(verify)?;
+            if verify_strips_match(surface.as_slice(), stride, verify.as_slice(), &ys, VERIFY_STRIP_ROWS)
+            {
+                // Anchor at completion plus a small lead: the next period's grab then
+                // lands just inside the content's quiet window.
+                return Ok(accept(surface, prev_strips, retries, true, qs + VERIFY_SETTLE * 2));
+            }
+        } else {
+            thread::sleep(VERIFY_SETTLE);
+            grab_strips(verify)?;
+            let stable = verify_strips_match(
+                surface.as_slice(),
+                stride,
+                verify.as_slice(),
+                &ys,
+                VERIFY_STRIP_ROWS,
+            );
+            let changed = prev_strips.len() != strips_len
+                || !verify_strips_match(surface.as_slice(), stride, prev_strips, &ys, VERIFY_STRIP_ROWS);
+            if stable && !changed {
+                // Nothing painted since the last accepted frame: cheap static path.
+                return Ok(accept(surface, prev_strips, retries, true, grab_start));
+            }
+            if stable && changed {
+                // The grab may sit inside a painter's mid-frame PAUSE: only a quiet
+                // window covering VERIFY_QUIET measured from the grab clears it.
+                thread::sleep(VERIFY_QUIET.saturating_sub(grab_start.elapsed()));
+                grab_strips(verify)?;
+                if verify_strips_match(
+                    surface.as_slice(),
+                    stride,
+                    verify.as_slice(),
+                    &ys,
+                    VERIFY_STRIP_ROWS,
+                ) {
+                    return Ok(accept(surface, prev_strips, retries, true, grab_start));
+                }
+            }
+        }
+        if start.elapsed() >= budget {
+            return Ok(accept(surface, prev_strips, retries, false, grab_start));
+        }
+        retries += 1;
+
+        // A paint is in flight (or resumed). Full re-grabs at random moments mostly
+        // land mid-paint again and burn the budget, so seek the painter's quiet
+        // window with cheap strip polls: only after the screen has been still for a
+        // full VERIFY_QUIET window is the re-grab above worth taking. The instant the
+        // stillness began is the content's completion time — the phase the caller's
+        // pacing locks onto.
+        quiet_scratch.clear();
+        quiet_scratch.extend_from_slice(&verify.as_slice()[..strips_len]);
+        let mut quiet_since = Instant::now();
+        quiet_start = None;
+        while start.elapsed() < budget {
+            thread::sleep(VERIFY_SETTLE);
+            grab_strips(verify)?;
+            if verify.as_slice()[..strips_len] == quiet_scratch[..] {
+                if quiet_since.elapsed() >= VERIFY_QUIET {
+                    quiet_start = Some(quiet_since);
+                    break;
+                }
+            } else {
+                quiet_scratch.clear();
+                quiet_scratch.extend_from_slice(&verify.as_slice()[..strips_len]);
+                quiet_since = Instant::now();
+            }
+        }
+    }
 }
 
 /// @brief Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
@@ -802,6 +1070,10 @@ where
     for _ in 0..POOL_N {
         surfaces.push(ShmSurface::create(&conn, cap_w, cap_h)?);
     }
+    // Small companion segment the stability strips land in; recreated alongside the
+    // pool surfaces on every width change so its stride always matches theirs.
+    let mut verify =
+        ShmSurface::create(&conn, cap_w, (VERIFY_STRIPS * VERIFY_STRIP_ROWS) as u16)?;
     let pool = Arc::new(FramePool::new(POOL_N));
 
     let mut watermark = X11Watermark::load(&settings.watermark_path);
@@ -817,6 +1089,14 @@ where
     });
 
     let mut next_frame = Instant::now();
+    // Frames between root-geometry polls (auto-adjust); ~0.5s at 60fps.
+    const GEOMETRY_POLL_FRAMES: i32 = 30;
+    let mut geometry_check = 0i32;
+    let mut grab_failures = 0u32;
+    // Strip rows of the last accepted frame (changed-content check) and the LCG state
+    // behind the anti-phase-lock jitter.
+    let mut prev_strips: Vec<u8> = Vec::new();
+    let mut jitter_state: u64 = 0x9E37_79B9_7F4A_7C15;
 
     let result = (|| -> Result<(), String> {
         while !controls.stop.load(Ordering::Relaxed) {
@@ -860,12 +1140,24 @@ where
                         for _ in 0..POOL_N {
                             surfaces.push(ShmSurface::create(&conn, cap_w, cap_h)?);
                         }
+                        verify.destroy(&conn);
+                        verify = ShmSurface::create(
+                            &conn,
+                            cap_w,
+                            (VERIFY_STRIPS * VERIFY_STRIP_ROWS) as u16,
+                        )?;
+                        prev_strips.clear();
                         pool.bump_generation();
                     }
                 }
             }
 
-            if settings.auto_adjust_screen_capture_size {
+            // Root geometry is polled on a cadence, not per frame: the reply costs a
+            // round-trip that would otherwise precede every grab, and external size
+            // changes are rare (live resizes arrive through region_dirty instead).
+            geometry_check -= 1;
+            if settings.auto_adjust_screen_capture_size && geometry_check <= 0 {
+                geometry_check = GEOMETRY_POLL_FRAMES;
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
                     let (nw, nh) = resolve_dims(g.width, g.height, &rsettings);
                     if nw != cap_w || nh != cap_h {
@@ -888,6 +1180,13 @@ where
                             for _ in 0..POOL_N {
                                 surfaces.push(ShmSurface::create(&conn, cap_w, cap_h)?);
                             }
+                            verify.destroy(&conn);
+                            verify = ShmSurface::create(
+                                &conn,
+                                cap_w,
+                                (VERIFY_STRIPS * VERIFY_STRIP_ROWS) as u16,
+                            )?;
+                            prev_strips.clear();
                             pool.bump_generation();
                         }
                     }
@@ -899,20 +1198,52 @@ where
                 None => break,
             };
             let surface = &mut surfaces[idx];
-            conn.shm_get_image(
-                root,
-                cap_x,
-                cap_y,
-                cap_w,
-                cap_h,
-                !0u32,
-                ImageFormat::Z_PIXMAP.into(),
-                surface.shmseg,
-                0,
-            )
-            .map_err(|e| format!("shm_get_image: {e}"))?
-            .reply()
-            .map_err(|e| format!("shm_get_image reply: {e}"))?;
+            // Enough for the quiet-seek to reach the content's inter-frame gap from
+            // any phase; only pathological continuously-painting content ever spends
+            // it all (and then degrades to the pre-verification behavior).
+            let budget = frame_dur.mul_f64(1.25).min(Duration::from_millis(25));
+            let grab = match grab_stable_frame(
+                &conn, root, surface, &mut verify, &mut prev_strips,
+                cap_x, cap_y, cap_w, cap_h, budget,
+            ) {
+                Ok(g) => {
+                    grab_failures = 0;
+                    g
+                }
+                Err(e) => {
+                    // Most likely an external root resize between geometry polls made
+                    // the grab run past the root edge: return the surface, re-poll
+                    // geometry immediately, and only give up if it never recovers.
+                    pool.recycle(idx);
+                    grab_failures += 1;
+                    geometry_check = 0;
+                    if grab_failures > 120 {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
+            // Lock the pacing to the accepted grab: the next tick lands one period
+            // after the instant that (verifiably) captured a complete frame, so
+            // capture converges to running just after the content finishes painting
+            // — the phase-locked-content case that otherwise produces a standing
+            // tear line becomes the best case instead of the worst.
+            next_frame = grab.anchor + frame_dur;
+            if grab.changed {
+                // A zero-mean random phase walk on top of the lock: an alignment the
+                // verifier cannot see through (a painter pausing beyond the quiet
+                // window) cannot then repeat frame after frame. An unverified accept
+                // (budget ran out) walks much wider to actively escape collision.
+                jitter_state = jitter_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let span_us = if grab.verified { 1500 } else { 8000 };
+                let jitter_us = (jitter_state >> 33) % span_us;
+                next_frame += Duration::from_micros(jitter_us);
+                next_frame = next_frame
+                    .checked_sub(Duration::from_micros(span_us / 2))
+                    .unwrap_or(next_frame);
+            }
 
             let frame_w = cap_w as i32;
             let frame_h = cap_h as i32;
@@ -978,6 +1309,7 @@ where
     for s in surfaces.iter_mut() {
         s.destroy(&conn);
     }
+    verify.destroy(&conn);
     result
 }
 
@@ -1128,6 +1460,42 @@ mod pool_tests {
         let b = p.acquire(&stop).unwrap();
         assert!(p.publish(RawFrame { generation: p.generation(), ..dummy(b) }, &stop));
         assert_eq!(p.take().unwrap().generation, 1);
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    /// @brief Strips span the full height (first at the top edge, last flush with the
+    /// bottom edge), stay strictly increasing, and collapse to a single strip when the
+    /// frame is too short to sample.
+    #[test]
+    fn strip_rows_span_top_to_bottom_within_bounds() {
+        let ys = verify_strip_rows(720, 16, 2);
+        assert_eq!(ys.len(), 16);
+        assert_eq!(ys[0], 0);
+        assert_eq!(*ys.last().unwrap(), 718);
+        assert!(ys.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(verify_strip_rows(3, 16, 2), vec![0]);
+    }
+
+    /// @brief Identical strips verify as stable; a single changed byte in any sampled
+    /// strip (a paint front that advanced past it between the grabs) fails the check.
+    #[test]
+    fn strips_match_detects_inflight_paint() {
+        let (w, h, rows) = (8usize, 64usize, 2usize);
+        let stride = w * 4;
+        let frame = vec![7u8; stride * h];
+        let ys = verify_strip_rows(h, 4, rows);
+        let mut verify = Vec::new();
+        for &y in &ys {
+            verify.extend_from_slice(&frame[y * stride..(y + rows) * stride]);
+        }
+        assert!(verify_strips_match(&frame, stride, &verify, &ys, rows));
+        let idx = rows * stride + 5;
+        verify[idx] ^= 0xFF;
+        assert!(!verify_strips_match(&frame, stride, &verify, &ys, rows));
     }
 }
 

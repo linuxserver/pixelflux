@@ -2650,7 +2650,7 @@ fn run_wayland_thread(
 
                         if send_frame {
                             if let Some(sync) = render_sync.take() {
-                                while sync.wait().is_err() {}
+                                let _ = sync.wait();
                             }
                             let force_idr_for_recording = state
                                 .recording_sink
