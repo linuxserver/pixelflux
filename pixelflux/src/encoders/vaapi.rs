@@ -4,6 +4,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! Hardware-accelerated H.264 encoding on VA-API through FFmpeg's `h264_vaapi`
+//! encoder. Frames reach the GPU by one of three entry points — a Wayland
+//! DRM-PRIME dmabuf (`encode_dmabuf`), a host BGRA frame from the X11 capture
+//! path (`encode_host_argb`), or already-planar NV12 pixels (`encode_raw`) — and
+//! an FFmpeg filter graph runs VA-VPP (`scale_vaapi`) to land the pixels as NV12
+//! in BT.709 limited range on the GPU before encode, so no colorspace conversion
+//! happens on the CPU.
+
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem;
 use std::os::fd::AsRawFd;
@@ -19,12 +27,26 @@ use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
+/// @brief One-time FFmpeg global-init barrier; the closure is empty because modern FFmpeg needs
+/// no explicit codec/filter registration, leaving only the run-once guarantee worth keeping.
 static FF_INIT: Once = Once::new();
+/// @brief Plane/object fan-out of the `AVDRM*` descriptors, matching FFmpeg's `AV_DRM_MAX_PLANES`.
 const AV_DRM_MAX_PLANES: usize = 4;
+/// @brief Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
+/// quality drop under sustained motion) must be requested before `update_qp` commits it. A CQP
+/// re-open is the only way to move the quantizer, so acting on every transient increase — and then
+/// reversing it as motion settles — would make the picture pulse; requiring the drop to persist
+/// this long absorbs those transients. Quality *decreases*, which only ever sharpen the picture,
+/// apply at once and never wait.
 const QP_HYSTERESIS_LIMIT: u32 = 60;
 
-// The AVDRM* structs mirror FFmpeg's libavutil/hwcontext_drm.h ABI for passing
-// DMA-BUF frames; their layout must stay bit-identical to the C definitions.
+/// @brief Exists only to mirror FFmpeg's `libavutil/hwcontext_drm.h` ABI so a Wayland dmabuf can be
+/// handed to the `hwmap` filter without a copy.
+///
+/// FFmpeg (C) reinterprets these bytes directly, so this and its sibling `AVDRM*` descriptors carry
+/// no abstraction of their own: every field, order, and `#[repr(C)]` layout must stay
+/// **bit-identical** to the C definitions or the driver reads garbage. This particular struct
+/// describes one backing DRM object (a dmabuf) — its fd, byte size, and DRM format modifier.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMObjectDescriptor {
@@ -33,6 +55,8 @@ struct AVDRMObjectDescriptor {
     pub format_modifier: u64,
 }
 
+/// @brief One plane within a layer: which object holds it, and the byte offset + pitch of the
+/// plane inside that object.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMPlaneDescriptor {
@@ -41,6 +65,7 @@ struct AVDRMPlaneDescriptor {
     pub pitch: isize,
 }
 
+/// @brief One layer (a single image format) built from up to `AV_DRM_MAX_PLANES` planes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMLayerDescriptor {
@@ -49,6 +74,8 @@ struct AVDRMLayerDescriptor {
     pub planes: [AVDRMPlaneDescriptor; AV_DRM_MAX_PLANES],
 }
 
+/// @brief Top-level DRM frame descriptor: the set of backing objects plus the layers that index
+/// into them, as consumed by FFmpeg's DRM-PRIME `hwmap`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMFrameDescriptor {
@@ -58,30 +85,35 @@ struct AVDRMFrameDescriptor {
     pub layers: [AVDRMLayerDescriptor; AV_DRM_MAX_PLANES],
 }
 
-// Owns the duplicated dmabuf fds for one in-flight frame; closed by
-// `release_drm_frame` when FFmpeg tears the buffer down.
+/// @brief Decouples fd ownership between FFmpeg and the compositor for one in-flight frame: FFmpeg
+/// closes the fds it is handed, so it must be handed `dup`'d copies rather than the originals the
+/// smithay `Dmabuf` still owns. This box holds those dup'd fds and gives them a defined lifetime —
+/// `release_drm_frame` closes them when FFmpeg tears the wrapping buffer down.
 struct DmabufResources {
     fds: Vec<c_int>,
 }
 
-/// FFmpeg buffer-free callback for custom DRM frames: closes the dmabuf fds and
+/// @brief FFmpeg buffer-free callback for the custom DRM-PRIME frames — closes the dmabuf fds and
 /// frees the descriptor.
+///
+/// FFmpeg (C) invokes this when it tears an `av_buffer_create` buffer down, so the whole body runs
+/// inside `catch_unwind`: a panic must not unwind across the `extern "C"` boundary (that would
+/// abort the process). The `opaque` pointer is reclaimed as the boxed `DmabufResources` and each
+/// dup'd fd is closed. `data` is the descriptor FFmpeg now owns, freed here when non-null; it is
+/// null only on the construction error path, where the caller frees the descriptor itself.
 unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
-    // FFmpeg (C) invokes this on buffer teardown: a panic must not unwind across the extern "C"
-    // boundary (the compiler guard would abort the process), so catch it here.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let resources = Box::from_raw(opaque as *mut DmabufResources);
         for &fd in &resources.fds {
             close(fd);
         }
-        // Free the descriptor FFmpeg owns now (null only on the error path, where
-        // the caller frees it).
         if !data.is_null() {
             ff::av_free(data as *mut c_void);
         }
     }));
 }
 
+/// @brief Format an FFmpeg error code as its human-readable string via `av_strerror`.
 fn ff_err_str(err: i32) -> String {
     unsafe {
         let mut errbuf = [0 as c_char; 128];
@@ -92,7 +124,26 @@ fn ff_err_str(err: i32) -> String {
     }
 }
 
-// Hardware-accelerated H.264 encoding via VAAPI (FFmpeg).
+/// @brief Hardware-accelerated H.264 encoder built on FFmpeg's `h264_vaapi`, owning the whole
+/// VA-API pipeline for one capture: device contexts, the NV12 surface pool, the color-convert
+/// filter graph, the reusable frames/packet, and live rate-control state.
+///
+/// The pointer members are raw FFmpeg objects freed in `Drop`. Three groups matter:
+///
+/// 1. **Device / frames contexts**: `drm_device_ctx` → derived `hw_device_ctx`; `drm_frames_ctx`
+///    describes the incoming DMA-BUF, `enc_frames_ctx` the NV12 VA-surface pool the encoder draws
+///    from. `enc_frames_ctx` is kept referenced so `reopen_codec` can rebuild the codec against the
+///    same pool.
+/// 2. **Filter graph**: `buffersrc_ctx` → hwmap/hwupload + `scale_vaapi` → `buffersink_ctx`, which
+///    lands every input as GPU NV12.
+/// 3. **Reusable frames**: `video_frame` feeds the graph on the dmabuf/host paths, `sw_frame` +
+///    `hw_frame` stage the direct NV12 upload in `encode_raw`, and `packet` is the shared output.
+///
+/// `current_qp` / `qp_hysteresis_counter` drive the CQP hysteresis in `update_qp`. `cbr_mode`,
+/// `current_bitrate_kbps`, `current_vbv_mult`, and `current_kf_s` cache the live rate-control state
+/// so `reconfigure_rate` re-opens the codec only when a value actually changes. `recording_sink` is
+/// the optional Unix-socket H.264 fan-out; `omit_stripe_headers` drops the 10-byte framing when the
+/// consumer wants a bare Annex-B stream.
 pub struct VaapiEncoder {
     encoder_ctx: *mut ff::AVCodecContext,
     codec: *const ff::AVCodec,
@@ -123,7 +174,6 @@ pub struct VaapiEncoder {
     current_qp: u32,
     qp_hysteresis_counter: u32,
 
-    // Live rate-control state, tracked so a reconfigure re-opens the codec only on a real change.
     cbr_mode: bool,
     current_bitrate_kbps: i32,
     current_vbv_mult: f64,
@@ -133,8 +183,15 @@ pub struct VaapiEncoder {
     omit_stripe_headers: bool,
 }
 
+/// @brief Assert `VaapiEncoder` is `Send`: its raw FFmpeg pointers are owned exclusively and the
+/// encoder is driven from a single capture thread, so moving the whole object across threads adds
+/// no aliasing (its `recording_sink` `Arc` is already `Send`).
 unsafe impl Send for VaapiEncoder {}
 
+/// @brief Tear down every FFmpeg object in dependency order so nothing is freed while still
+/// referenced: first the reusable packet and frames, then the filter graph and codec context, and
+/// last the frames/device contexts they pointed at (encoder pool, DRM frames, VA-API device, DRM
+/// device). Each pointer is null-checked so a partially-built encoder unwinds cleanly.
 impl Drop for VaapiEncoder {
     fn drop(&mut self) {
         unsafe {
@@ -175,13 +232,9 @@ impl Drop for VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    /// Initializes the VAAPI encoder, deriving context from a DRM render node.
-    ///
-    /// Sets up the hardware device context, derives the VAAPI context, allocates
-    /// frame contexts, and configures the FFmpeg filter graph for color conversion.
-    ///
-    /// Dmabuf input (Wayland): the source frame is a DRM-PRIME dmabuf mapped into a VAAPI
-    /// surface by the filter graph.
+    /// @brief Build a VA-API encoder for the Wayland **dmabuf** path — the source is a DRM-PRIME
+    /// dmabuf that the filter graph `hwmap`s onto a VA surface. Thin wrapper over `new_impl` with
+    /// `host_input = false`.
     pub fn new(
         settings: &RustCaptureSettings,
         recording_sink: Option<Arc<RecordingSink>>,
@@ -189,8 +242,10 @@ impl VaapiEncoder {
         Self::new_impl(settings, recording_sink, false)
     }
 
-    /// Host-ARGB input (X11): the source is a CPU BGRA frame uploaded to a VAAPI surface, then
-    /// converted ARGB->NV12 by VA-VPP (scale_vaapi) on the GPU before encode -- no CPU CSC.
+    /// @brief Build a VA-API encoder for the X11 **host-ARGB** path — the source is a CPU BGRA frame
+    /// that the filter graph `hwupload`s onto a VA surface. Thin wrapper over `new_impl` with
+    /// `host_input = true`; the GPU still does the ARGB→NV12 convert, so there is no CPU colorspace
+    /// conversion.
     pub fn new_host(
         settings: &RustCaptureSettings,
         recording_sink: Option<Arc<RecordingSink>>,
@@ -198,6 +253,46 @@ impl VaapiEncoder {
         Self::new_impl(settings, recording_sink, true)
     }
 
+    /// @brief Stand up the whole VA-API pipeline for one capture, shared by the dmabuf and
+    /// host-ARGB entry points and selected by `host_input`.
+    ///
+    /// **Why it is built this way.** Every piece here exists to push all pixel-format work onto the
+    /// GPU: the capture thread should hand over a dmabuf or a raw host frame and get H.264 back
+    /// without the CPU ever performing a colorspace conversion. One function serves both capture
+    /// backends so their device, pool, codec, and filter-graph setup cannot drift apart; `host_input`
+    /// selects only the two points where the paths genuinely differ — the buffersrc pixel format and
+    /// the `hwupload` vs `hwmap` staging filter.
+    ///
+    /// 1. **Devices**: open a DRM device on the chosen render node (`/dev/dri/renderD{128+index}`,
+    ///    or `renderD128` when no index is set) and derive a VA-API device from it.
+    /// 2. **Frames contexts**: a DRM-PRIME frames context (sw-format BGRA) describes the incoming
+    ///    Wayland dmabufs; the encoder frames context is a pool of `initial_pool_size = 20` VA-API
+    ///    surfaces in NV12 at macroblock-aligned dimensions (width→16, height→32). A second ref to
+    ///    the encoder pool is saved so `reopen_codec` can rebuild the codec against it.
+    /// 3. **Codec context**: `h264_vaapi` with an effectively **infinite GOP** (`gop_size = INT_MAX`,
+    ///    IDRs only on demand), **no B-frames** (low latency), **4 slices** (lets client decoders
+    ///    parallelize; more than 4 upsets Chromium), and `compression_level = 6` (the VA quality
+    ///    knob, biased toward speed — higher is faster). Rate control is either **CBR** (program
+    ///    `bit_rate`/`rc_max_rate` and a `vbv_bits`-derived `rc_buffer_size`, `rc_mode=CBR`) or
+    ///    **CQP** (`rc_mode=CQP` plus a fixed `qp`); both then pin `profile=high`, `level=4.1`,
+    ///    `async_depth=1`.
+    /// 4. **Filter graph**: an explicit `buffersrc` → `hwmap`/`hwupload` + `scale_vaapi` →
+    ///    `buffersink` chain. The buffersrc format is DRM-PRIME (carrying the DRM frames context) for
+    ///    dmabuf input, or plain BGRA for host input. `scale_vaapi` does the ARGB→NV12 convert on the
+    ///    GPU in **BT.709 limited range** (`out_range=tv`) so VA-API output matches the NVENC/x264
+    ///    4:2:0 color — an explicit convert is used rather than trusting encoder-side RGB CSC, which
+    ///    varies across VA drivers.
+    /// 5. **Graph staging**: the chain is built with the segment API (parse → create filters →
+    ///    attach the VA device to every filter → apply → link our endpoints to the dangling pads)
+    ///    rather than the one-shot parser. `hwupload` initializes *during* the parse and fails
+    ///    without a device, and on the host path the BGRA buffersrc carries no frames context to
+    ///    derive one from; staging mirrors what the ffmpeg CLI does so the device is attached before
+    ///    those filters init.
+    /// 6. **Preflight**: allocate the reusable `video_frame`/`sw_frame`/`hw_frame` and pull one
+    ///    buffer from the encoder pool to prove the NV12 surface path is live before returning.
+    ///
+    /// Every failure step unwinds by unref-ing exactly the contexts allocated so far, in reverse
+    /// order, so no FFmpeg object leaks on the error path.
     fn new_impl(
         settings: &RustCaptureSettings,
         recording_sink: Option<Arc<RecordingSink>>,
@@ -299,7 +394,6 @@ impl VaapiEncoder {
                 return Err("Failed to init encoder frames ctx".into());
             }
 
-            // Keep a reference for restarting the encoder
             let mut saved_enc_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
 
             let mut encoder_ctx = ff::avcodec_alloc_context3(codec);
@@ -320,9 +414,7 @@ impl VaapiEncoder {
             (*encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
             (*encoder_ctx).max_b_frames = 0;
             (*encoder_ctx).gop_size = std::ffi::c_int::MAX;
-            // Multiple slices help client decoders parallelize; >4 upsets Chromium.
             (*encoder_ctx).slices = 4;
-            // Driver quality level biased toward speed (VA quality range: higher = faster).
             (*encoder_ctx).compression_level = 6;
 
             ff::av_buffer_unref(&mut enc_frames_ref);
@@ -335,8 +427,6 @@ impl VaapiEncoder {
             };
 
             if settings.video_cbr_mode {
-                // Constant bitrate: VA-API reads the target rate from the codec context's
-                // bit_rate; the rc_mode opt just selects the algorithm.
                 let bps = (settings.video_bitrate_kbps.max(0) as i64).saturating_mul(1000);
                 let vbv = crate::encoders::vbv_bits(
                     bps.min(u32::MAX as i64) as u32,
@@ -388,7 +478,6 @@ impl VaapiEncoder {
                 return Err("Failed to alloc buffersrc parameters".into());
             }
             if host_input {
-                // Software BGRA in; hwupload (below) stages it onto a VAAPI surface.
                 (*par).format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
             } else {
                 (*par).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
@@ -450,22 +539,12 @@ impl VaapiEncoder {
                 return Err("Failed to create buffersink".into());
             }
 
-            // VA-VPP convert ARGB->NV12 on the GPU BEFORE encode (VA implementations vary, so an
-            // explicit convert is safer than relying on encoder-side RGB CSC). Pin BT.709 limited
-            // to match the NVENC/x264 4:2:0 output so all backends agree on color. Host input
-            // (X11) uploads the CPU BGRA frame to a VAAPI surface (hwupload); dmabuf input
-            // (Wayland) maps the DRM-PRIME buffer (hwmap). Both then run scale_vaapi (VA-VPP).
             let stage = if host_input { "hwupload" } else { "hwmap" };
             let filters_desc = CString::new(format!(
                 "{},scale_vaapi=w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
                 stage, width, height
             ))
             .unwrap();
-            // The one-shot parser initializes filters DURING the parse, and hwupload fails
-            // its init without a device (the host path's buffersrc is plain BGRA, so no
-            // frames context to derive one from). Stage the graph the way the ffmpeg CLI
-            // does: parse -> create filters -> attach the device -> init+link -> wire our
-            // endpoints to the chain's dangling pads.
             let mut seg: *mut ff::AVFilterGraphSegment = ptr::null_mut();
             let mut seg_inputs: *mut ff::AVFilterInOut = ptr::null_mut();
             let mut seg_outputs: *mut ff::AVFilterInOut = ptr::null_mut();
@@ -569,13 +648,19 @@ impl VaapiEncoder {
         }
     }
 
-    /// Re-opens the codec context in place, applying the current rate-control state.
+    /// @brief Applies every live QP / bitrate / fps change by re-opening the whole codec context,
+    /// because VA-API drivers do not reliably honor an in-place reconfigure — a fresh
+    /// `AVCodecContext` is the one portable way to make a new rate-control setting actually take
+    /// effect.
     ///
-    /// The VA device, encoder frames pool and filter graph persist; only the AVCodecContext is
-    /// rebuilt. CBR reprograms bit_rate / rc_max_rate / rc_buffer_size from the tracked bitrate
-    /// and VBV; CQP reprograms the quantizer. A freshly opened context emits an IDR as its first
-    /// frame, so the reference chain self-heals. This replaces any driver-side live reconfigure,
-    /// which is flaky on some drivers.
+    /// The price of that reliability is that a re-opened context always emits an IDR as its first
+    /// frame, which is affordable here precisely because that IDR simply re-anchors the reference
+    /// chain, so the stream self-heals across the swap rather than breaking. Only the codec context
+    /// is torn down and rebuilt: the VA device, the encoder frames pool, and the filter graph all
+    /// persist, and the new context is re-allocated against the same `codec` and re-bound to the
+    /// saved `enc_frames_ctx` pool and `hw_device_ctx`, with the same GOP / slice / compression
+    /// settings as the initial open. **CBR** reprograms `bit_rate` / `rc_max_rate` / `rc_buffer_size`
+    /// (VBV from `vbv_bits`); **CQP** reprograms the quantizer to `qp` and records it in `current_qp`.
     unsafe fn reopen_codec(&mut self, qp: u32) -> Result<(), String> {
         if !self.encoder_ctx.is_null() {
             ff::avcodec_free_context(&mut self.encoder_ctx);
@@ -636,13 +721,23 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    /// Updates the quantization parameter (QP) with hysteresis.
+    /// @brief Moves the CQP quantizer toward `target_qp`, but weighs each change against the cost of
+    /// acting on it, because applying a quantizer is not free — it forces a codec re-open (and thus
+    /// an IDR) — and the two directions are not equally worth that cost.
     ///
-    /// If QP decreases (higher quality paint-over), it re-opens immediately.
-    /// If QP increases (lower quality motion), it waits for the hysteresis limit
-    /// to avoid blinking artifacts. No-op in CBR, where quality is driven by the
-    /// bitrate target and a per-frame QP change would otherwise re-open in CQP and
-    /// drop the configured bitrate.
+    /// A *decrease* sharpens the picture and is always worth an immediate switch; an *increase* dulls
+    /// it and is worth committing to only once the drop has clearly persisted, so transient motion
+    /// does not make quality blink. That asymmetry is the whole point of the hysteresis. Resolved in
+    /// priority order:
+    ///
+    /// 1. **CBR**: no-op — the bitrate target, not the quantizer, governs quality, so re-opening per
+    ///    frame would only flip the context into CQP and abandon the configured bitrate.
+    /// 2. **Unchanged QP**: reset the hysteresis counter and return.
+    /// 3. **QP decrease** (higher quality, e.g. a paint-over refresh): apply immediately via
+    ///    `reopen_codec` — a sharper static image is always worth the switch.
+    /// 4. **QP increase** (lower quality, e.g. sustained motion): count consecutive requests and only
+    ///    re-open once the counter exceeds `QP_HYSTERESIS_LIMIT`, so brief motion does not make
+    ///    quality visibly blink between re-opens.
     unsafe fn update_qp(&mut self, target_qp: u32) -> Result<(), String> {
         if self.cbr_mode {
             return Ok(());
@@ -667,10 +762,15 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    /// Apply a live rate-control / framerate change from updated settings. Guarded so it only
-    /// re-opens the codec when the CBR bitrate/VBV (CBR only) or the target fps actually change,
-    /// making it cheap to call every frame like the NVENC path. The re-open carries the current
-    /// QP so a CQP stream keeps its quantizer across an fps change.
+    /// @brief Stays cheap enough for the pipeline to call on every single frame by re-opening the
+    /// codec only when a rate-control or framerate setting has actually changed — an unconditional
+    /// re-open here would force a needless IDR every frame and cripple the stream.
+    ///
+    /// The change test is deliberately narrow, to keep that guard tight: in CBR, a different target
+    /// bitrate or VBV multiplier; in any mode, a different target fps. When nothing changed it returns
+    /// without touching the codec. On a real change it caches the new fps / bitrate / VBV / keyframe
+    /// interval and calls `reopen_codec` carrying the **current** QP, so a CQP stream keeps its
+    /// quantizer across the change.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) {
         unsafe {
             let mut changed = false;
@@ -697,7 +797,19 @@ impl VaapiEncoder {
         }
     }
 
-    /// Retrieves encoded packets from the encoder and formats them with the custom header.
+    /// @brief Feeds each finished packet to two consumers that need different framing, which is why
+    /// this is more than a plain receive loop.
+    ///
+    /// The network `output` gets each packet wrapped in the 10-byte stripe header the client demuxer
+    /// expects, so a full frame can ride the exact same path as the striped modes — it is simply
+    /// described to the client as one full-height stripe: tag `0x04`, a keyframe flag (`0x01`/`0x00`
+    /// from `AV_PKT_FLAG_KEY`), the frame number as a big-endian `u16`, a `0` y-start (a whole frame
+    /// starts at the top), then width and height as big-endian `u16`s, followed by the raw Annex-B
+    /// payload. A `recording_sink`, when attached, instead receives the bare payload with no header,
+    /// because a recording is a plain elementary stream that must not carry the transport framing.
+    /// `omit_stripe_headers` drops the header on the network path too, for a consumer that already
+    /// wants raw Annex-B. The loop drains `avcodec_receive_packet` until the encoder is empty,
+    /// unref'ing each packet before the next iteration.
     unsafe fn collect_packet(&mut self, frame_number: u64, output: &mut Vec<u8>) {
         while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) == 0 {
             let size = (*self.packet).size as usize;
@@ -725,9 +837,26 @@ impl VaapiEncoder {
         }
     }
 
-    /// Encodes a DMA-BUF frame by importing it via DRM and passing it through the filter graph.
+    /// @brief Encode one Wayland DRM-PRIME dmabuf by wrapping it in an FFmpeg DRM frame descriptor
+    /// and pushing it through the filter graph, which `hwmap`s it to a VA surface and converts to
+    /// NV12 before encode.
     ///
-    /// The filter graph handles mapping the DRM frame to a VAAPI surface and converting colorspace.
+    /// 1. **Quantizer**: apply the requested `qp` through `update_qp` (hysteresis / CBR-aware).
+    /// 2. **Descriptor**: allocate a zeroed `AVDRMFrameDescriptor` and populate it from the dmabuf —
+    ///    one object per handle with a freshly `dup`'d fd (so FFmpeg owns independent fds), the object
+    ///    size computed from the plane stride and the height rounded up to 32, the format modifier,
+    ///    and one layer whose planes carry each plane's offset and pitch. A single-handle multi-plane
+    ///    buffer points all planes at object 0.
+    /// 3. **Ownership**: the dup'd fds live in a boxed `DmabufResources` handed to `av_buffer_create`
+    ///    as `release_drm_frame`'s opaque, so FFmpeg closes them on teardown. If building that buffer
+    ///    fails, `release_drm_frame` is called directly to clean up.
+    /// 4. **Submit**: point `video_frame` at the descriptor, tag it DRM-PRIME with the DRM frames
+    ///    context, and feed the graph. `av_buffersrc_add_frame` consumes the frame's refs only on
+    ///    success; on error the frame is untouched, so `video_frame` is unref'd to release `buf[0]`
+    ///    (which runs `release_drm_frame` and closes the fds) — no manual fd close, which would
+    ///    double-close.
+    /// 5. **Collect**: pull each converted frame from the sink, stamp `pict_type = I` when
+    ///    `force_idr`, send it to the encoder, and drain packets via `collect_packet`.
     pub fn encode_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
@@ -809,10 +938,6 @@ impl VaapiEncoder {
             (*self.video_frame).hw_frames_ctx = ff::av_buffer_ref(self.drm_frames_ctx);
 
             if ff::av_buffersrc_add_frame(self.buffersrc_ctx, self.video_frame) < 0 {
-                // add_frame (no KEEP_REF) only consumes the frame's refs on success;
-                // on error "the input frame is not touched", so buf[0] is still live
-                // and this unref is required to release it (-> release_drm_frame closes
-                // the dup'd dmabuf fds). Don't add a manual fd close: that double-closes.
                 ff::av_frame_unref(self.video_frame);
                 return Err("Failed to feed filter graph".into());
             }
@@ -839,12 +964,16 @@ impl VaapiEncoder {
         }
     }
 
-    /// Encodes one host BGRA frame using GPU postprocessing (X11 path).
+    /// @brief Encode one host BGRA frame (X11 path) by staging it onto a VA surface and letting the
+    /// GPU do the color convert — valid only on an encoder built with `new_host`.
     ///
-    /// The CPU frame is staged into a VAAPI surface (hwupload) and converted ARGB->NV12 by
-    /// VA-VPP (scale_vaapi) on the GPU before encode -- there is no CPU colorspace conversion.
-    /// `bgra` is B,G,R,A in memory (X11 host layout) at `stride` bytes per row (may
-    /// include padding). Only valid on an encoder built with `new_host`.
+    /// `bgra` is B,G,R,A in memory at `stride` bytes per row (padding allowed) and must hold at least
+    /// `stride * height` bytes. The flow: apply `qp` via `update_qp`; allocate a fresh refcounted
+    /// BGRA `video_frame` and copy the host rows in (the sole copy — plain data movement to a
+    /// GPU-uploadable frame, clamped to `min(width*4, stride, dst_stride)` per row, **not** a
+    /// colorspace conversion); feed the graph, where `hwupload` stages it onto a VA surface and
+    /// `scale_vaapi` converts ARGB→NV12; then pull converted frames, stamp `pict_type = I` when
+    /// `force_idr`, encode, and drain packets via `collect_packet`.
     pub fn encode_host_argb(
         &mut self,
         bgra: &[u8],
@@ -862,8 +991,6 @@ impl VaapiEncoder {
                 return Err("Input buffer too small".into());
             }
 
-            // Build a fresh refcounted BGRA frame and stage the host rows into it (the only copy;
-            // it is data movement for the GPU upload, not a colorspace conversion).
             ff::av_frame_unref(self.video_frame);
             (*self.video_frame).width = self.width;
             (*self.video_frame).height = self.height;
@@ -908,7 +1035,16 @@ impl VaapiEncoder {
         }
     }
 
-    /// Encodes raw NV12 pixel data by uploading it from CPU memory to the GPU.
+    /// @brief Encode already-planar NV12 pixels by uploading them straight to a VA surface,
+    /// bypassing the filter graph (there is no color convert to do).
+    ///
+    /// Wraps the input as an NV12 `sw_frame` — Y plane at offset 0, interleaved UV at `width*height`,
+    /// both with `linesize = width` — after checking the buffer holds the full `w*h + w*h/2` bytes.
+    /// A fresh `hw_frame` is pulled from the encoder pool (the frame is unref'd first, or the prior
+    /// surface would leak), `av_hwframe_transfer_data` copies CPU→GPU, and the `sw_frame` is released.
+    /// Keyframes are forced through `pict_type = I` (`AV_PKT_FLAG_KEY` is a *packet* flag, unusable on
+    /// a frame); otherwise `pict_type = NONE`. The GPU frame is sent to the encoder and packets are
+    /// drained via `collect_packet`.
     pub fn encode_raw(
         &mut self,
         nv12_pixels: &[u8],
@@ -938,7 +1074,6 @@ impl VaapiEncoder {
             (*self.sw_frame).data[1] = nv12_pixels.as_ptr().add(width * height) as *mut u8;
             (*self.sw_frame).linesize[1] = self.width;
 
-            // get_buffer needs an empty frame; without this the prior surface leaks.
             ff::av_frame_unref(self.hw_frame);
             if ff::av_hwframe_get_buffer((*self.encoder_ctx).hw_frames_ctx, self.hw_frame, 0) < 0 {
                 return Err("Failed to allocate HW frame for NV12 path".into());
@@ -953,7 +1088,6 @@ impl VaapiEncoder {
             ff::av_frame_unref(self.sw_frame);
 
             (*self.hw_frame).pts = frame_number as i64;
-            // Force keyframes via pict_type (AV_PKT_FLAG_KEY is a packet flag, not a frame flag).
             if force_idr {
                 (*self.hw_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
             } else {
@@ -976,11 +1110,16 @@ impl VaapiEncoder {
 mod graph_ordering_tests {
     use super::*;
 
-    /// Builds the same shaped graph as new_impl's host path -- explicit buffersrc/sink
-    /// endpoints plus an "hwupload,..." chain -- against a CUDA device (hwupload is the
-    /// same generic filter VAAPI uses; this box has no VAAPI device). `staged` selects
-    /// the segment API (parse -> create -> attach -> init/link) vs the one-shot parser
-    /// with the device attached afterwards.
+    /// @brief Build the same shape of graph as `new_impl`'s host path — explicit buffersrc/sink
+    /// endpoints around an `hwupload,…` chain — against a CUDA device, to exercise the device-attach
+    /// ordering without needing a VA-API device.
+    ///
+    /// `hwupload` is the generic filter VA-API also uses, so CUDA stands in on a box that has no VA
+    /// device. `staged = true` builds via the segment API (parse → create filters → attach device →
+    /// init/link); `staged = false` uses the one-shot `avfilter_graph_parse_ptr` with the device
+    /// attached only afterwards. The helper then configures the graph and pushes one 64×64 BGRA frame
+    /// through it, returning `Err` unless a frame actually flows out — proving the graph passes
+    /// pixels, not merely that it configured.
     unsafe fn build_hwupload_graph(staged: bool) -> Result<(), String> {
         let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
         if ff::av_hwdevice_ctx_create(
@@ -1079,7 +1218,6 @@ mod graph_ordering_tests {
             if r < 0 { Err(format!("config failed: {}", ff_err_str(r))) } else { Ok(()) }
         });
 
-        // Prove the staged graph actually passes pixels, not just configures.
         let result = result.and_then(|()| {
             let frame = ff::av_frame_alloc();
             (*frame).format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
@@ -1112,9 +1250,11 @@ mod graph_ordering_tests {
         result
     }
 
-    /// The one-shot parser initializes hwupload during the parse, before any attach loop
-    /// can run -- reproducing the "always falls back to software" failure; the staged
-    /// segment build must succeed end-to-end on the same machine.
+    /// @brief Verify the device-attach ordering the host filter graph depends on: on the same
+    /// machine, the staged segment build must pass pixels end-to-end while the one-shot parser must
+    /// fail. The one-shot parser initializes `hwupload` during the parse — before any device-attach
+    /// loop can run — so it never gets a device and would force a software fallback, which is exactly
+    /// why `new_impl` stages the graph. Ignored by default (needs a working hardware device).
     #[test]
     #[ignore]
     fn gpu_hwupload_device_attach_ordering() {

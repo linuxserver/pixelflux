@@ -13,8 +13,11 @@ use xcursor::{
     CursorTheme,
 };
 
-// Loaded XCursor theme: default-cursor frames plus the theme handle for
-// named lookups, all at the resolved pixel size.
+/// @brief The loaded XCursor theme, held for the whole capture so cursor lookups stay cheap.
+///
+/// The default cursor's frames are parsed once and kept here because they are consulted on nearly
+/// every frame; the theme handle is retained alongside them so the rarer named cursors (`hand1`,
+/// `text`, …) can still be resolved on demand. Everything is sized to the one resolved pixel size.
 pub struct Cursor {
     icons: Vec<Image>,
     theme: CursorTheme,
@@ -22,8 +25,11 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    // size_override comes from CaptureSettings.cursor_size (selkies --cursor-size /
-    // XCURSOR_SIZE); <=0 falls back to 24.
+    /// @brief Load the theme named by `XCURSOR_THEME` (default `"default"`) at the requested size.
+    ///
+    /// `size_override` comes from `CaptureSettings.cursor_size` (selkies `--cursor-size` /
+    /// `XCURSOR_SIZE`); a value `<= 0` falls back to 24. When the theme's default icon cannot be
+    /// loaded, a 16×16 solid-red placeholder stands in so the caller always has a valid image.
     pub fn load(size_override: i32) -> Cursor {
         let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
         let size: u32 = if size_override > 0 { size_override as u32 } else { 24 };
@@ -51,18 +57,20 @@ impl Cursor {
         Cursor { icons, theme, size }
     }
 
+    /// @brief The default cursor's animation frame for `time`, at the theme size times `scale`.
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
         let size = self.size * scale;
         frame(time.as_millis() as u32, size, &self.icons)
     }
 
+    /// @brief A named cursor's animation frame for `time`, or `None` when the theme lacks it.
     pub fn get_image_by_name(&self, name: &str, scale: u32, time: Duration) -> Option<Image> {
         let icons = load_icon(&self.theme, name).ok()?;
         let size = self.size * scale;
         Some(frame(time.as_millis() as u32, size, &icons))
     }
 
-    /// Named cursor icon as PNG bytes plus hotspot (x, y), for web clients.
+    /// @brief A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
     pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
@@ -83,7 +91,9 @@ impl Cursor {
     }
 }
 
-// All frames of the variant whose size is closest to the requested size.
+/// @brief All frames of the theme variant whose pixel size is closest to `size`. XCursor files
+/// bundle the same cursor at several sizes, and choosing the nearest one avoids scaling a
+/// mismatched bitmap into a blurry or aliased cursor.
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
     let nearest_image = images
         .iter()
@@ -94,7 +104,9 @@ fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
         .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
 }
 
-// Picks the animation frame for the elapsed time by cycling cumulative delays.
+/// @brief Pick which animation frame to show for the elapsed time, so animated cursors (a spinner,
+/// a progress ring) actually advance instead of freezing on frame zero; it maps the time onto the
+/// frames by cycling their cumulative delays.
 fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     let total = nearest_images(size, images).fold(0, |acc, image| acc + image.delay);
     if total == 0 {
@@ -110,6 +122,10 @@ fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     unreachable!()
 }
 
+/// @brief Parse the named icon from the theme's cursor file into its frames.
+///
+/// Empty parses are rejected so `nearest_images`'s `min_by_key().unwrap()` cannot panic on a
+/// cursor file that has a valid header but zero images.
 fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
     let icon_path = theme.load_icon(name).ok_or("Icon not found")?;
     let mut cursor_file = std::fs::File::open(icon_path).map_err(|e| e.to_string())?;
@@ -117,8 +133,6 @@ fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
     cursor_file
         .read_to_end(&mut cursor_data)
         .map_err(|e| e.to_string())?;
-    // Reject empty parses so nearest_images()'s min_by_key().unwrap() can't panic
-    // on a valid-header-but-zero-image cursor file.
     let imgs = parse_xcursor(&cursor_data).ok_or("Failed to parse".to_string())?;
     if imgs.is_empty() {
         return Err("Cursor file has no images".to_string());

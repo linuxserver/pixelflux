@@ -97,8 +97,13 @@ pub mod encoders {
     pub mod software;
     pub mod vaapi;
 
-    /// CBR VBV/HRD buffer size in bits: one frame's bit budget times `multiplier`.
-    /// `multiplier` <= 0 uses the default (1.5, or 3 when keyframe_interval_s > 0).
+    /// @brief Size the CBR VBV/HRD buffer so rate control has enough slack to hold quality steady
+    /// without letting end-to-end latency drift upward. The size is expressed as a MULTIPLE of one
+    /// frame's bit budget (bitrate / fps) rather than a fixed byte count precisely so a live bitrate
+    /// or framerate change rescales the buffer with it, preserving the same latency behavior at every
+    /// operating point. A `multiplier` <= 0 selects the policy default — 1.5 frames on an infinite
+    /// GOP, relaxed to 3 when scheduled keyframes are enabled, because each periodic IDR needs the
+    /// extra headroom or quality visibly dips at every interval.
     pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier: f64) -> u32 {
         let frame_bits = bitrate_bps as f64 / fps.max(1.0);
         let mult = if multiplier > 0.0 {
@@ -174,7 +179,13 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
 }
 
-/// Wraps a GBM buffer object as a Dmabuf (fd + stride + modifier, single plane).
+/// @brief Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
+/// rendered into and encoded with no intervening copy — the linchpin of the zero-copy capture path.
+/// The returned dmabuf is the one handle the GLES renderer binds as its framebuffer AND a hardware
+/// encoder (NVENC through CUDA, or VAAPI) imports to read those pixels directly, which only works if
+/// the buffer is described precisely enough (fd, stride, DRM modifier) for the importer to interpret
+/// it. One ARGB8888 plane is all that is carried because the compositor's offscreen target is exactly
+/// that single-plane format.
 fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier().expect("Failed to get modifier");
@@ -195,6 +206,13 @@ fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     builder.build().expect("Failed to build Dmabuf from GBM BO")
 }
 
+/// @brief The full set of capture + encode parameters the Python layer hands to the Rust backend.
+///
+/// A single value configures a capture session end to end: capture geometry and frame rate, the
+/// output mode (striped JPEG/x264 vs full-frame H.264), the H.264 quality and rate-control knobs,
+/// cursor and watermark options, the encode-device selection, and the optional recording socket.
+/// It derives `PartialEq` so the backend can detect when a live setting actually changed, and
+/// `Clone` so each capture pipeline can own its own copy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RustCaptureSettings {
     pub width: i32,
@@ -225,27 +243,27 @@ pub struct RustCaptureSettings {
     pub debug_logging: bool,
     pub auto_adjust_screen_capture_size: bool,
     pub recording_socket: String,
-    // When true, encoders emit the raw payload without the per-stripe header byte block;
-    // stripe metadata is then carried only on the frame attributes.
+    /// When true, encoders emit the raw payload without the per-stripe header byte block;
+    /// stripe metadata is then carried only on the frame attributes.
     pub omit_stripe_headers: bool,
     pub video_cbr_mode: bool,
     pub video_bitrate_kbps: i32,
-    // CBR VBV/HRD size as a multiple of one frame's bit budget (bitrate/framerate), so
-    // it rescales with live bitrate/fps changes. <= 0 selects the policy default:
-    // 1.5 on an infinite GOP, 3 when scheduled keyframes are enabled.
+    /// CBR VBV/HRD size as a multiple of one frame's bit budget (bitrate/framerate), so it
+    /// rescales with live bitrate/fps changes. `<= 0` selects the policy default: 1.5 on an
+    /// infinite GOP, 3 when scheduled keyframes are enabled.
     pub video_vbv_multiplier: f64,
-    // Seconds between scheduled recovery keyframes; <= 0 keeps the GOP infinite
-    // (IDRs only on demand: client join/reset, recording cadence).
+    /// Seconds between scheduled recovery keyframes; `<= 0` keeps the GOP infinite
+    /// (IDRs only on demand: client join / reset, recording cadence).
     pub keyframe_interval_s: f64,
-    // Rate-controlled (CBR) QP clamp: max bounds the quality FLOOR (screen text stays
-    // legible under motion at the cost of overshooting impossible targets), min bounds
-    // bit WASTE on easy content. 0 keeps the encoder's own default; CRF/CQP modes pin
-    // their QP directly and ignore these.
+    /// Rate-controlled (CBR) QP clamp: `video_max_qp` bounds the quality FLOOR (screen text stays
+    /// legible under motion at the cost of overshooting impossible targets), `video_min_qp` bounds
+    /// bit WASTE on easy content. 0 keeps the encoder's own default; CRF/CQP modes pin their QP
+    /// directly and ignore these.
     pub video_min_qp: i32,
     pub video_max_qp: i32,
 }
 
-/// The per-frame decision/quality knobs every encoder re-reads from the settings on each
+/// @brief The per-frame decision/quality knobs every encoder re-reads from the settings on each
 /// tick, so they retune a running capture with no encoder re-init: x264 reconfigures, NVENC
 /// CQP retargets, VAAPI re-opens only its codec ctx, JPEG is stateless. Applied on the
 /// thread that owns the settings copy. Structural switches (encoder, chroma, RC mode,
@@ -265,6 +283,7 @@ pub struct LiveTunables {
 }
 
 impl LiveTunables {
+    /// @brief Snapshot the live-tunable subset out of a full settings value.
     pub fn from_settings(s: &RustCaptureSettings) -> Self {
         Self {
             jpeg_quality: s.jpeg_quality,
@@ -280,6 +299,7 @@ impl LiveTunables {
         }
     }
 
+    /// @brief Write these live tunables back into a full settings value in place.
     pub fn apply_to(&self, s: &mut RustCaptureSettings) {
         s.jpeg_quality = self.jpeg_quality;
         s.paint_over_jpeg_quality = self.paint_over_jpeg_quality;
@@ -336,9 +356,14 @@ impl Default for RustCaptureSettings {
     }
 }
 
-/// Build a `RustCaptureSettings` by reading each field off a Python settings object
-/// (any object exposing the `CaptureSettings` attributes) via getattr. Used by both the
-/// Wayland and X11 capture entry points, so they read an identical set of fields.
+/// @brief Marshal a Python settings object into the plain owned Rust value both capture backends run
+/// on, so the FFI boundary is crossed exactly once per start and every downstream thread reads a
+/// struct instead of ever touching Python. Fields are read by ATTRIBUTE NAME (getattr), not by
+/// position, which is what lets a caller pass any object exposing the `CaptureSettings` attributes —
+/// including a subclass carrying extras — and is why the names here must match the Python side
+/// exactly. The newer/optional fields fall back to a default when absent rather than erroring, so a
+/// caller built against an older schema still starts. Routing both the Wayland and X11 entry points
+/// through this one reader is what keeps them from ever drifting on which fields they honor.
 pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCaptureSettings> {
     let watermark_path_obj = settings.getattr("watermark_path")?;
     let watermark_path = if let Ok(s) = watermark_path_obj.extract::<String>() {
@@ -396,9 +421,6 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .ok()
             .and_then(|v| v.extract::<String>().ok())
             .unwrap_or_default(),
-        // When true, encoders emit the raw payload without the per-stripe header. Stripe
-        // metadata is still exposed on the frame attributes, so the consumer must read it
-        // from there rather than parsing header bytes when this is set.
         omit_stripe_headers: settings
             .getattr("omit_stripe_headers")
             .ok()
@@ -429,38 +451,55 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
     })
 }
 
+/// @brief Control messages sent from the Python-facing methods to the capture thread.
+///
+/// Every interaction with a running capture crosses the thread boundary as one of these variants
+/// over the command channel: starting and stopping, injecting keyboard / pointer input, swapping
+/// the xkb keymap, serving the clipboard, changing live rate and per-frame tunables, and the
+/// computer-use queries that read back the screen, cursor, and geometry.
 pub enum ThreadCommand {
     StartCapture(Py<PyAny>, RustCaptureSettings),
     StopCapture,
     SetCursorCallback(Py<PyAny>),
     SetClipboardCallback(Py<PyAny>),
-    // Server-side clipboard offer: the compositor owns the selection and serves
-    // `data` as `mime` (plus text aliases) to pasting clients.
+    /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
+    /// `mime` (plus text aliases) to pasting clients.
     SetClipboard { mime: String, data: Vec<u8> },
     KeyboardKey { scancode: u32, state: u32 },
-    // Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text); the caller
-    // owns keysym-to-keycode policy and injects the keycodes it defined via KeyboardKey.
+    /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text); the caller owns
+    /// keysym-to-keycode policy and injects the keycodes it defined via `KeyboardKey`.
     SetKeymapString(String),
-    // Reply with the smithay keyboard's keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a
-    // consumer (selkies) can build its reverse keysym map from the IDENTICAL keymap.
+    /// Reply with the smithay keyboard's keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a
+    /// consumer (selkies) can build its reverse keysym map from the IDENTICAL keymap.
     GetXkbKeymap { reply: std::sync::mpsc::Sender<String> },
     PointerMotion { x: f64, y: f64 },
     PointerRelativeMotion { dx: f64, dy: f64 },
+    /// `btn` is an evdev `BTN_` code by contract (e.g. 272 = BTN_LEFT, 273 = BTN_RIGHT,
+    /// 274 = BTN_MIDDLE, 0x113 = BTN_SIDE / 0x114 = BTN_EXTRA for back/forward) and is passed
+    /// straight through to smithay's pointer.
     PointerButton { btn: u32, state: u32 },
     PointerAxis { x: f64, y: f64 },
     UpdateCursorConfig { render_on_framebuffer: bool },
+    /// On-demand keyframe request (client reconnect / decoder reset): forces a send and an IDR
+    /// even on a static screen.
     RequestIdr,
-    // Live rate-control change for the Wayland calloop thread (parity with the X11 rate_dirty
-    // path). Each field is None when that dimension is unchanged.
+    /// Live rate-control change for the Wayland calloop thread (parity with the X11 `rate_dirty`
+    /// path). Each field is `None` when that dimension is unchanged.
     UpdateRate { bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64> },
-    // Live per-frame tunables (quality/paint-over/streaming/cursor), applied to the calloop's
-    // settings and mirrored to the readback encode thread -- no capture or encoder restart.
+    /// Live per-frame tunables (quality / paint-over / streaming / cursor), applied to the
+    /// calloop's settings and mirrored to the readback encode thread — no capture or encoder
+    /// restart.
     UpdateTunables(LiveTunables),
     CuScreenshot { resp: std::sync::mpsc::Sender<Vec<u8>> },
     CuCursorPosition { resp: std::sync::mpsc::Sender<(f64, f64)> },
     CuGetInfo { resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
 }
 
+/// @brief Read the kernel driver bound to a render node — the cheap, authoritative signal that
+/// routes encoder selection (an `nvidia` driver picks NVENC, anything else VA-API) without opening
+/// the device or loading a userspace driver just to ask. The name is lowercased so callers can
+/// substring-match it case-insensitively, and is empty when the node has no driver link, which the
+/// selection logic treats as "no detectable GPU". Keyed off the node `/dev/dri/renderD<128+card_index>`.
 pub(crate) fn get_gpu_driver(card_index: i32) -> String {
     let path = format!("/sys/class/drm/renderD{}/device/driver", 128 + card_index);
     match std::fs::read_link(&path) {
@@ -469,7 +508,7 @@ pub(crate) fn get_gpu_driver(card_index: i32) -> String {
     }
 }
 
-/// A DRM card's identity as the kernel reports it, read from the device's
+/// @brief A DRM card's identity as the kernel reports it, read from the device's
 /// sysfs `uevent` (DRIVER=, PCI_ID=, OF_COMPATIBLE_n=) with per-file fallbacks
 /// (`vendor`, `modalias`, the `driver` symlink). uevent is uniform across buses
 /// (PCI, platform/devicetree, USB) and readable in unprivileged containers.
@@ -479,6 +518,12 @@ struct CardIdentity {
     compatibles: Vec<String>,
 }
 
+/// @brief Read a DRM card's `CardIdentity` from sysfs.
+///
+/// The device's `uevent` file is the primary source (`DRIVER=`, `PCI_ID=`, `OF_COMPATIBLE_n=`)
+/// because it is uniform across buses and readable in unprivileged containers. Each field has a
+/// fallback for cards whose `uevent` omits it: the `vendor` file for the PCI vendor, `modalias`
+/// (`of:...C<compatible>`) for the devicetree compatibles, and the `driver` symlink for the name.
 fn read_card_identity(device: &std::path::Path) -> CardIdentity {
     let mut id = CardIdentity { driver: String::new(), pci_vendor: None, compatibles: Vec::new() };
     if let Ok(uevent) = std::fs::read_to_string(device.join("uevent")) {
@@ -516,7 +561,7 @@ fn read_card_identity(device: &std::path::Path) -> CardIdentity {
     id
 }
 
-/// Human vendor name -> PCI vendor IDs. The kernel has no such table (the
+/// @brief Human vendor name -> PCI vendor IDs. The kernel has no such table (the
 /// grouping is conventional), and pci.ids/hwdata is often absent in containers,
 /// so this is the one mapping that must be embedded — kept to the names only.
 const VENDOR_PCI_IDS: &[(&str, &[u32])] = &[
@@ -535,7 +580,7 @@ const VENDOR_PCI_IDS: &[(&str, &[u32])] = &[
     ("virtio", &[0x1af4]),
 ];
 
-/// Human name -> devicetree vendor prefix, only where they differ (a token
+/// @brief Human name -> devicetree vendor prefix, only where they differ (a token
 /// equal to the prefix itself, e.g. "qcom" or "rockchip", matches directly).
 const OF_PREFIX_ALIASES: &[(&str, &str)] = &[
     ("mali", "arm"),
@@ -547,7 +592,7 @@ const OF_PREFIX_ALIASES: &[(&str, &str)] = &[
     ("powervr", "img"),
 ];
 
-/// Does a card match the requested token? Accepted token forms, checked against
+/// @brief Does a card match the requested token? Accepted token forms, checked against
 /// the identity the kernel itself reports: a kernel DRIVER name (exact, no
 /// table), a raw PCI vendor ID ("0x10de"/"10de"), a devicetree vendor prefix
 /// (literal first segment of any compatible), or a human vendor name resolved
@@ -580,7 +625,7 @@ fn card_matches_token(token: &str, id: &CardIdentity) -> bool {
     false
 }
 
-/// Parse an auto-GPU request (the CaptureSettings `auto_gpu` field, which selkies
+/// @brief Parse an auto-GPU request (the CaptureSettings `auto_gpu` field, which selkies
 /// fills from --auto-gpu / SELKIES_AUTO_GPU). `None` = disabled; `Some(None)` =
 /// pick the first GPU overall ("true"); `Some(Some(token))` = pick the first GPU
 /// whose kernel identity matches the case-insensitive token (vendor name, kernel
@@ -594,13 +639,15 @@ fn parse_auto_gpu(value: &str) -> Option<Option<String>> {
     }
 }
 
-/// Resolve a usable /dev/dri/renderD* node by walking /sys/class/drm cards in
-/// numeric order. This skips cards with no render node (e.g. an IPMI/VGA card0)
-/// and only returns a node that is actually present in this namespace, so it
-/// behaves correctly inside containers where /dev/dri is filtered.
+/// @brief Resolve a usable `/dev/dri/renderD*` node, optionally matching a vendor/driver token.
+///
+/// Cards under `/sys/class/drm` are walked in numeric order, which skips cards with no render node
+/// (e.g. an IPMI/VGA `card0`) and only returns a node actually present in this namespace, so it
+/// behaves correctly inside containers where `/dev/dri` is filtered. When `/sys/class/drm` is
+/// unreadable — a container that bind-mounts `/dev/dri` without `/sys` — the walk falls through to
+/// scanning `/dev/dri` directly for the lowest render node; that fallback has no device identity,
+/// so a vendor/driver `token` request cannot be satisfied there and yields `None`.
 fn auto_select_render_node(token: Option<&str>) -> Option<String> {
-    // Don't `?`-return if /sys/class/drm is unreadable (e.g. a container that
-    // bind-mounts /dev/dri without /sys): fall through to the /dev/dri scan below.
     let mut cards: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir("/sys/class/drm")
         .into_iter()
         .flatten()
@@ -629,8 +676,6 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
             }
         }
     }
-    // Fallback: lowest render node directly under /dev/dri. Without /sys there is
-    // no device identity, so a vendor/driver request cannot be satisfied here.
     if token.is_some() {
         return None;
     }
@@ -645,7 +690,7 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
 }
 
 
-/// One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
+/// @brief One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
 /// encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
 /// overlay animation); the IDR request travels separately via the controls atomic.
 pub struct WlFrame {
@@ -657,12 +702,13 @@ pub struct WlFrame {
     is_animated: bool,
 }
 
+/// @brief Interior state of `WlFramePool`: the free-buffer list plus the single publish slot.
 struct WlPoolInner {
     free: Vec<(usize, Vec<u8>)>,
     slot: Option<WlFrame>,
 }
 
-/// Render->encode handoff for the Wayland readback paths, mirroring the X11 FramePool's
+/// @brief Render->encode handoff for the Wayland readback paths, mirroring the X11 FramePool's
 /// single-slot non-dropping design with one deliberate difference: the calloop thread is also
 /// the compositor + input dispatcher, so it must NEVER block on the pool. `try_begin` hands
 /// out a buffer only while the publish slot is empty, so `publish` cannot block, and a
@@ -676,6 +722,9 @@ pub struct WlFramePool {
 }
 
 impl WlFramePool {
+    /// @brief Pre-allocate all `n` capture buffers up front (each `buf_len` bytes, all initially
+    /// free) so the steady-state render/encode loop hands buffers around without ever allocating on
+    /// the hot path.
     fn new(n: usize, buf_len: usize) -> Self {
         Self {
             inner: Mutex::new(WlPoolInner {
@@ -687,7 +736,7 @@ impl WlFramePool {
         }
     }
 
-    /// Calloop: reserve a buffer for the next render/readback, NON-blocking. None means the
+    /// @brief Calloop: reserve a buffer for the next render/readback, NON-blocking. None means the
     /// encoder is still behind (slot full or every buffer in flight) -- skip this tick.
     /// Because the calloop is the only producer, a successful reservation guarantees the
     /// following `publish` finds the slot empty (the consumer only ever drains it).
@@ -699,7 +748,7 @@ impl WlFramePool {
         g.free.pop()
     }
 
-    /// Calloop: hand the filled buffer to the encode thread. Never blocks (see `try_begin`).
+    /// @brief Calloop: hand the filled buffer to the encode thread. Never blocks (see `try_begin`).
     fn publish(&self, frame: WlFrame) {
         let mut g = self.inner.lock().unwrap();
         debug_assert!(g.slot.is_none());
@@ -708,12 +757,12 @@ impl WlFramePool {
         self.cv.notify_all();
     }
 
-    /// Calloop: return an unused reservation (render failed, readback skipped).
+    /// @brief Calloop: return an unused reservation (render failed, readback skipped).
     fn cancel(&self, id: usize, buf: Vec<u8>) {
         self.inner.lock().unwrap().free.push((id, buf));
     }
 
-    /// Encode: block until a frame is published (Some) or the pool shuts down (None). The
+    /// @brief Encode: block until a frame is published (Some) or the pool shuts down (None). The
     /// wait is bounded, re-checking `stop` as defense-in-depth against a lost wakeup.
     fn take(&self) -> Option<WlFrame> {
         let mut g = self.inner.lock().unwrap();
@@ -729,13 +778,13 @@ impl WlFramePool {
         }
     }
 
-    /// Encode: return an encoded frame's buffer so the calloop can capture into it again.
+    /// @brief Encode: return an encoded frame's buffer so the calloop can capture into it again.
     /// No notify: the only waiter (take) waits on the slot, and try_begin never blocks.
     fn recycle(&self, id: usize, buf: Vec<u8>) {
         self.inner.lock().unwrap().free.push((id, buf));
     }
 
-    /// Store stop under the lock so take() can't check stop==false and then park after the
+    /// @brief Store stop under the lock so take() can't check stop==false and then park after the
     /// notify already fired (lost wakeup); notify after unlocking.
     fn shutdown(&self) {
         let g = self.inner.lock().unwrap();
@@ -745,7 +794,7 @@ impl WlFramePool {
     }
 }
 
-/// Cross-thread controls for the Wayland encode thread, the X11 `Controls` scheme: the
+/// @brief Cross-thread controls for the Wayland encode thread, the X11 `Controls` scheme: the
 /// UpdateRate handler stores the current values then flips `rate_dirty` with Release; the
 /// encode thread swaps it with Acquire and re-reads the payload, never seeing it half-applied.
 /// `force_idr` is swapped just before each encode, so an on-demand keyframe lands on the
@@ -756,8 +805,8 @@ pub struct WlEncodeControls {
     vbv_mult_milli: AtomicI32,
     fps_milli: AtomicU64,
     force_idr: AtomicBool,
-    // Pending per-frame tunables for the encode thread (mutex, not atomics: one struct,
-    // set rarely, read only when the dirty flag says so).
+    /// Pending per-frame tunables for the encode thread (mutex, not atomics: one struct, set
+    /// rarely, read only when the dirty flag says so).
     tunables_dirty: AtomicBool,
     tunables: Mutex<Option<LiveTunables>>,
 }
@@ -776,11 +825,11 @@ impl WlEncodeControls {
     }
 }
 
-/// Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
+/// @brief Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
 /// publish slot, so a deeper pool would only add latency (staler frames), never overlap.
 const WL_POOL_SURFACES: usize = 2;
 
-/// Shared capture stats: whichever thread owns the encoders counts frames/stripes and
+/// @brief Shared capture stats: whichever thread owns the encoders counts frames/stripes and
 /// composes `desc` + `n_stripes` (the encoder half of the 1 s debug log line); the calloop
 /// log loads, prints and resets the counters.
 pub struct WlEncodeStats {
@@ -801,7 +850,7 @@ impl WlEncodeStats {
     }
 }
 
-/// Everything the Wayland encode thread needs, fixed for the life of one capture (a
+/// @brief Everything the Wayland encode thread needs, fixed for the life of one capture (a
 /// StartCapture reconfigure tears the thread down and spawns a fresh one). Rate changes
 /// flow through `controls`; damage and the IDR request arrive per-frame in `WlFrame`.
 struct WlEncodeConfig {
@@ -819,10 +868,17 @@ struct WlEncodeConfig {
     stats: Arc<WlEncodeStats>,
 }
 
-/// Build the readback-mode encoder set on the thread that will own and drive it: a HW
-/// session consuming host NV12/YUV444 via encode_raw, or the OpenH264 full-frame encoder,
-/// else None/None for the striped x264/JPEG path (encode_cpu builds per-stripe state).
-/// The EGL display is always null here: readback mode never imports dmabufs.
+/// @brief Build the readback-mode encoder set on the thread that will own and drive it.
+///
+/// The result is one of three shapes: a hardware `GpuEncoder` (NVENC or VAAPI) consuming host
+/// NV12/YUV444 via `encode_raw`, the OpenH264 full-frame encoder, or `(None, None)` for the
+/// striped x264/JPEG path (where `encode_cpu` builds its own per-stripe state). Selection follows
+/// the settings and the effective encode device — an auto index below zero resolves to device 0:
+/// OpenH264 when explicitly opted in, NVENC on an NVIDIA driver, VAAPI on any other GPU, except a
+/// 4:4:4 full-color request which VAAPI cannot do reliably and so falls through to the CPU. When a
+/// compatible NVENC session is handed over from the previous encode thread it is reconfigured in
+/// place (milliseconds) rather than rebuilt, which would stall the stream. The EGL display is
+/// always null here: readback mode never imports dmabufs.
 fn build_readback_encoders(
     settings: &RustCaptureSettings,
     try_gpu: bool,
@@ -844,15 +900,12 @@ fn build_readback_encoders(
     if !try_gpu {
         return (None, None);
     }
-    // Effective encoder device: auto (<0) means device 0.
     let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
     println!(
         "[Wayland] Encode Node Index: {} | Driver: {}",
         settings.encode_node_index.max(0), encode_driver
     );
     if encode_driver.contains("nvidia") {
-        // Reuse the previous thread's session when compatible: an in-place reconfigure
-        // costs milliseconds where a session rebuild stalls the stream.
         if let Some(GpuEncoder::Nvenc(mut enc)) = prior {
             match enc.reconfigure_resolution(settings) {
                 Ok(()) => {
@@ -890,13 +943,32 @@ fn build_readback_encoders(
     (None, None)
 }
 
-/// Encode-thread body for the Wayland readback paths: consume published frames and run the
-/// full encode dispatch (CSC -> decide_hw_fullframe -> HW
-/// encode_raw / OpenH264 / striped encode_cpu), recycle the buffer BEFORE delivery so a slow
-/// consumer never holds a capture buffer, then hand the stripes to the delivery thread.
-/// Owning the encoders here (created/driven/dropped on one thread) is what lets the calloop
-/// overlap the next render/readback with this encode -- the X11 capture||encode split, minus
-/// the renderer, which is genuinely calloop-affine (EGL/GBM/dmabuf and the pixman targets).
+/// @brief Encode-thread body for the Wayland readback paths: drain published frames and run the
+/// full encode dispatch, owning the encoders for the life of the capture.
+///
+/// Owning the encoders on this one thread (created, driven, and dropped here) is what lets the
+/// calloop overlap the next render/readback with this encode — the same capture‖encode split used
+/// on X11, minus the renderer, which is genuinely calloop-affine (EGL/GBM/dmabuf and the pixman
+/// targets). Each published frame is processed in order so the H.264 reference chain stays
+/// contiguous:
+///
+/// 1. **Apply cross-thread changes**: live tunables and rate/VBV/fps updates are read here, on the
+///    thread that owns the encoders (each `Acquire` swap pairs with the command handler's `Release`
+///    store, so a payload is never seen half-applied). The IDR request is swapped as late as
+///    possible, so a request that arrived while this frame was in flight is honored one pipeline
+///    stage earlier than the next publish.
+/// 2. **Dispatch by encoder**: a hardware session runs `decide_hw_fullframe`, then colorspace-
+///    converts only the frames actually being encoded (RGBA vs BGRA source chosen by the renderer)
+///    into the reused NV12/YUV444 buffer and calls `encode_raw`; OpenH264 encodes host pixels
+///    directly; otherwise `encode_cpu` runs the striped x264/JPEG path with compositor damage. The
+///    software H.264 path keeps an infinite GOP, forcing an IDR only on an explicit request or the
+///    configured interval, and an explicit request also forces a full JPEG resend for joiners.
+/// 3. **Recycle then deliver**: the capture buffer is recycled BEFORE delivery so a slow consumer
+///    never pins one, then the stripes go to the delivery thread through a single-slot `send` whose
+///    blocking is the backpressure that overlaps delivery with the next render + encode.
+///
+/// On exit the hardware session is handed back to the calloop so a restart can reuse it in place
+/// when the new settings stay compatible (a plain `StopCapture` just drops it).
 fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEncoder> {
     crate::boost_thread_priority(-10);
     let mut settings = cfg.settings;
@@ -943,16 +1015,11 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     };
 
     while let Some(mut f) = pool.take() {
-        // Live tunables land in this thread's settings copy; every encoder re-reads them
-        // per frame (Acquire pairs with the UpdateTunables handler's Release store).
         if cfg.controls.tunables_dirty.swap(false, Ordering::Acquire) {
             if let Some(t) = cfg.controls.tunables.lock().unwrap().take() {
                 t.apply_to(&mut settings);
             }
         }
-        // Cross-thread rate controls are applied here, on the thread that owns the encoders
-        // (Acquire pairs with the UpdateRate handler's Release store). The striped x264 path
-        // picks the new settings up inside encode_cpu.
         if cfg.controls.rate_dirty.swap(false, Ordering::Acquire) {
             settings.video_bitrate_kbps = cfg.controls.bitrate_kbps.load(Ordering::Relaxed);
             settings.video_vbv_multiplier =
@@ -971,14 +1038,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             }
         }
 
-        // Swap the IDR request as late as possible: a request that arrives while this frame
-        // was in flight is honored HERE, one pipeline stage earlier than the next publish.
         let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed);
 
         let mut out: Vec<EncodedStripe> = Vec::new();
         if let Some(ref mut encoder) = video_encoder {
-            // Full-frame H.264 on a HW readback session. Same decide_hw_fullframe paint-over/
-            // recovery-IDR logic as the zero-copy and X11 paths; dirtiness = compositor damage.
             let decision = crate::pipeline::decide_hw_fullframe(
                 &mut hw_state,
                 &settings,
@@ -988,8 +1051,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 requested_idr,
             );
             if decision.send {
-                // CSC only for frames that are actually encoded; the RGBA/BGRA split follows
-                // the renderer (GLES readback vs pixman framebuffer).
                 let w = width as u32;
                 let h = height as u32;
                 if settings.video_fullcolor {
@@ -1058,7 +1119,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 }
             }
         } else if let Some(ref mut enc) = openh264_encoder {
-            // OpenH264 full-frame software H.264 on host pixels, parity with the X11 path.
             let decision = crate::pipeline::decide_hw_fullframe(
                 &mut hw_state,
                 &settings,
@@ -1092,9 +1152,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             if f.is_animated {
                 damage.push(Rectangle::new((0, 0).into(), (width, height).into()));
             }
-            // Infinite GOP by default for the software H.264 path: stripes IDR on an explicit
-            // request or the optional configured interval. An explicit request also forces a
-            // JPEG full resend so a joining viewer gets every stripe.
             let force_idr_all = requested_idr
                 || (settings.output_mode == 1
                     && crate::pipeline::periodic_idr_due(&settings, f.frame_id));
@@ -1107,7 +1164,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 &settings,
                 f.frame_id,
                 cfg.use_gpu,
-                false, // hash_damage: Wayland gets damage from the compositor
+                false,
                 cfg.recording_sink.as_ref(),
                 force_idr_all,
             );
@@ -1118,9 +1175,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
         if !out.is_empty() {
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
-            // send() blocks only while the previous frame is still undelivered -- the same
-            // single-slot backpressure as the X11 publish(), overlapping delivery with the
-            // next render + encode.
             let _ = cfg.deliver_tx.send(out);
         }
     }
@@ -1132,12 +1186,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             stripes.len()
         );
     }
-    // Hand the HW session back to the calloop: a restart reuses it in place when the
-    // new settings remain compatible (StopCapture just drops it).
     video_encoder
 }
 
-/// Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
+/// @brief Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
 /// whichever thread owns the encoders.
 fn encoder_desc(
     settings: &RustCaptureSettings,
@@ -1174,8 +1226,12 @@ fn encoder_desc(
     format!("H264 ({}) {} {} {} CRF:{}", backend, cs_str, range_str, frame_str, settings.video_crf)
 }
 
-/// Stripe count for the capture configuration; `fullframe_encoder` = a HW or OpenH264
-/// session (single-stream) is active.
+/// @brief Decide how many horizontal stripes a frame is split into, which is really the choice of how
+/// much encode parallelism to spend on it. A full-frame session (`fullframe_encoder`: a HW or
+/// OpenH264 encoder, or a forced `video_fullframe`) is one contiguous H.264 stream and so is always a
+/// SINGLE stripe; the striped CPU paths instead fan the frame out across cores — bounded by
+/// `height/64` for H.264 so no stripe is shorter than a macroblock row, or by `height` for JPEG — so
+/// a many-core host encodes a frame in parallel without over-subscribing a tiny one.
 fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool) -> usize {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1196,7 +1252,7 @@ fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool)
     }
 }
 
-/// One-shot "Stream settings active" line, printed by the thread that owns the encoders
+/// @brief One-shot "Stream settings active" line, printed by the thread that owns the encoders
 /// once the selection is final (calloop for zero-copy, encode thread for readback).
 fn log_stream_settings(
     settings: &RustCaptureSettings,
@@ -1249,7 +1305,7 @@ fn log_stream_settings(
         }
 
         let is_actually_444 = if openh264 {
-            false // OpenH264 is 4:2:0 only
+            false
         } else {
             match video_encoder {
                 Some(GpuEncoder::Nvenc(_)) => settings.video_fullcolor,
@@ -1274,9 +1330,42 @@ fn log_stream_settings(
     println!("{}", log_msg);
 }
 
-// Main Wayland backend loop (own thread): owns the calloop event loop (Python
-// command channel + Wayland socket) and the render timer that composites, reads
-// back, encodes, and transmits each frame. GBM/EGL HW accel, Pixman SW fallback.
+/// @brief The main execution loop of the Wayland backend.
+///
+/// This function is the central nervous system of the backend. It runs on its own thread and owns
+/// the entire lifecycle of the headless Wayland compositor:
+///
+/// 1. **Initialization**: builds the `calloop` event loop and the Wayland display, raises
+///    libwayland's per-client buffer limit when the newer setter is available (resolved at runtime
+///    so the module still loads against older libwayland), and brings up the rendering pipeline —
+///    GBM/EGL hardware acceleration on the resolved DRM render node, falling back to software
+///    rendering (Pixman) when no node is usable.
+/// 2. **State management**: constructs and holds the `AppState` — the Wayland globals (compositor,
+///    seat, SHM, shell, dmabuf, selections, and the rest), the single virtual `HEADLESS-1` output,
+///    the frame buffer and encode pools, and the window / cursor / encode bookkeeping.
+/// 3. **Event dispatch**:
+///    - **Command channel**: control messages from the Python thread — start/stop, input injection,
+///      keymap and clipboard operations, live rate / tunable changes, and the computer-use queries.
+///    - **Wayland socket**: accepts client connections and drives the compositor protocol.
+/// 4. **StartCapture reconfigure**: reprograms the virtual output's mode / scale / refresh, resizes
+///    the framebuffer and offscreen GBM buffer, and fullscreens mapped toplevels. The encode device
+///    is resolved here: an operator's explicit `encode_node_index` (-1 software, >= 0 a device)
+///    always wins, and only the unset `-2` sentinel is filled from the auto-picked render node.
+///    H.264 output masks the dimensions even, because 4:2:0 needs even width and height.
+/// 5. **Encode-path choice + render loop**: only a same-GPU GLES session encodes zero-copy on this
+///    calloop thread, because the dmabuf and its EGL context are calloop-affine; every readback
+///    flavor (OpenH264, striped x264/JPEG, Pixman, or a cross-GPU hardware encoder) builds its
+///    encoders on the dedicated encode thread instead. A high-frequency timer composites the mapped
+///    windows plus cursor and watermark, applies the shared paint-over / recovery-IDR policy, and
+///    delivers the encoded stripes back to Python through the frame callback. The zero-copy encode
+///    waits the GL render fence first, so a hardware encoder reading the dmabuf through CUDA/VA
+///    never maps a half-rasterized (torn) frame.
+/// 6. **Thread lifecycle**: the Python frame callback runs on a dedicated delivery thread so its
+///    GIL never stalls calloop input / control dispatch, and in readback mode the encoders run on
+///    the `wl-encode` thread. On a restart or stop the encode thread is torn down before the
+///    delivery thread — it feeds the delivery sender and must be gone first — and the retained
+///    callbacks are dropped and gated by a process-shutdown flag so nothing fires into a finalizing
+///    interpreter.
 fn run_wayland_thread(
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
     command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
@@ -1286,19 +1375,12 @@ fn run_wayland_thread(
     auto_gpu_selected: bool,
     cursor_size: i32,
 ) {
-    // Initial framebuffer size comes from the caller (selkies owns resolution policy
-    // and forwards it via the WaylandBackend constructor); first StartCapture resizes.
     let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
     let height: i32 = if initial_height > 0 { initial_height } else { 768 };
 
     let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
     let display: Display<AppState> = Display::new().unwrap();
     let dh: DisplayHandle = display.handle();
-    // Raise libwayland's per-client connection buffer (default 4 KiB) so bursty
-    // clients (large keymaps, clipboard offers) aren't disconnected mid-message.
-    // The setter only exists in libwayland >= 1.23; resolve it at runtime so the
-    // module keeps working against older system libraries (stock buffer size)
-    // instead of failing to load for a function nothing may ever call.
     unsafe {
         if let Ok(lib) = libloading::Library::new("libwayland-server.so.0") {
             if let Ok(set_max) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_void, usize)>(
@@ -1309,14 +1391,10 @@ fn run_wayland_thread(
                     10 * 1024 * 1024,
                 );
             }
-            // libwayland must stay resident for the lifetime of the compositor; the
-            // backend's own dlopen holds it too, so never unload our handle.
             std::mem::forget(lib);
         }
     }
 
-    // The render node arrives fully resolved (ensure_wayland_backend applies the
-    // explicit-path / auto_gpu / encoder-node precedence); empty = software renderer.
     let dri_node = explicit_dri_node;
 
     let mut use_gpu = !dri_node.is_empty();
@@ -1390,7 +1468,6 @@ fn run_wayland_thread(
 
     if !gpu_success {
         if !dri_node.is_empty() && !use_gpu {
-            // Pass
         } else {
             println!("[Wayland] No render node. Initializing Software Renderer (Pixman).");
         }
@@ -1532,10 +1609,6 @@ fn run_wayland_thread(
         .insert_source(command_rx, move |event, _, state| {
             match event {
                 CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
-                    // AUTO_GPU aims the encoder at the auto-picked render node. An explicit
-                    // render_node_path (which sets auto_gpu_selected = false) is respected.
-                    // Operator choice (encode_node_index = -1 software / >= 0 device) always wins;
-                    // only the unset sentinel (-2) is resolved here.
                     if state.auto_gpu_selected && settings.encode_node_index < -1 {
                         if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
                             if let Ok(idx) = idx_str.parse::<i32>() {
@@ -1544,7 +1617,6 @@ fn run_wayland_thread(
                         }
                     }
 
-                    // H.264 4:2:0 needs even dimensions.
                     if settings.output_mode == 1 {
                         settings.width &= !1;
                         settings.height &= !1;
@@ -1628,18 +1700,14 @@ fn run_wayland_thread(
                     }
 
                     let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
-                    // HW is only meaningful for H.264 output (X11 parity: JPEG always CPU).
                     let gpu_intent =
                         settings.output_mode == 1 && !settings.use_openh264 && !use_cpu_explicit;
                     if use_cpu_explicit && !(settings.output_mode == 1 && settings.use_openh264) {
                         println!("[Wayland] CPU encoding selected (use_cpu=true or encode_node_index=-1).");
                     }
 
-                    // Cross-GPU render/encode is decidable from settings + the resolved render
-                    // node alone; it forces readback, so the encode thread owns that session.
                     let mut different_gpu = false;
                     if gpu_intent {
-                        // Effective encoder device: auto (<0) means device 0.
                         let encode_node_idx = settings.encode_node_index.max(0);
                         if !state.render_node_path.is_empty()
                             && !state.render_node_path.contains(&format!("renderD{}", 128 + encode_node_idx))
@@ -1648,10 +1716,6 @@ fn run_wayland_thread(
                         }
                     }
 
-                    // Only a same-GPU GLES session encodes zero-copy on the calloop (the dmabuf
-                    // and its EGL context are calloop-affine). Every readback flavor -- OpenH264,
-                    // striped x264/JPEG, pixman or cross-GPU HW -- builds its encoders on the
-                    // dedicated encode thread instead (see wayland_encode_loop below).
                     if gpu_intent && state.use_gpu && !different_gpu {
                         let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
                         println!(
@@ -1660,9 +1724,6 @@ fn run_wayland_thread(
                         );
 
                         if encode_driver.contains("nvidia") {
-                            // Keep a live NVENC session across capture (re)starts: a pure
-                            // resize/rate change reconfigures it in place (milliseconds)
-                            // instead of a session rebuild that stalls the stream.
                             let reused = match state.video_encoder.as_mut() {
                                 Some(GpuEncoder::Nvenc(enc)) => {
                                     match enc.reconfigure_resolution(&settings) {
@@ -1720,8 +1781,6 @@ fn run_wayland_thread(
                             }
                         }
                     } else {
-                        // Not a zero-copy GPU start (CPU/OpenH264/readback): drop any session a
-                        // previous capture left behind.
                         state.video_encoder = None;
                     }
 
@@ -1761,39 +1820,24 @@ fn run_wayland_thread(
                     state.frame_counter = 0;
                     state.pending_force_idr = false;
                     state.vaapi_state = StripeState::default();
-                    // If a cursor callback is already registered, replay the retained cursor to
-                    // this (re)started capture so the client isn't left cursorless until the next
-                    // compositor cursor event.
                     if state.cursor_callback.is_some() {
                         if let Some(icon) = state.current_cursor_icon.clone() {
                             state.send_cursor_image(&icon);
                         }
                     }
-                    // Tear down a previous encode thread first -- it feeds the delivery thread,
-                    // so it must be gone before the delivery sender is dropped. shutdown()
-                    // unblocks its take(); join guarantees its deliver_tx clone is dropped and
-                    // hands back its HW session for in-place reuse by the new thread.
                     if let Some(p) = state.encode_pool.take() { p.shutdown(); }
                     let prior_readback_encoder = state
                         .encode_join
                         .take()
                         .and_then(|j| j.join().ok())
                         .flatten();
-                    // Move the Python callback onto a dedicated delivery thread so it (and the GIL
-                    // it holds) never runs on the calloop thread and can't stall input/control
-                    // dispatch. Tear down any prior thread first (restart without StopCapture).
                     if let Some(tx) = state.deliver_tx.take() { drop(tx); }
                     if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
                     if let Some(cb) = state.callback.take() {
                         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
                         let join = thread::spawn(move || {
                             crate::boost_thread_priority(-10);
-                            // recv() blocks until a frame arrives; returns Err (exits) when the
-                            // SyncSender is dropped on StopCapture/teardown. One GIL acquisition
-                            // per frame, all stripes batched, mirroring the X11 on_frame closure.
                             while let Ok(stripes) = rx.recv() {
-                                // Drain without attaching once teardown has begun: attaching to a
-                                // finalizing interpreter aborts the process pre-3.13.
                                 if PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
                                 Python::attach(|py| {
                                     for s in stripes {
@@ -1813,10 +1857,6 @@ fn run_wayland_thread(
                     }
 
                     if state.video_encoder.is_none() {
-                        // Readback mode: pooled host buffers + a dedicated encode thread (the
-                        // X11 capture||encode split). The thread builds and owns every encoder
-                        // -- OpenH264 and striped x264/JPEG identically, plus HW readback
-                        // sessions -- so the calloop only renders and reads back.
                         if let Some(ref deliver_tx) = state.deliver_tx {
                             let pool = Arc::new(WlFramePool::new(
                                 WL_POOL_SURFACES,
@@ -1839,8 +1879,6 @@ fn run_wayland_thread(
                             let cfg = WlEncodeConfig {
                                 settings: settings.clone(),
                                 use_gpu: state.use_gpu,
-                                // A same-GPU GLES session was already probed above (zero-copy);
-                                // only pixman/cross-GPU rigs retry HW here, as a readback session.
                                 try_gpu: gpu_intent && (!state.use_gpu || different_gpu),
                                 prior: prior_readback_encoder,
                                 recording_sink: state.recording_sink.clone(),
@@ -1869,20 +1907,10 @@ fn run_wayland_thread(
                     state.is_capturing = false;
                     WAYLAND_CAPTURE_ALIVE.store(false, Ordering::Release);
                     state.callback = None;
-                    // Drop the cursor/clipboard callbacks: this thread outlives the
-                    // interpreter, so a retained one could fire into a finalizing
-                    // interpreter (the off-GIL drop defers the decref). Callers
-                    // re-register them before the next start.
                     state.cursor_callback = None;
                     state.clipboard_callback = None;
                     state.video_encoder = None;
                     state.vaapi_state = StripeState::default();
-                    // Stop the encode thread FIRST (it releases every readback encoder --
-                    // x264 contexts own worker threads, OpenH264 owns plane buffers, HW
-                    // sessions own GPU state -- and drops its delivery sender on exit),
-                    // then the delivery thread. The calloop holds no GIL here, so joining
-                    // while a callback is mid-flight is safe. Also reached from the atexit
-                    // teardown, which sends StopCapture.
                     if let Some(p) = state.encode_pool.take() { p.shutdown(); }
                     if let Some(j) = state.encode_join.take() { let _ = j.join(); }
                     state.recording_sink = None;
@@ -1895,7 +1923,6 @@ fn run_wayland_thread(
                 }
                 CalloopEvent::Msg(ThreadCommand::SetClipboard { mime, data }) => {
                     let mimes: Vec<String> = if mime.starts_with("text/plain") {
-                        // Text aliases so every toolkit finds a target it knows.
                         ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
                          "STRING", "TEXT"].iter().map(|s| s.to_string()).collect()
                     } else {
@@ -1910,10 +1937,6 @@ fn run_wayland_thread(
                 }
                 CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
                     state.cursor_callback = Some(cb);
-                    // Replay the retained cursor so a client that (re)registers its callback AFTER
-                    // the last compositor cursor event still gets the current cursor immediately
-                    // (fixes the cursor-lost-after-tab-sleep symptom), instead of waiting for the
-                    // next cursor event that may never come.
                     if let Some(icon) = state.current_cursor_icon.clone() {
                         state.send_cursor_image(&icon);
                     }
@@ -1929,9 +1952,6 @@ fn run_wayland_thread(
                     }
                 }
                 CalloopEvent::Msg(ThreadCommand::SetKeymapString(text)) => {
-                    // Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1).
-                    // Clients receive the new map before any later key event, so the
-                    // caller may inject keycodes it defined immediately afterwards.
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         if let Err(e) = keyboard.set_keymap_from_string(state, text) {
                             eprintln!("[Wayland] keymap swap failed: {e:?}");
@@ -1939,14 +1959,11 @@ fn run_wayland_thread(
                     }
                 }
                 CalloopEvent::Msg(ThreadCommand::GetXkbKeymap { reply }) => {
-                    // Hand back our keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can
-                    // build its reverse keysym map from the IDENTICAL keymap.
                     let mut keymap_str = String::new();
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         keymap_str = keyboard.with_xkb_state(state, |context| {
                             match context.xkb().lock() {
                                 Ok(guard) => {
-                                    // SAFETY: read-only use of the &Keymap within the guard scope.
                                     let keymap = unsafe { guard.keymap() };
                                     keymap.get_as_string(
                                         smithay::input::keyboard::xkb::KEYMAP_FORMAT_TEXT_V1,
@@ -1956,7 +1973,6 @@ fn run_wayland_thread(
                             }
                         });
                     }
-                    // Best-effort: the caller may have timed out and dropped the receiver.
                     let _ = reply.send(keymap_str);
                 }
                 CalloopEvent::Msg(ThreadCommand::PointerMotion { x, y }) => {
@@ -2076,10 +2092,6 @@ fn run_wayland_thread(
                                 }
                             }
                         }
-                        // `btn` is already an evdev BTN_ code by contract (the selkies
-                        // consumer sends e.g. 272=BTN_LEFT/273=BTN_RIGHT/274=BTN_MIDDLE,
-                        // and 0x113=BTN_SIDE/0x114=BTN_EXTRA for back/forward), so pass it
-                        // straight through to smithay's pointer.
                         let button = btn;
                         pointer.button(state, &ButtonEvent { button, state: button_state, serial, time });
                         pointer.frame(state);
@@ -2115,10 +2127,6 @@ fn run_wayland_thread(
                     state.render_cursor_on_framebuffer = render_on_framebuffer;
                 }
                 CalloopEvent::Msg(ThreadCommand::RequestIdr) => {
-                    // On-demand keyframe (client reconnect / decoder reset); forces a send +
-                    // IDR even on a static screen. Readback mode goes straight to the encode
-                    // thread's atomic so the request lands on the frame already in flight;
-                    // zero-copy consumes it on the next captured frame as before.
                     if state.encode_pool.is_some() {
                         state.encode_controls.force_idr.store(true, Ordering::Relaxed);
                     } else {
@@ -2126,10 +2134,6 @@ fn run_wayland_thread(
                     }
                 }
                 CalloopEvent::Msg(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps }) => {
-                    // Live rate change (web-UI bitrate/fps sliders), parity with the X11 path.
-                    // Update settings so the frame pacing picks it up on the next tick; a
-                    // zero-copy session reconfigures inline, the encode thread reads the
-                    // controls atomics on its next frame (Release pairs with its Acquire).
                     if let Some(b) = bitrate_kbps { state.settings.video_bitrate_kbps = b; }
                     if let Some(v) = vbv_multiplier { state.settings.video_vbv_multiplier = v; }
                     if let Some(f) = fps { if f > 0.0 { state.settings.target_fps = f; } }
@@ -2152,9 +2156,6 @@ fn run_wayland_thread(
                     c.rate_dirty.store(true, Ordering::Release);
                 }
                 CalloopEvent::Msg(ThreadCommand::UpdateTunables(t)) => {
-                    // Live quality/paint-over/streaming/cursor change: the calloop's own
-                    // per-frame decisions read state.settings, the readback encode thread
-                    // picks the mirror up on its next frame. No restart anywhere.
                     t.apply_to(&mut state.settings);
                     state.render_cursor_on_framebuffer = t.capture_cursor;
                     *state.encode_controls.tunables.lock().unwrap() = Some(t);
@@ -2225,8 +2226,6 @@ fn run_wayland_thread(
             let now = Instant::now();
             let elapsed = now.duration_since(state.last_log_time).as_secs_f64();
             if elapsed >= 1.0 {
-                // Counters + description come from whichever thread owns the encoders
-                // (calloop for zero-copy, the encode thread for readback).
                 let frames = state.encode_stats.frames.swap(0, Ordering::Relaxed);
                 let stripes = state.encode_stats.stripes.swap(0, Ordering::Relaxed);
                 if state.is_capturing && state.settings.debug_logging {
@@ -2249,15 +2248,8 @@ fn run_wayland_thread(
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
-            // READ (don't take) the on-demand IDR request: it's cleared below only where an
-            // encoder actually consumes it, so a request on a skipped frame isn't dropped.
             let requested_idr = state.pending_force_idr;
 
-            // Readback backpressure: reserve the capture buffer BEFORE rendering. When the
-            // encode thread is still busy (slot full or every buffer in flight), skip the
-            // tick entirely -- the calloop stays live for input/control dispatch, compositor
-            // damage accumulates via buffer age, and the retry lands in ~1 ms. This is the
-            // non-blocking analogue of the X11 capture thread's bounded acquire().
             let mut pool_slot: Option<(usize, Vec<u8>)> = None;
             if let Some(ref pool) = state.encode_pool {
                 if !is_memory_throttling {
@@ -2275,15 +2267,12 @@ fn run_wayland_thread(
             );
 
             let mut render_success = false;
-            // GLES render completion fence, consumed by the zero-copy encode below.
             let mut render_sync = None;
             let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
             let width = state.settings.width;
             let height = state.settings.height;
 
             if let Some(output) = state.outputs.first().cloned() {
-                // GLES renders into one fixed offscreen target, so age 1 always holds there;
-                // an animated overlay invalidates everything.
                 let render_age = if state.overlay_state.is_animated() { 0 } else { 1 };
                 if state.use_gpu {
                     if let Some(renderer) = state.gles_renderer.as_mut() {
@@ -2418,13 +2407,6 @@ fn run_wayland_thread(
                                         },
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
-                                    // Readback into the pooled buffer via ExportMem: unlike a raw
-                                    // glReadPixels it re-makes the target current and selects
-                                    // COLOR_ATTACHMENT0 explicitly, so a READ-framebuffer left
-                                    // pointing elsewhere by the render pass can't yield a stale
-                                    // (black) capture. Bytes are RGBA, identical to the old path.
-                                    // On failure the reservation is canceled: skipping a tick is
-                                    // recoverable, publishing a black frame is not.
                                     if pool_slot.is_some() {
                                         use smithay::backend::renderer::ExportMem;
                                         let region = Rectangle::from_size((width, height).into());
@@ -2468,10 +2450,6 @@ fn run_wayland_thread(
                     }
                 } else {
                     if let Some(renderer) = state.pixman_renderer.as_mut() {
-                        // pixman renders INTO the capture buffer, so the target rotates with the
-                        // pool and damage tracking needs each slot's true buffer age (renders
-                        // since that slot was last the target; 0 = never = full redraw). The
-                        // throttle path renders into the retained frame_buffer, always full.
                         let (ptr, buf_age) = match pool_slot {
                             Some((id, ref mut buf)) => {
                                 let age = if state.pool_last_render[id] == 0 {
@@ -2616,9 +2594,6 @@ fn run_wayland_thread(
                                     },
                                     Err(e) => eprintln!("Render error: {:?}", e)
                                 }
-                                // Record which slot this render landed in (throttle renders into
-                                // frame_buffer still advance the sequence: they add a snapshot to
-                                // the damage history, aging the pooled slots truthfully).
                                 state.render_seq += 1;
                                 if render_success {
                                     if let Some((id, _)) = pool_slot {
@@ -2638,18 +2613,10 @@ fn run_wayland_thread(
                     }
 
                     if is_memory_throttling {
-                        // Zero-copy keeps its historical throttle accounting (the IDR request
-                        // stays pending); the readback path made no reservation, and holding
-                        // its frame ids keeps the encode thread's sequence contiguous.
                         if state.encode_pool.is_none() {
                             state.frame_counter = state.frame_counter.wrapping_add(1);
                         }
                     } else if state.encode_pool.is_some() {
-                        // Readback: publish to the encode thread -- CSC, the send/paint-over
-                        // decision, encode and delivery all happen there, overlapped with this
-                        // thread's next render. The IDR request travels via the controls
-                        // atomic (swapped pre-encode), not with the frame: every published
-                        // frame IS encoded, in order (non-dropping pool).
                         if state.pending_screenshot.is_some() {
                             if let Some((_, ref buf)) = pool_slot {
                                 let n = buf.len().min(state.frame_buffer.len());
@@ -2668,9 +2635,6 @@ fn run_wayland_thread(
                             state.frame_counter = state.frame_counter.wrapping_add(1);
                         }
                     } else if let Some(ref mut encoder) = state.video_encoder {
-                        // Zero-copy full-frame H.264: send / paint-over / recovery-IDR decision
-                        // on compositor damage, then a dmabuf encode on this thread (the buffer
-                        // and its EGL context are calloop-affine).
                         let is_animated = state.overlay_state.is_animated();
                         let decision = crate::pipeline::decide_hw_fullframe(
                             &mut state.vaapi_state,
@@ -2685,10 +2649,6 @@ fn run_wayland_thread(
                         let target_qp = decision.target_qp;
 
                         if send_frame {
-                            // NVENC/VA-API read the offscreen dmabuf through CUDA/VA, which
-                            // cannot see the GL command queue: wait the render's sync point
-                            // so the encoder never maps a half-rasterized frame (a mid-frame
-                            // horizontal tear). wait() only errs on signal interrupt; retry.
                             if let Some(sync) = render_sync.take() {
                                 while sync.wait().is_err() {}
                             }
@@ -2719,9 +2679,6 @@ fn run_wayland_thread(
                                 if !data.is_empty() {
                                     state.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
                                     state.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
-                                    // Full-frame H.264 (y_start=0, full height): hand off to the delivery
-                                    // thread. send() blocks the calloop only while the previous frame is
-                                    // still undelivered -- single-slot backpressure, same as X11 publish().
                                     if let Some(ref tx) = state.deliver_tx {
                                         let _ = tx.send(vec![EncodedStripe {
                                             data, data_type: 2, stripe_y_start: 0,
@@ -2733,7 +2690,6 @@ fn run_wayland_thread(
                                 eprintln!("HW Encode Error: {}", e);
                             }
                         }
-                        // Consume the on-demand IDR request only now that an encode pass ran.
                         state.pending_force_idr = false;
                         state.frame_counter = state.frame_counter.wrapping_add(1);
                     }
@@ -2760,15 +2716,12 @@ fn run_wayland_thread(
                     }
                 }
             }
-            // A reservation that never reached publish (render failure, no output) goes back
-            // to the pool; an IDR request stays queued in the controls atomic regardless.
             if let Some((id, buf)) = pool_slot.take() {
                 if let Some(ref pool) = state.encode_pool {
                     pool.cancel(id, buf);
                 }
             }
             let work_elapsed = loop_start_time.elapsed();
-            // Clamp to a positive, finite fps; Duration::from_secs_f64 panics on inf/negative.
             let fps = (if is_memory_throttling { 5.0 } else { state.settings.target_fps }).max(1.0);
             let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
@@ -2803,7 +2756,7 @@ fn run_wayland_thread(
     }).unwrap();
 }
 
-/// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
+/// @brief Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
 /// exposes it read-only via the buffer protocol, so `bytes(frame)` /
 /// `memoryview(frame)` alias the Rust buffer instead of copying. Carries the
 /// four stripe-metadata ints as Python attributes.
@@ -2821,7 +2774,7 @@ struct StripeFrame {
 }
 
 impl StripeFrame {
-    /// Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
+    /// @brief Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
     fn new_owned_meta(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
@@ -2831,8 +2784,8 @@ impl StripeFrame {
 
 #[pymethods]
 impl StripeFrame {
-    // Symmetry/testability: copies the bytes-like into the owned Vec. The hot
-    // path uses `new_owned_meta` (a move) instead.
+    /// @brief Symmetry / testability constructor: copies the bytes-like into the owned `Vec`.
+    /// The hot path uses `new_owned_meta` (a move) instead.
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
     fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
@@ -2843,8 +2796,10 @@ impl StripeFrame {
         self.data.len()
     }
 
-    // PyBuffer_FillInfo INCREFs `slf` into view->obj, pinning the Vec until every
-    // view is released, so memoryviews can outlive the Python `frame` handle.
+    /// @brief Expose the owned bytes read-only through the Python buffer protocol.
+    ///
+    /// `PyBuffer_FillInfo` INCREFs `slf` into `view->obj`, pinning the `Vec` until every view is
+    /// released, so memoryviews can outlive the Python `frame` handle.
     unsafe fn __getbuffer__(
         slf: PyRefMut<'_, Self>,
         view: *mut pyo3::ffi::Py_buffer,
@@ -2855,7 +2810,7 @@ impl StripeFrame {
             slf.as_ptr(),
             slf.data.as_ptr() as *mut std::os::raw::c_void,
             slf.data.len() as pyo3::ffi::Py_ssize_t,
-            1, // readonly
+            1,
             flags,
         );
         if r != 0 {
@@ -2867,7 +2822,11 @@ impl StripeFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-/// Python-exposed class; spawns the Wayland thread on instantiation.
+/// @brief The Python handle to the one long-lived compositor thread. Because calloop, EGL/GBM, and
+/// the Wayland display are all thread-affine and the compositor has to keep running to serve its
+/// clients even between captures, the backend cannot be a passive object that starts work on demand:
+/// constructing it spawns that thread and it stays up for the process lifetime. The struct itself is
+/// nothing but the command-channel sender used to drive that thread across the boundary.
 #[pyclass]
 struct WaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
@@ -2875,6 +2834,10 @@ struct WaylandBackend {
 
 #[pymethods]
 impl WaylandBackend {
+    /// @brief Construct the backend and spawn the long-lived compositor thread, handing it the
+    /// strongest scheduling edge (nice -15) because it drives the calloop, input dispatch, the render
+    /// loop, and — on the zero-copy path — the encode itself, all on this single thread, so any
+    /// scheduling starvation here surfaces directly as dropped or late frames.
     #[new]
     #[pyo3(signature = (width, height, dri_node, auto_gpu_selected = false, cursor_size = -1))]
     fn new(
@@ -2887,17 +2850,19 @@ impl WaylandBackend {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
         let cu_tx = tx.clone();
         thread::spawn(move || {
-            // The calloop thread captures, renders and encodes; give it the strongest edge.
             crate::boost_thread_priority(-15);
             run_wayland_thread(rx, cu_tx, width, height, dri_node, auto_gpu_selected, cursor_size);
         });
         WaylandBackend { tx }
     }
 
+    /// @brief Begin a capture with the given frame callback and settings.
+    ///
+    /// Issuing the start also clears the interpreter-teardown gate: starting from Python proves the
+    /// interpreter is live again after a manual atexit sweep.
     fn start_capture(&self, callback: Py<PyAny>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let rust_settings = extract_settings(settings)?;
 
-        // Starting from Python proves the interpreter is live again after a manual sweep.
         PY_SHUTDOWN.store(false, Ordering::Relaxed);
         self.tx
             .send(ThreadCommand::StartCapture(callback, rust_settings))
@@ -2919,7 +2884,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// @brief cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
     fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::SetClipboardCallback(callback))
@@ -2927,7 +2892,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    /// @brief Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
     fn set_clipboard(&self, mime: String, data: Vec<u8>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::SetClipboard { mime, data })
@@ -2942,7 +2907,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
+    /// @brief Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
     /// owns keysym-to-keycode policy: define keycodes here, then press them via
     /// `inject_key`. Ordered with key events on the one compositor channel.
     fn set_keymap_string(&self, text: String) -> PyResult<()> {
@@ -2952,15 +2917,17 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Return the active xkb keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can build
-    /// a reverse keysym->keycode map from the identical keymap. Empty string if it can't be read.
+    /// @brief Return the active xkb keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can
+    /// build a reverse keysym->keycode map from the identical keymap.
+    ///
+    /// The GIL is released while awaiting the reply, because the Wayland thread can call back into
+    /// Python and would otherwise deadlock; the wait is bounded so a stall cannot hang the caller,
+    /// and an empty string is returned when the keymap cannot be read in time.
     fn get_xkb_keymap_string(&self, py: Python<'_>) -> PyResult<String> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<String>();
         self.tx
             .send(ThreadCommand::GetXkbKeymap { reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request keymap: {}", e)))?;
-        // Release the GIL while waiting (the wayland thread can call back into Python -> deadlock);
-        // move the owned Receiver in (it's Send) and bound the wait so a stall can't hang us.
         let result = py.detach(move || reply_rx.recv_timeout(Duration::from_secs(2)));
         match result {
             Ok(s) => Ok(s),
@@ -3003,7 +2970,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Forces an IDR/keyframe on the next captured frame so a (re)connecting client
+    /// @brief Forces an IDR/keyframe on the next captured frame so a (re)connecting client
     /// or a decoder reset can resume immediately. With the default infinite GOP this
     /// is the only recovery path, so every consumer that can lose decoder state must
     /// call it. No-op cost on the JPEG/software path (keyframes are N/A).
@@ -3014,7 +2981,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the running capture.
+    /// @brief Apply a live bitrate (kbps) / VBV (kb) / framerate change to the running capture.
     fn update_rate(&self, bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps })
@@ -3037,8 +3004,11 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::encoders::software::EncodedStripe;
 
-/// Create a `StripeFrame` from any buffer-like object (bytes/bytearray/memoryview), copying the
-/// bytes in. Module-level helper for constructing a frame from already-encoded data.
+/// @brief Let Python wrap already-encoded bytes back into a `StripeFrame`, for callers that produce or
+/// replay stripe data outside a live capture (tests, re-sends to a late joiner). It copies the
+/// buffer-like input (bytes/bytearray/memoryview) in because the frame owns its bytes; the capture
+/// hot path instead uses `new_owned_meta` to MOVE the encoder's buffer with no copy, so this
+/// copying constructor stays off that path.
 #[pyfunction]
 #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
 fn stripe_frame_from_buffer(
@@ -3051,7 +3021,7 @@ fn stripe_frame_from_buffer(
     StripeFrame::new_owned_meta(data, data_type, stripe_y_start, stripe_height, frame_id)
 }
 
-/// Capture configuration read by `start_capture` (each field by attribute name via
+/// @brief Capture configuration read by `start_capture` (each field by attribute name via
 /// `extract_settings`, so the field names must match exactly). Declared `dict` so callers
 /// can stash extra attributes not listed here.
 #[pyclass(dict)]
@@ -3090,21 +3060,21 @@ struct CaptureSettings {
     #[pyo3(get, set)] video_max_qp: i32,
     #[pyo3(get, set)] auto_adjust_screen_capture_size: bool,
     #[pyo3(get, set)] omit_stripe_headers: bool,
-    // Informational: frames always own their buffers and free on last reference;
-    // consumers set this to signal they hold frames past the callback (zero-copy send).
+    /// Informational: frames always own their buffers and free on last reference;
+    /// consumers set this to signal they hold frames past the callback (zero-copy send).
     #[pyo3(get, set)] deferred_free: bool,
     #[pyo3(get, set)] encode_node_path: Py<PyAny>,
-    // Compositor render node (Wayland): an explicit path wins; empty with auto_gpu
-    // set lets the library pick one; empty without falls back to the encoder node.
+    /// Compositor render node (Wayland): an explicit path wins; empty with auto_gpu
+    /// set lets the library pick one; empty without falls back to the encoder node.
     #[pyo3(get, set)] render_node_path: Py<PyAny>,
-    // Auto-GPU request: "" = off, "true" = first GPU, any other token = first GPU
-    // whose kernel identity matches (vendor name, driver name, DT prefix, PCI id).
+    /// Auto-GPU request: "" = off, "true" = first GPU, any other token = first GPU
+    /// whose kernel identity matches (vendor name, driver name, DT prefix, PCI id).
     #[pyo3(get, set)] auto_gpu: Py<PyAny>,
-    // Backend choice: True/False force Wayland/X11; None follows WAYLAND_DISPLAY.
+    /// Backend choice: True/False force Wayland/X11; None follows WAYLAND_DISPLAY.
     #[pyo3(get, set)] use_wayland: Py<PyAny>,
-    // H.264 recording tap: a Unix socket path to bind, or empty for none.
+    /// H.264 recording tap: a Unix socket path to bind, or empty for none.
     #[pyo3(get, set)] recording_socket: Py<PyAny>,
-    // Compositor cursor-theme size in pixels; <=0 keeps the theme default (24).
+    /// Compositor cursor-theme size in pixels; <=0 keeps the theme default (24).
     #[pyo3(get, set)] cursor_size: i32,
 }
 
@@ -3132,36 +3102,38 @@ impl CaptureSettings {
     }
 }
 
-// ---- Unified backend glue: process-wide Wayland singleton, its owner, and the atexit sweep ----
-
-/// Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
+/// @brief Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
 static WAYLAND_BACKEND: OnceLock<Mutex<Option<Py<WaylandBackend>>>> = OnceLock::new();
-/// Cursor callback registered before the backend exists (selkies registers it pre-start);
+/// @brief Cursor callback registered before the backend exists (selkies registers it pre-start);
 /// applied when the backend is created, which is deferred to capture start so the real
 /// render node (not a placeholder) reaches the compositor.
 static PENDING_CURSOR_CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
-/// Interpreter-teardown gate, set by the atexit sweep: the detached compositor and delivery
+/// @brief Interpreter-teardown gate, set by the atexit sweep: the detached compositor and delivery
 /// threads must never attach to a finalizing interpreter (aborts the process pre-3.13).
 /// Cleared by a fresh capture start (only a live interpreter can start one).
 pub(crate) static PY_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// ScreenCapture id that owns the active shared Wayland capture (0 = none). Only the owner may
+/// @brief ScreenCapture id that owns the active shared Wayland capture (0 = none). Only the owner may
 /// stop it, so an input-only or stale instance can't tear down a live capture.
 static WAYLAND_OWNER: AtomicU64 = AtomicU64::new(0);
-// Real Wayland capture liveness (StartCapture -> true, StopCapture -> false), mirrored
-// from AppState.is_capturing so the Python-facing is_capturing() reports whether the
-// pipeline is actually running, not merely which ScreenCapture owns the backend.
+/// @brief Real Wayland capture liveness (StartCapture -> true, StopCapture -> false), mirrored
+/// from AppState.is_capturing so the Python-facing is_capturing() reports whether the
+/// pipeline is actually running, not merely which ScreenCapture owns the backend.
 static WAYLAND_CAPTURE_ALIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// Monotonic ScreenCapture id source.
+/// @brief Hands each `ScreenCapture` a unique, monotonic id — the token `WAYLAND_OWNER` compares to
+/// decide which instance is allowed to stop the one shared compositor capture. Starts at 1 so 0 can
+/// mean "no owner".
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
-/// Live X11 capture controls, for the atexit sweep.
+/// @brief Registry of every live X11 capture's `Controls`, so the atexit sweep can flag them all to
+/// stop before the interpreter finalizes even after the owning `ScreenCapture` Python handles have
+/// been dropped — without a central registry those captures would have no reachable stop switch.
 static LIVE_X11: OnceLock<Mutex<Vec<Arc<crate::x11::Controls>>>> = OnceLock::new();
 
 fn live_x11() -> &'static Mutex<Vec<Arc<crate::x11::Controls>>> {
     LIVE_X11.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Best-effort nice boost for the calling capture/encode/delivery thread. These threads
+/// @brief Best-effort nice boost for the calling capture/encode/delivery thread. These threads
 /// compete with the very workload being captured, so a scheduling edge keeps frame pacing
 /// steady under load. Requires CAP_SYS_NICE (or root); otherwise EPERM and silently a no-op.
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
@@ -3171,7 +3143,7 @@ pub(crate) fn boost_thread_priority(nice: libc::c_int) {
     }
 }
 
-/// Forward a live rate change to the shared Wayland backend (no-op if none is running).
+/// @brief Forward a live rate change to the shared Wayland backend (no-op if none is running).
 fn wayland_update_rate(
     py: Python<'_>,
     bitrate_kbps: Option<i32>,
@@ -3185,6 +3157,7 @@ fn wayland_update_rate(
     }
 }
 
+/// @brief Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
 fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
@@ -3193,9 +3166,14 @@ fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
     }
 }
 
-/// Get-or-create the singleton Wayland backend (idempotent; first dims + render node win,
-/// capture resizes). Called from capture start (which knows the operator's real node) and
-/// from the import-time bootstrap when the deployment opts into pixelflux-as-compositor.
+/// @brief Get-or-create the singleton Wayland backend (idempotent: the first dimensions and render
+/// node win, and a later capture just resizes).
+///
+/// Called from capture start (which knows the operator's real node) and from the import-time
+/// bootstrap when the deployment opts into pixelflux-as-compositor. The render node is chosen once,
+/// at creation, by precedence: an explicit `render_node_path`, then an `auto_gpu` pick, then the
+/// encoder node (so a caller that sets only one node still renders on that GPU); empty selects the
+/// software renderer.
 fn ensure_wayland_backend(
     py: Python<'_>,
     width: i32,
@@ -3208,9 +3186,6 @@ fn ensure_wayland_backend(
     let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
     let mut g = slot.lock().unwrap();
     if g.is_none() {
-        // Render-node precedence, applied once at backend creation: an explicit
-        // render_node_path, then an auto_gpu pick, then the encoder node (so callers
-        // that only set one node still render on that GPU); empty = software.
         let mut node = (!explicit_node.is_empty()).then_some(explicit_node);
         let mut auto_gpu_selected = false;
         if node.is_none() {
@@ -3234,7 +3209,6 @@ fn ensure_wayland_backend(
             py,
             WaylandBackend::new(width, height, node, auto_gpu_selected, cursor_size),
         )?;
-        // Apply a cursor callback registered before the backend existed.
         if let Some(cb) = PENDING_CURSOR_CALLBACK.lock().unwrap().take() {
             let _ = be.bind(py).borrow().set_cursor_callback(cb);
         }
@@ -3243,7 +3217,7 @@ fn ensure_wayland_backend(
     Ok(g.as_ref().unwrap().clone_ref(py))
 }
 
-/// The live Wayland backend, if any — never creates one. The pre-capture entry points
+/// @brief The live Wayland backend, if any — never creates one. The pre-capture entry points
 /// (input injection, cursor/config setters) use this so they can't lock in a backend
 /// with a placeholder render node.
 fn wayland_backend_running(py: Python<'_>) -> Option<Py<WaylandBackend>> {
@@ -3252,7 +3226,7 @@ fn wayland_backend_running(py: Python<'_>) -> Option<Py<WaylandBackend>> {
     g.as_ref().map(|b| b.clone_ref(py))
 }
 
-/// Backend choice: an explicit `use_wayland` bool in the settings wins (selkies
+/// @brief Backend choice: an explicit `use_wayland` bool in the settings wins (selkies
 /// forwards --wayland / SELKIES_WAYLAND there); when left unset (None), capture
 /// goes through Wayland exactly when the session exposes a WAYLAND_DISPLAY.
 fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
@@ -3266,17 +3240,21 @@ fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
     std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// @brief Mutable per-capture state behind `ScreenCapture`'s mutex: the active backend, the live
+/// X11 controls and thread handle, and the capture / encode thread ids used to detect a re-entrant
+/// stop.
 struct ScState {
-    backend: u8, // 0 = idle, 1 = X11, 2 = Wayland
+    /// 0 = idle, 1 = X11, 2 = Wayland.
+    backend: u8,
     controls: Option<Arc<crate::x11::Controls>>,
     handle: Option<thread::JoinHandle<()>>,
     cap_thread_id: Option<thread::ThreadId>,
-    // The internal encode+deliver thread's id, so a re-entrant stop from inside the delivery
-    // callback (which runs on that thread) is detected and doesn't try to self-join.
+    /// The internal encode+deliver thread's id, so a re-entrant stop from inside the delivery
+    /// callback (which runs on that thread) is detected and doesn't try to self-join.
     encode_thread_id: Option<thread::ThreadId>,
 }
 
-/// Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
+/// @brief Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
 /// shared Wayland backend, chosen at `start_capture` time. Exposes start_capture / stop_capture /
 /// request_idr_frame / update_* / is_capturing, plus the Wayland input-injection methods.
 #[pyclass]
@@ -3286,6 +3264,15 @@ struct ScreenCapture {
 }
 
 impl ScreenCapture {
+    /// @brief Stop this capture: signal the capture thread, drop the live controls, and join.
+    ///
+    /// The path forks on the backend. A **Wayland** capture only tells the shared compositor to
+    /// stop when this instance still owns it — ownership is claimed-and-cleared atomically so a
+    /// stale stop cannot tear down a capture another instance just started. An **X11** capture joins
+    /// its capture thread (which also joins the encode thread), releasing the GIL first because the
+    /// encode thread runs the Python callback and holding the GIL across the join would deadlock. A
+    /// re-entrant stop arriving on the capture or encode thread cannot join itself, so it detaches
+    /// and lets the threads exit on the stop flag.
     fn stop_internal(&self, py: Python<'_>) -> PyResult<()> {
         let (handle, same_thread, backend, controls) = {
             let mut st = self.inner.lock().unwrap();
@@ -3293,7 +3280,6 @@ impl ScreenCapture {
                 c.stop.store(true, Ordering::Relaxed);
             }
             let cur = Some(thread::current().id());
-            // Re-entrant stop from our own capture OR encode/deliver thread: can't join self.
             let same = st.cap_thread_id == cur || st.encode_thread_id == cur;
             let controls = st.controls.take();
             let handle = st.handle.take();
@@ -3307,9 +3293,6 @@ impl ScreenCapture {
             live_x11().lock().unwrap().retain(|x| !Arc::ptr_eq(x, c));
         }
         if backend == 2 {
-            // Wayland: only the owner may stop the shared compositor capture. Claim-and-clear
-            // ownership atomically so a stale stop can't tear down a capture that another instance
-            // just started and took ownership of between our read and our clear.
             if WAYLAND_OWNER
                 .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -3321,12 +3304,7 @@ impl ScreenCapture {
                 }
             }
         } else if let Some(h) = handle {
-            // Joining the capture thread also joins the encode thread (run_capture joins it before
-            // returning). Release the GIL first: the encode thread runs the Python callback, so
-            // holding the GIL across the join would deadlock.
             if same_thread {
-                // Re-entrant stop from the capture or encode thread: can't join self; the threads
-                // exit on the stop flag. Detach.
                 drop(h);
             } else {
                 py.detach(|| {
@@ -3354,17 +3332,23 @@ impl ScreenCapture {
         }
     }
 
-    /// Begin capture. `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
+    /// @brief Begin capture: `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
+    ///
+    /// The backend is chosen from the settings (`want_wayland`). A **Wayland** start delegates to
+    /// the shared backend, distinguishing the compositor RENDER node from the ENCODER node and
+    /// resolving an AUTO_GPU request; restarting this instance's own live Wayland capture skips the
+    /// stop so the calloop can reconfigure the running session in place — keeping a compatible NVENC
+    /// session alive — instead of destroying it and forcing a full rebuild. An **X11** start
+    /// resolves AUTO_GPU to an encoder device when none was chosen explicitly, then spawns the
+    /// capture thread (which internally spawns the encode+deliver thread). The per-frame delivery
+    /// closure makes one GIL acquisition per frame with all stripes batched, and a failed start
+    /// surfaces as a `PyErr` rather than a silent, forever-"capturing" state.
     fn start_capture(
         &self,
         py: Python<'_>,
         settings: &Bound<'_, PyAny>,
         callback: Py<PyAny>,
     ) -> PyResult<()> {
-        // Restarting our own live Wayland capture: skip the stop. The calloop's
-        // StartCapture handler replaces callback/settings/threads on a running capture
-        // and keeps a compatible NVENC session alive by reconfiguring it in place; a
-        // stop first would destroy that session and force a full rebuild.
         let live_wayland_restart = want_wayland(settings)
             && self.inner.lock().unwrap().backend == 2
             && WAYLAND_OWNER.load(Ordering::Relaxed) == self.id
@@ -3375,9 +3359,6 @@ impl ScreenCapture {
         let rs = extract_settings(settings)?;
 
         if want_wayland(settings) {
-            // The compositor RENDER node (render_node_path / auto_gpu) is distinct from
-            // the ENCODER node (encode_node_path); ensure_wayland_backend applies
-            // the precedence between them. Values arrive as utf-8 bytes or str.
             let read_node = |attr: &str| -> Option<String> {
                 settings.getattr(attr).ok().and_then(|o| {
                     o.extract::<String>()
@@ -3408,10 +3389,6 @@ impl ScreenCapture {
             return Ok(());
         }
 
-        // AUTO_GPU on X11: with no explicit encode device chosen (encode_node_index = -2),
-        // resolve the requested GPU to a render node and aim the encoder at it so a
-        // multi-GPU host doesn't silently default to device 0. Explicit --encode-dri /
-        // -1 (software) / >= 0 (device) win.
         let mut rs = rs;
         if rs.encode_node_index < -1 {
             let auto_gpu = settings
@@ -3439,22 +3416,14 @@ impl ScreenCapture {
             }
         }
 
-        // X11 capture: this spawned thread runs the capture loop; run_capture internally spawns an
-        // encode+deliver thread. `controls` carries live request_idr / rate / fps. The delivery
-        // callback runs on the encode thread.
         let controls = Arc::new(crate::x11::Controls::new(&rs));
         live_x11().lock().unwrap().push(controls.clone());
         let c2 = controls.clone();
-        let c3 = controls.clone(); // flag stop when the capture thread exits (Ok OR Err)
+        let c3 = controls.clone();
         let cb = callback;
-        // Captures run_capture's error so a dead start (bad DISPLAY, shm failure) surfaces as a
-        // PyErr below instead of a silent, forever-"capturing" lie.
         let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let err_slot2 = err_slot.clone();
 
-        // Delivery closure (runs on the encode thread): ONE GIL acquisition per FRAME (all stripes
-        // batched) -> StripeFrame -> callback, to cut GIL churn. Errors are printed, never
-        // propagated -- nothing must unwind into the encode loop.
         let on_frame = move |frame: Vec<EncodedStripe>| {
             Python::attach(|py| {
                 for s in frame {
@@ -3479,15 +3448,12 @@ impl ScreenCapture {
             });
         };
 
-        let (tid_tx, tid_rx) = std::sync::mpsc::channel(); // capture thread id
-        let (etid_tx, etid_rx) = std::sync::mpsc::channel(); // encode thread id (from run_capture)
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (etid_tx, etid_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             crate::boost_thread_priority(-15);
             let _ = tid_tx.send(thread::current().id());
             let res = crate::x11::run_capture(rs, c2, etid_tx, on_frame);
-            // Whether run_capture returned Ok (external stop) or Err (setup / mid-run failure),
-            // the capture is dead: mark it stopped so is_capturing reports the truth instead of
-            // lying True forever.
             c3.stop.store(true, Ordering::Release);
             if let Err(e) = res {
                 let msg = e.to_string();
@@ -3497,20 +3463,11 @@ impl ScreenCapture {
                 }
             }
         });
-        // The capture thread sends its id first; the encode id arrives once run_capture spawns it
-        // (bounded wait). Release the GIL across the wait: the encode thread runs the Python
-        // callback, so holding it here could deadlock, and this can block up to ~2s.
         let (tid, etid_res) = py.detach(move || {
             let tid = tid_rx.recv().ok();
             let etid_res = etid_rx.recv_timeout(std::time::Duration::from_secs(2));
             (tid, etid_res)
         });
-        // A live encode thread sends its id as its very first action, so Ok(tid) => it started.
-        // Disconnected => the sender was dropped WITHOUT a send: run_capture returned Err during
-        // setup (bad DISPLAY, shm/xfixes/geometry failure) before spawning the encode thread. That
-        // is a definitive start failure -- join the (finishing) capture thread and raise its
-        // captured error instead of registering a capture that would report is_capturing == True
-        // forever. Only a plain Timeout (thread alive but slow to spawn the encoder) falls through.
         let etid = match etid_res {
             Ok(id) => Some(id),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3561,6 +3518,10 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// @brief Apply a live target-bitrate (kbps) change to the running capture.
+    ///
+    /// On the X11 path the dirty flag is Release-published after the payload store, so the encode
+    /// thread's Acquire read can never observe the flag set against a stale bitrate.
     fn update_video_bitrate(&self, py: Python<'_>, kbps: i32) -> PyResult<()> {
         let (backend, controls) = {
             let st = self.inner.lock().unwrap();
@@ -3569,8 +3530,6 @@ impl ScreenCapture {
         match backend {
             1 => {
                 if let Some(c) = &controls {
-                    // Release-publish the dirty flag AFTER the payload store so the encode thread's
-                    // Acquire read can't observe the flag set with a stale bitrate.
                     c.bitrate_kbps.store(kbps, Ordering::Relaxed);
                     c.rate_dirty.store(true, Ordering::Release);
                 }
@@ -3599,7 +3558,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
+    /// @brief Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
     fn update_vbv_multiplier(&self, py: Python<'_>, multiplier: f64) -> PyResult<()> {
         let (backend, controls) = {
             let st = self.inner.lock().unwrap();
@@ -3619,7 +3578,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// Apply the live-tunable subset of `settings` (quality, paint-over, streaming mode,
+    /// @brief Apply the live-tunable subset of `settings` (quality, paint-over, streaming mode,
     /// cursor overlay, keyframe interval) to the running capture -- no restart, no encoder
     /// re-init. Structural changes (encoder, chroma, RC mode, device) still need a restart.
     fn update_tunables(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -3643,7 +3602,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// Move/resize the live X11 capture region (root-relative). The capture loop drains
+    /// @brief Move/resize the live X11 capture region (root-relative). The capture loop drains
     /// in-flight frames, re-targets its surfaces, and the encoder follows in place where
     /// it can (NVENC reconfigure / stripe re-derive) -- no capture restart. `width`/
     /// `height` <= 0 mean "to the root edge". On Wayland the output IS the capture
@@ -3680,9 +3639,6 @@ impl ScreenCapture {
         }
     }
 
-    // ---- Input injection: via the shared Wayland backend (X11 input lives elsewhere). Dispatch
-    // is tied to an active session, so none of these create the backend (creation fixes the
-    // render node and belongs to start_capture); with no backend they are no-ops. ----
     fn inject_key(&self, py: Python<'_>, scancode: u32, state: u32) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_key(scancode, state))
     }
@@ -3704,13 +3660,16 @@ impl ScreenCapture {
     fn set_cursor_rendering(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_cursor_rendering(enabled))
     }
+    /// @brief Register the client-copy cursor callback, or stash it until the backend exists.
+    ///
+    /// The backend slot lock is held across the check so a concurrent backend creation cannot miss
+    /// the stash; before the backend exists the callback is stored in `PENDING_CURSOR_CALLBACK` and
+    /// applied by `ensure_wayland_backend` at creation.
     fn set_cursor_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        // Hold the slot lock across the check so a concurrent creation can't miss the stash.
         let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
         let g = slot.lock().unwrap();
         match g.as_ref() {
             Some(be) => be.bind(py).borrow().set_cursor_callback(callback),
-            // Pre-start: stash it; ensure_wayland_backend applies it at creation.
             None => {
                 *PENDING_CURSOR_CALLBACK.lock().unwrap() = Some(callback);
                 Ok(())
@@ -3721,7 +3680,7 @@ impl ScreenCapture {
         wayland_backend_running(py)
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))
     }
-    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// @brief cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
     fn set_clipboard_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard_callback(callback),
@@ -3730,7 +3689,7 @@ impl ScreenCapture {
             )),
         }
     }
-    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    /// @brief Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
     fn set_clipboard(&self, py: Python<'_>, mime: String, data: Vec<u8>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard(mime, data),
@@ -3741,11 +3700,13 @@ impl ScreenCapture {
     }
 }
 
+/// @brief Best-effort teardown: flag the capture thread to exit without joining.
+///
+/// Joining would need the GIL (the thread calls back into Python), which `Drop` cannot safely take,
+/// so this only sets the stop flag; the actual join is left to an explicit `stop_capture` or the
+/// atexit sweep.
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
-        // Best-effort: signal the capture thread to exit. Joining needs the GIL (the thread calls
-        // back into Python), which Drop can't safely take, so just flag it; explicit
-        // stop_capture() / the atexit sweep do the joining.
         if let Ok(st) = self.inner.lock() {
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
@@ -3754,7 +3715,7 @@ impl Drop for ScreenCapture {
     }
 }
 
-/// Bring the Wayland compositor socket up before any capture so apps launched early can
+/// @brief Bring the Wayland compositor socket up before any capture so apps launched early can
 /// connect (sets WAYLAND_DISPLAY for children of this process). Idempotent; the running
 /// backend keeps its node/dimensions on later calls. `render_node` is an explicit
 /// /dev/dri/renderD* path; `auto_gpu` is a truthy string or vendor/driver token; empty
@@ -3773,12 +3734,15 @@ fn ensure_wayland_display(
         .map(|_| ())
 }
 
-/// Stop every live X11 capture (registered with atexit). Sets each stop flag and gives the
-/// threads a brief grace period to exit before interpreter finalization tears down Python.
+/// @brief Stop every live capture (registered with atexit) before interpreter finalization.
+///
+/// The interpreter-teardown gate is set first so no detached thread may attach to a finalizing
+/// interpreter, and a never-applied cursor stash is dropped while the GIL is held. Every X11
+/// capture's stop flag is set, and a live Wayland capture is stopped over the command channel (the
+/// compositor thread clears its callback and encoder on `StopCapture`). A brief grace sleep lets
+/// the stops be observed before Python finalizes.
 #[pyfunction]
 fn _stop_all_captures(py: Python<'_>) {
-    // Gate first: from here the interpreter may finalize at any point and no detached thread
-    // may attach to it. Also drop a never-applied cursor stash while the GIL is held.
     PY_SHUTDOWN.store(true, Ordering::Relaxed);
     *PENDING_CURSOR_CALLBACK.lock().unwrap() = None;
     if let Some(slot) = LIVE_X11.get() {
@@ -3786,10 +3750,6 @@ fn _stop_all_captures(py: Python<'_>) {
             c.stop.store(true, Ordering::Relaxed);
         }
     }
-    // A live Wayland capture runs on an unjoined compositor thread that calls the Python frame
-    // callback; stop it (the wayland thread clears its callback + encoder on StopCapture) so it
-    // can't call into a finalizing interpreter and abort/segfault. Best-effort, async via the
-    // command channel; the grace sleep below lets it be observed before finalization.
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
             let _ = be.bind(py).borrow().stop_capture();
@@ -3800,6 +3760,8 @@ fn _stop_all_captures(py: Python<'_>) {
     py.detach(|| std::thread::sleep(Duration::from_millis(50)));
 }
 
+/// @brief The `pixelflux` Python module: registers the exported classes and functions, and hooks
+/// `_stop_all_captures` into `atexit` so every live capture is stopped before interpreter shutdown.
 #[pymodule]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WaylandBackend>()?;
@@ -3809,8 +3771,6 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
-    // Register _stop_all_captures with atexit so every live capture is stopped before
-    // interpreter shutdown, ensuring no capture thread calls into Python during finalization.
     if let Ok(atexit) = m.py().import("atexit") {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));
     }
@@ -3845,7 +3805,6 @@ mod wl_frame_pool_tests {
         assert_ne!(a, b);
         assert!(p.try_begin().is_none(), "free list exhausted");
         p.publish(frame(a, abuf, 0));
-        // Slot full: even though nothing else is reserved, begin must refuse.
         p.cancel(b, bbuf);
         assert!(p.try_begin().is_none(), "slot occupied blocks begin");
         let f = p.take().expect("published frame");
@@ -3875,7 +3834,6 @@ mod wl_frame_pool_tests {
                 thread::sleep(Duration::from_micros(50));
             }
         }
-        // Give the consumer time to drain the last frame before shutdown.
         thread::sleep(Duration::from_millis(50));
         p.shutdown();
         let seen = consumer.join().unwrap();
@@ -3933,8 +3891,8 @@ mod auto_gpu_token_tests {
     #[test]
     fn vendor_names_and_raw_ids_match_pci_identity() {
         let nv = pci("nouveau", 0x10de);
-        assert!(card_matches_token("nvidia", &nv)); // name, despite nouveau driver
-        assert!(card_matches_token("0x10de", &nv)); // raw hex
+        assert!(card_matches_token("nvidia", &nv));
+        assert!(card_matches_token("0x10de", &nv));
         assert!(card_matches_token("10de", &nv));
         assert!(!card_matches_token("amd", &nv));
         assert!(card_matches_token("ati", &pci("radeon", 0x1002)));
@@ -3943,9 +3901,9 @@ mod auto_gpu_token_tests {
     #[test]
     fn devicetree_prefixes_match_literally_and_via_aliases() {
         let mali = dt("panfrost", &["rockchip,rk3399-mali", "arm,mali-t860"]);
-        assert!(card_matches_token("rockchip", &mali)); // literal prefix, no table
+        assert!(card_matches_token("rockchip", &mali));
         assert!(card_matches_token("arm", &mali));
-        assert!(card_matches_token("mali", &mali)); // alias -> arm
+        assert!(card_matches_token("mali", &mali));
         let adreno = dt("msm", &["qcom,adreno-630", "qcom,adreno"]);
         assert!(card_matches_token("qcom", &adreno));
         assert!(card_matches_token("qualcomm", &adreno));

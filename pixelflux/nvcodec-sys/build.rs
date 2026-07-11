@@ -12,13 +12,42 @@
 //! (`NV_ENC_*_VER`) and the `static const GUID` codec/preset GUIDs are extracted from the header
 //! with regexes and appended -- mirroring how the upstream SDK defines them.
 
+/// @brief Regenerates the committed `src/bindgen/{nvenc,cuda}.rs` FFI bindings from the NVIDIA
+/// SDK and CUDA toolkit headers; this is the only path in the crate that needs bindgen or
+/// libclang, and it only runs under the `regen` feature.
+///
+/// 1. **NVENC bindings**: runs bindgen over the bundled `headers/nvEncodeAPI.h`, allowlisting the
+///    `NV.*` types, `Nv.*` functions, and `NVENC.*` / `NV_MAX.*` vars, and writes the result to
+///    `src/bindgen/nvenc.rs`. A handful of driver-facing enums (`_NVENCSTATUS`,
+///    `_NV_ENC_PIC_TYPE`, `_NV_ENC_PIC_STRUCT`, `_NV_ENC_PARAMS_FRAME_FIELD_MODE`,
+///    `_NV_ENC_PARAMS_RC_MODE`, `_NV_ENC_MULTI_PASS`, `_NV_ENC_MV_PRECISION`) are newtyped rather
+///    than rustified: their values arrive from the installed driver -- as return codes, or written
+///    into structs pixelflux later reads -- so an out-of-range discriminant (legal from a driver
+///    newer than this header) would be UB in a rustified enum, and some of these have no zero
+///    variant for the zero-filling `Default` bindgen derives for rustified enums.
+///
+/// 2. **NVENC struct-version constants and GUIDs**: bindgen does not expand function-like macros,
+///    so the `NV_ENC_*_VER` struct-version constants and the `static const GUID` codec/preset
+///    GUIDs are recovered by regexing the raw header text and appended to `nvenc.rs` as plain
+///    Rust `const`s, mirroring how the SDK headers define them. The struct-version regex captures
+///    just the shift count out of the header's `( 1u<<31 )` high-bit term, since that C literal
+///    (the `1u` suffix) isn't valid Rust and only the shift is needed to re-emit it.
+///
+/// 3. **CUDA bindings**: regenerated only when `CUDA_PATH` is set, since the toolkit's `cuda.h` is
+///    large, version-specific, and not bundled; without it the already-committed `cuda.rs` is left
+///    untouched. Generation is restricted to the 31 functions pixelflux's NVENC path actually
+///    calls, and applies the same newtype treatment -- and for the same UB-avoidance reason -- to
+///    `cudaError_enum` and `CUmemorytype_enum`.
+///
+/// 4. **Cargo directives**: reruns on changes to the NVENC header, this build script, or the
+///    `CUDA_PATH` environment variable, and emits a `cargo:warning` when `CUDA_PATH` is unset so
+///    it's visible that the CUDA bindings stayed on the committed version.
 #[cfg(feature = "regen")]
 fn main() -> std::io::Result<()> {
     use std::io::Write;
     let out = std::path::PathBuf::from("src/bindgen");
     std::fs::create_dir_all(&out)?;
 
-    // ---- NVENC ----
     let nvenc_header = "headers/nvEncodeAPI.h";
     let nvenc_out = out.join("nvenc.rs");
     bindgen::builder()
@@ -30,10 +59,6 @@ fn main() -> std::io::Result<()> {
         .allowlist_var("NV_MAX.*")
         .size_t_is_usize(true)
         .default_enum_style(bindgen::EnumVariation::Rust { non_exhaustive: false })
-        // Newtype (not rustified) for enums whose values arrive from the driver -- as return
-        // codes or in structs it fills that we then read/copy -- and for zero-less enums the
-        // generated zero-filling Default impls materialize: an out-of-range discriminant in a
-        // rustified enum is UB, and a newer driver may legally send codes this header predates.
         .newtype_enum("_NVENCSTATUS")
         .newtype_enum("_NV_ENC_PIC_TYPE")
         .newtype_enum("_NV_ENC_PIC_STRUCT")
@@ -54,8 +79,6 @@ fn main() -> std::io::Result<()> {
     let mut extra = String::from(
         "\nconst fn nv_struct_version(ver: u32) -> u32 {\n    NVENCAPI_VERSION | ((ver) << 16) | (0x7 << 28)\n}\n",
     );
-    // The high-bit OR term is written `( 1u<<31 )` in the SDK headers; capture just the shift
-    // count so it can be re-emitted as a valid Rust literal (the C `1u` suffix is not Rust).
     let ver_re = regex::Regex::new(
         r"#define\s+([A-Z_]+)\s+\(?NVENCAPI_STRUCT_VERSION\((\d+)\)(?:\s*\|\s*\(\s*1u?\s*<<\s*(\d+)\s*\))?\s*\)?",
     )
@@ -90,11 +113,6 @@ fn main() -> std::io::Result<()> {
         .open(&nvenc_out)?
         .write_all(extra.as_bytes())?;
 
-    // ---- CUDA driver (subset used by NVENC) ----
-    // The CUDA Driver API header ships with the CUDA toolkit (large, version-specific), so we do
-    // NOT bundle it. Regenerate cuda.rs from $CUDA_PATH/include/cuda.h when the toolkit is present;
-    // otherwise keep the committed binding (the NVENC regen above is self-contained). The 31-symbol
-    // subset below is exactly what pixelflux's NVENC path links.
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_header = format!("{}/include/cuda.h", cuda_path);
         let cuda_funcs = [
@@ -113,8 +131,6 @@ fn main() -> std::io::Result<()> {
             .parse_callbacks(Box::new(bindgen::CargoCallbacks))
             .size_t_is_usize(true)
             .default_enum_style(bindgen::EnumVariation::Rust { non_exhaustive: false })
-            // Same UB guard: CUresult comes back from the driver (and may postdate this
-            // header); CUmemorytype has no zero value yet is zero-filled by Default.
             .newtype_enum("cudaError_enum")
             .newtype_enum("CUmemorytype_enum")
             .generate_comments(false)
@@ -142,5 +158,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// @brief No-op build script for ordinary builds: the committed `src/bindgen/*.rs` bindings are
+/// compiled as-is without invoking bindgen.
 #[cfg(not(feature = "regen"))]
 fn main() {}

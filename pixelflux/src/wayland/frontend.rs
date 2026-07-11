@@ -4,6 +4,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! @brief Headless Smithay compositor that stands in for a real display server so ordinary Wayland
+//! clients have somewhere to render — their composited output is exactly what the capture pipeline
+//! reads back and H.264-encodes. There is no monitor, KMS, or libinput in this process, so
+//! everything a desktop session normally receives from hardware — an output to map windows onto, a
+//! seat to deliver input to, a clipboard to share — this frontend has to synthesize itself.
+//!
+//! This module owns [`AppState`], the single context threaded through every Smithay protocol
+//! handler, and implements those handlers: `wl_compositor` commit handling with the window
+//! map/configure/focus state machine, seat/keyboard/pointer/touch routing through [`FocusTarget`],
+//! clipboard and primary-selection bridging to Python, and the xdg-shell / layer-shell /
+//! xdg-activation / decoration / fractional-scale / dmabuf wiring. It also resolves cursor images
+//! to PNG for the Python callback and provides the serial and monotonic-time helpers the input
+//! path stamps onto events.
+
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Cursor as IoCursor;
@@ -124,10 +138,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+/// @brief Hand out the next unique, monotonically increasing Wayland event serial. Wayland tags
+/// each event — and the requests that event authorizes — with a serial so both the client and
+/// Smithay can prove a request was caused by a specific event: a popup grab or a selection change is
+/// honored only if it carries the serial of the input event that triggered it. Every injected input
+/// event therefore has to draw a fresh value from this one process-wide counter.
 pub fn next_serial() -> Serial {
     Serial::from(SERIAL_COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
+/// @brief Millisecond timestamp for a pointer / keyboard / touch event. Wayland stamps every input
+/// event with a time that clients rely on to order events relative to one another and to time
+/// interactions such as double-click and drag thresholds, and the protocol fixes that field to a
+/// `u32` millisecond count — so this samples `CLOCK_MONOTONIC` and wraps it into exactly that domain.
 pub fn wayland_time() -> u32 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
@@ -136,6 +159,10 @@ pub fn wayland_time() -> u32 {
     (ts.tv_sec as u32).wrapping_mul(1000).wrapping_add((ts.tv_nsec as u32) / 1_000_000)
 }
 
+/// @brief Microsecond timestamp for relative-pointer motion. Relative motion — the raw-delta path
+/// used by pointer-locked games and similar consumers — carries a higher-resolution `u64`
+/// microsecond time than the millisecond input clock so that sub-frame motion deltas stay
+/// distinguishable; this samples `CLOCK_MONOTONIC` at that finer resolution.
 pub fn wayland_utime() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
@@ -144,15 +171,53 @@ pub fn wayland_utime() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
 }
 
-/// The active hardware encoder session, if any.
+/// @brief The one hardware H.264 encoder session backing a capture. Only a single GPU backend is
+/// ever live for a given capture, and VA-API and NVENC expose entirely different session types, so
+/// this enum is what lets the render and delivery code pass around "the hardware encoder" without
+/// caring which vendor path actually produced the frames.
 #[allow(clippy::large_enum_variant)]
 pub enum GpuEncoder {
     Vaapi(VaapiEncoder),
     Nvenc(NvencEncoder),
 }
 
-/// Central context passed to all Smithay handlers; owns the Wayland globals,
-/// the GBM/EGL renderer state, and the encode pipeline state.
+/// @brief Central context threaded through every Smithay handler; owns the Wayland globals, the
+/// GBM/EGL (or pixman) renderer state, and the capture/encode pipeline state.
+///
+/// A single `AppState` lives for the whole compositor thread and is mutated in place by the
+/// calloop event sources (client dispatch, input injection, the capture timer). The non-obvious
+/// fields encode the pipeline's threading and buffer strategy:
+///
+/// 1. **Render / encode targets**:
+///    - **`video_encoder`**: the zero-copy GPU session only (GLES render + same-GPU dmabuf
+///      encode). Its EGL/dmabuf handles are calloop-affine, so this encoder runs inline on the
+///      calloop thread; it is `None` whenever a readback path is active.
+///    - **`encode_pool` / `encode_join`**: the readback capture||encode split. The calloop renders
+///      and reads back into a pooled host buffer and publishes it, while a separate encode thread
+///      owns the CPU / cross-GPU / pixman-HW encoders. `encode_join` returns that thread's hardware
+///      session on shutdown so a restart can reconfigure it in place rather than rebuild it. Both
+///      are `None` while a zero-copy GPU session runs.
+///    - **`frame_buffer`**: scratch render target used only by the pixman memory-throttle path; the
+///      normal readback path renders and reads back into the pooled buffers instead.
+///    - **`pool_last_render` / `render_seq`**: buffer-age bookkeeping for the pixman path, which
+///      renders directly into the pooled buffers (an age is "renders since this slot was last the
+///      target"). The GLES path renders into one fixed offscreen buffer and never consults these.
+///
+/// 2. **Delivery** (`deliver_tx` / `deliver_join`): encoded frames go to a dedicated delivery
+///    thread over a capacity-1 rendezvous channel, mirroring the X11 single-slot FramePool
+///    (non-dropping, ordered, at most one frame of blocking backpressure), so a slow GIL-holding
+///    Python callback can never stall input/control dispatch on the calloop thread.
+///
+/// 3. **Keyframes** (`pending_force_idr`): set by an IDR request (client reconnect / decoder reset)
+///    and consumed once on the next captured frame to force an immediate keyframe.
+///
+/// 4. **Clipboard** (`pending_clipboard_read`): stages the mime chosen in `new_selection`; the loop
+///    drains it only after the dispatch that stores the new client source, so the read targets the
+///    new selection rather than the previous one.
+///
+/// 5. **GPU selection** (`auto_gpu_selected`): records that automatic (not explicit) selection
+///    picked `render_node_path`, so `StartCapture` aims the encoder at that same node unless a
+///    device was chosen explicitly.
 pub struct AppState {
     pub compositor_state: CompositorState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -181,8 +246,6 @@ pub struct AppState {
     pub xdg_activation_state: XdgActivationState,
     pub primary_selection_state: PrimarySelectionState,
     pub popups: PopupManager,
-    // Render target for the pixman memory-throttle path only; normal readback capture
-    // renders/reads back into pooled buffers owned by `encode_pool`.
     pub frame_buffer: Vec<u8>,
 
     pub gles_renderer: Option<GlesRenderer>,
@@ -196,8 +259,6 @@ pub struct AppState {
     pub callback: Option<Py<PyAny>>,
     pub cursor_callback: Option<Py<PyAny>>,
     pub clipboard_callback: Option<Py<PyAny>>,
-    // Mime staged by new_selection; the loop drains it AFTER the dispatch that
-    // stores the new source (requesting inside the handler reads the OLD selection).
     pub pending_clipboard_read: Option<String>,
 
     pub last_log_time: Instant,
@@ -205,15 +266,9 @@ pub struct AppState {
     pub clock: Clock<Monotonic>,
 
     pub frame_counter: u16,
-    // Set by ThreadCommand::RequestIdr (client reconnect / decoder reset),
-    // consumed once on the next captured frame to force an immediate keyframe.
     pub pending_force_idr: bool,
     pub use_gpu: bool,
 
-    // ZERO-COPY GPU session only (GLES render + same-GPU dmabuf encode); its EGL/dmabuf
-    // handles are calloop-affine, so this encoder runs inline. Every readback path (CPU
-    // encoders, cross-GPU or pixman HW sessions) instead runs on the encode thread behind
-    // `encode_pool`, so the calloop overlaps the next render with the current encode.
     pub video_encoder: Option<GpuEncoder>,
     pub vaapi_state: StripeState,
     pub cursor_helper: Cursor,
@@ -230,31 +285,22 @@ pub struct AppState {
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
-    // True when auto-GPU selection (not an explicit path) picked render_node_path;
-    // StartCapture then aims the encoder at the same node unless one was chosen.
     pub auto_gpu_selected: bool,
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
-    // Encoded frames are handed to a dedicated delivery thread (not the calloop thread) so a slow,
-    // GIL-holding Python callback can't stall input/control dispatch. Capacity-1 rendezvous mirrors
-    // the X11 FramePool single slot: non-dropping, ordered, <=1 frame of blocking backpressure.
     pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
     pub deliver_join: Option<std::thread::JoinHandle<()>>,
-    // Readback capture||encode split: the calloop renders/reads back into a pooled host
-    // buffer and publishes it; the encode thread owns the encoders (wayland_encode_loop).
-    // None while a zero-copy GPU session runs. The join hands the thread's HW session
-    // back so a restart can reconfigure it in place instead of rebuilding it.
     pub encode_pool: Option<Arc<crate::WlFramePool>>,
     pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
     pub encode_controls: Arc<crate::WlEncodeControls>,
     pub encode_stats: Arc<crate::WlEncodeStats>,
-    // Buffer-age bookkeeping for the pixman path, which renders INTO the pooled buffers:
-    // ages are "renders since this slot was last the target". GLES renders into one fixed
-    // offscreen buffer and never consults these.
     pub pool_last_render: Vec<u64>,
     pub render_seq: u64,
     pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
+/// @brief Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
+/// confinement region, so activation and cursor-position hints are accepted as no-ops; the global
+/// still exists so clients may bind it without error.
 impl PointerConstraintsHandler for AppState {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
@@ -266,12 +312,20 @@ impl PointerConstraintsHandler for AppState {
     ) {}
 }
 
+/// @brief Foreign-toplevel-list protocol: exposes the managed state so Smithay can advertise each
+/// toplevel (title / app-id) to listing clients such as taskbars.
 impl ForeignToplevelListHandler for AppState {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
         &mut self.foreign_toplevel_list
     }
 }
 
+/// @brief xdg-activation protocol: hands out activation tokens and, on redemption, raises the
+/// target window.
+///
+/// `token_created` accepts every token. `request_activation` honors a token only while it is fresh
+/// (issued less than 10 seconds ago) so a stale or replayed token cannot steal focus, then raises
+/// the window whose surface matches to the top of the space.
 impl XdgActivationHandler for AppState {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
@@ -296,12 +350,25 @@ impl XdgActivationHandler for AppState {
     }
 }
 
+/// @brief Carry the X11-style primary selection so middle-click paste works between clients.
+/// Exposing the managed state lets Smithay record which client currently owns the primary selection;
+/// `focus_changed` then keeps that ownership tracking keyboard focus, so a middle-click pastes from
+/// whichever client the user is actually working in.
 impl PrimarySelectionHandler for AppState {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
     }
 }
 
+/// @brief Default every toplevel to server-side decorations so clients don't bake their own title
+/// bars and borders into the captured image.
+///
+/// The frontend shows fullscreen application content with no window-manager chrome, so a client
+/// left to draw client-side decorations would paint a stray title bar straight into the encoded
+/// frame. Pinning the negotiation to `Mode::ServerSide` (in `new_decoration`, and again when a
+/// client unsets its preference in `unset_mode`) hands decoration duty to the compositor — which
+/// draws none — leaving clean, borderless output; `request_mode` still grants a mode a client
+/// explicitly insists on. Each path acknowledges with a configure.
 impl XdgDecorationHandler for AppState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
@@ -325,6 +392,11 @@ impl XdgDecorationHandler for AppState {
     }
 }
 
+/// @brief wlr-layer-shell protocol: places panels / overlays / backgrounds (layer surfaces).
+///
+/// `new_layer_surface` resolves the requested output (or the first output), configures the surface
+/// to that output's full pixel size, and maps it into the output's layer map so the render loop
+/// composites it in the correct z-order. `layer_destroyed` needs no action here.
 impl WlrLayerShellHandler for AppState {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
@@ -359,6 +431,8 @@ impl WlrLayerShellHandler for AppState {
     fn layer_destroyed(&mut self, _surface: WlrLayerSurface) {}
 }
 
+/// @brief Core `wl_compositor` protocol: per-surface commit handling plus the window
+/// map/configure/focus state machine.
 impl CompositorHandler for AppState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -367,7 +441,37 @@ impl CompositorHandler for AppState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-    // Also maps newly-ready toplevels and sets their initial config + focus.
+    /// @brief Fold a client's `wl_surface.commit` into compositor state and — the reason the window
+    /// logic lives in this handler — walk a brand-new toplevel through the xdg-shell handshake it
+    /// must finish before it may be shown.
+    ///
+    /// A window cannot just appear on its first commit: xdg-shell requires the compositor to send an
+    /// initial configure (telling the client the size and state to draw at) and the client to ack it
+    /// and commit a buffer matching that size before the surface counts as mapped. Mapping earlier
+    /// would flash an unconfigured, wrongly-sized window into the captured frame. So a pending
+    /// toplevel is carried across two commits instead of one, while everything else here is
+    /// per-commit housekeeping that must run whether or not a map is in flight. On each commit, in
+    /// order:
+    ///
+    /// 1. **Buffer intake**: `on_commit_buffer_handler` ingests the newly attached buffer.
+    /// 2. **Layer relayout**: if the surface is a mapped layer surface, re-arrange the output's
+    ///    layer map so geometry tracks the new content.
+    /// 3. **Cursor refresh**: if the surface backs the current cursor, re-send its image so a client
+    ///    animating its own cursor surface is reflected downstream.
+    /// 4. **Foreign-toplevel metadata**: push the current title / app-id to the foreign-toplevel
+    ///    handle for taskbar-style clients.
+    /// 5. **Window on-commit**: forward the commit to the matching mapped `Window`.
+    /// 6. **Two-phase map of a pending toplevel**:
+    ///    - **First commit — no initial configure sent yet**: this commit is the client announcing
+    ///      it wants to be shown, so compute the logical size from the output mode/scale (falling
+    ///      back to the settings resolution), send a fullscreen + activated configure, and re-queue
+    ///      the window to wait for the client's acked commit — nothing is mapped yet.
+    ///    - **Acked commit — the client has drawn to that configure**: map the element at the origin,
+    ///      refresh its cached bounding box *before* reading geometry (so the drift check sees
+    ///      current geometry and doesn't fire a redundant configure), enter the output, and, only if
+    ///      the client's geometry still drifts more than a pixel from the expected fullscreen size,
+    ///      send one corrective configure. Finally give the new window keyboard focus so input lands
+    ///      on it at once.
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
@@ -457,7 +561,6 @@ impl CompositorHandler for AppState {
                 self.pending_windows.push(window);
             } else {
                 self.space.map_element(window.clone(), (0, 0), true);
-                // Refresh the cached bbox before reading geometry() (avoids a redundant configure).
                 window.on_commit();
 
                 if let Some(output) = self.outputs.first() {
@@ -493,9 +596,15 @@ impl CompositorHandler for AppState {
 
 
 impl AppState {
-    /// Drain a selection read staged by new_selection: ask the (now current)
-    /// client source to write into a pipe and hand (mime, bytes) to Python
-    /// from a reader thread.
+    /// @brief Drain a clipboard read staged by `new_selection` and hand `(mime, bytes)` to the
+    /// Python callback off-thread.
+    ///
+    /// Runs from the loop *after* the dispatch that stored the new client source, so the request
+    /// targets the current selection rather than the previous one. It clones the callback, opens a
+    /// pipe, and asks the owning client source to write the chosen mime into the pipe's writer. A
+    /// spawned reader thread then reads the response — capped at 64 MiB so a hostile client cannot
+    /// balloon memory — and, unless the interpreter is finalizing, delivers the bytes to Python. The
+    /// `PY_SHUTDOWN` checks keep this off a shutting-down interpreter.
     pub(crate) fn process_pending_clipboard_read(&mut self) {
         let Some(mime) = self.pending_clipboard_read.take() else { return };
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -517,7 +626,6 @@ impl AppState {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = Vec::new();
-            // Bound the read so a hostile client can't balloon memory.
             if (&reader).take(64 * 1024 * 1024).read_to_end(&mut buf).is_err() || buf.is_empty() {
                 return;
             }
@@ -532,12 +640,34 @@ impl AppState {
     }
 
 
-    // Resolves a CursorImageStatus (named / hidden / surface-backed) to PNG bytes
-    // plus hotspot and invokes the Python cursor callback.
-    // pub(crate): also invoked from the calloop command handlers in lib.rs to replay the retained
-    // cursor when a callback (re)registers or a capture (re)starts.
+    /// @brief Resolve a `CursorImageStatus` to PNG bytes plus hotspot and invoke the Python cursor
+    /// callback. Also re-invoked from the calloop command handlers to replay the retained cursor
+    /// when a callback re-registers or a capture restarts.
+    ///
+    /// Dispatches on the cursor status:
+    ///
+    /// 1. **Named**: look the themed cursor up by CSS name and emit its cached PNG (`"png"`), or
+    ///    `"error"` if the theme lacks it.
+    /// 2. **Hidden**: emit `"hide"` — the only message allowed through with empty data, since an
+    ///    intentional pointer hide must blank the consumer's cursor.
+    /// 3. **Surface** (a client-supplied cursor sprite): ignore any surface without the
+    ///    `cursor_image` role, read the hotspot, then read the backing buffer by one of two paths:
+    ///    - **SHM**: hash only the sprite's sub-region — width/height/stride/offset/format plus the
+    ///      pixel span — because many sprites share one pool and differ only by `offset`, so hashing
+    ///      the whole pool would collide. On a cache miss (and only when ≤128×128) convert the
+    ///      BGRA/XRGB pixels to RGBA and PNG-encode; `Xrgb8888` has no alpha so byte 3 is forced
+    ///      opaque, and stride/offset are clamped non-negative with checked arithmetic so a garbage
+    ///      descriptor skips pixels instead of panicking.
+    ///    - **dmabuf** (`NotManaged`): bind it to the GLES renderer, copy the framebuffer to
+    ///      `Abgr8888`, map it back, and PNG-encode using the derived readback stride.
+    ///    The PNG cache is bounded at 100 entries by arbitrary eviction; content-hashing means an
+    ///    evicted sprite simply re-inserts on the next render.
+    ///
+    /// A surface whose buffer could not be read yields `("surface", empty)`, which the final gate
+    /// suppresses — Python is called only for non-empty data or `"hide"` — so a transient read miss
+    /// (common during a stop/start replay) preserves the consumer's last cursor instead of blanking
+    /// it. `PY_SHUTDOWN` gates the whole call off a finalizing interpreter.
     pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
-        // Teardown gate: never attach to a finalizing interpreter from this thread.
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -600,9 +730,6 @@ impl AppState {
                         let shm_result = with_buffer_contents(&buffer, |ptr, len, spec| {
                             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
                             let mut hasher = DefaultHasher::new();
-                            // Hash only the cursor's sub-region (and its geometry/format), not the
-                            // whole pool: multiple sprites can share one pool and differ only by
-                            // `offset`, which would otherwise collide to the same cached PNG.
                             spec.width.hash(&mut hasher);
                             spec.height.hash(&mut hasher);
                             spec.stride.hash(&mut hasher);
@@ -624,9 +751,6 @@ impl AppState {
                                 } else {
                                     if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
                                         let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
-                                        // Clamp client-supplied stride/offset to non-negative and use
-                                        // checked arithmetic: a garbage descriptor must skip pixels, not
-                                        // panic (a negative i32 cast to usize wraps; offset+4 can overflow).
                                         let stride_usize = stride.max(0) as usize;
                                         let base_offset = buf_offset.max(0) as usize;
 
@@ -641,7 +765,6 @@ impl AppState {
                                                     None => continue,
                                                 };
                                                 if offset.checked_add(4).is_some_and(|end| end <= raw_bytes.len()) {
-                                                    // Xrgb8888 has no alpha; byte 3 is padding.
                                                     let alpha = if format == wl_shm::Format::Xrgb8888 {
                                                         255
                                                     } else {
@@ -662,8 +785,6 @@ impl AppState {
                                             self.cursor_cache.insert(hash, bytes.clone());
                                             final_png = bytes;
                                             if self.cursor_cache.len() > 100 {
-                                                // Evict an arbitrary entry to bound the cache; content-hash
-                                                // memoization means a re-render simply re-inserts if needed.
                                                 let evict = *self.cursor_cache.keys().next().unwrap();
                                                 self.cursor_cache.remove(&evict);
                                             }
@@ -718,10 +839,10 @@ impl AppState {
                                                      let offset = (y as usize * stride_usize) + (x as usize * 4);
                                                      if offset + 4 <= raw_bytes.len() {
                                                          img_buf.put_pixel(x, y, Rgba([
-                                                             raw_bytes[offset],     // R
-                                                             raw_bytes[offset + 1], // G
-                                                             raw_bytes[offset + 2], // B
-                                                             raw_bytes[offset + 3]  // A
+                                                             raw_bytes[offset],
+                                                             raw_bytes[offset + 1],
+                                                             raw_bytes[offset + 2],
+                                                             raw_bytes[offset + 3]
                                                          ]));
                                                      }
                                                  }
@@ -732,8 +853,6 @@ impl AppState {
                                                  self.cursor_cache.insert(hash, bytes.clone());
                                                  final_png = bytes;
                                                  if self.cursor_cache.len() > 100 {
-                                                     // Evict an arbitrary entry to bound the cache; content-hash
-                                                     // memoization means a re-render simply re-inserts if needed.
                                                      let evict = *self.cursor_cache.keys().next().unwrap();
                                                      self.cursor_cache.remove(&evict);
                                                  }
@@ -751,9 +870,6 @@ impl AppState {
                     if !final_png.is_empty() {
                         ("png", final_png, hot_x, hot_y)
                     } else {
-                        // Transient: the surface's buffer wasn't readable (common during a
-                        // stop/start replay). An intentional pointer hide arrives as Hidden,
-                        // so suppress this instead of blanking the consumer's last cursor.
                         ("surface", Vec::new(), 0, 0)
                     }
                 }
@@ -769,7 +885,8 @@ impl AppState {
     }
 }
 
-// Clipboard mimes we can hand to Python, most specific first.
+/// @brief Clipboard mime types the bridge can hand to Python, most specific first; `new_selection`
+/// picks the first of these that the client's source offers.
 const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -782,18 +899,26 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "TEXT",
 ];
 
+/// @brief Selection (clipboard) bridge between Wayland clients and Python. `SelectionUserData` is
+/// the Python-owned payload `(mime, bytes)` served to pasting clients when Python holds the
+/// selection.
 impl SelectionHandler for AppState {
-    // Server-set selection payload: (mime, bytes) served to pasting clients.
     type SelectionUserData = std::sync::Arc<(String, Vec<u8>)>;
 
+    /// @brief A client took the clipboard: pick the best offered mime and stage it for the loop to
+    /// read.
+    ///
+    /// Only client-owned clipboard (not primary) selections are relayed to Python. Among the
+    /// source's offered mimes it chooses the most specific match from `CLIPBOARD_MIME_PREFERENCE`
+    /// and records it in `pending_clipboard_read`. The read itself is deferred: the new source is
+    /// stored only after this handler returns, so `process_pending_clipboard_read` runs
+    /// post-dispatch and reads the new selection rather than the previous one.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
         seat: Seat<Self>,
     ) {
-        // A client app copied: read the offer off-thread and hand (mime, bytes)
-        // to the Python callback. Server-set selections don't come through here.
         if ty != SelectionTarget::Clipboard {
             return;
         }
@@ -812,12 +937,12 @@ impl SelectionHandler for AppState {
         else {
             return;
         };
-        // The new source is stored only after this handler returns; the loop's
-        // post-dispatch drain performs the actual read.
         self.pending_clipboard_read = Some(mime);
         let _ = seat;
     }
 
+    /// @brief A client pastes the Python-owned selection: stream the stored bytes into the client's
+    /// fd on a spawned thread, since the receiving pipe may backpressure.
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
@@ -826,8 +951,6 @@ impl SelectionHandler for AppState {
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
-        // A client pastes the server-set selection: stream our bytes into its fd
-        // off-thread (the pipe may backpressure).
         if ty != SelectionTarget::Clipboard {
             return;
         }
@@ -840,27 +963,40 @@ impl SelectionHandler for AppState {
     }
 }
 
+/// @brief `wl_data_device` protocol: exposes the managed state for drag-and-drop and clipboard
+/// data transfers.
 impl DataDeviceHandler for AppState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
     }
 }
+/// @brief wlr-data-control protocol: exposes the managed state so privileged clients can read and
+/// set selections.
 impl DataControlHandler for AppState {
     fn data_control_state(&mut self) -> &mut DataControlState {
         &mut self.data_control_state
     }
 }
+/// @brief Marker impl enabling Wayland drag-and-drop grabs with Smithay's default behavior.
 impl WaylandDndGrabHandler for AppState {}
+/// @brief Buffer lifecycle hook: buffer destruction needs no bookkeeping here.
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
+/// @brief `wl_shm` protocol: exposes the shared-memory buffer state.
 impl ShmHandler for AppState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
+/// @brief Output protocol marker impl (no per-output callbacks are needed).
 impl OutputHandler for AppState {}
 
+/// @brief Linux-dmabuf protocol: imports client dmabufs into the GLES renderer.
+///
+/// `dmabuf_imported` attempts the import into the GLES renderer and signals the client through the
+/// notifier — success only when a GLES renderer exists and the import succeeds, otherwise failure
+/// (the software / pixman path advertises no dmabuf global, so it always fails here).
 impl DmabufHandler for AppState {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -884,6 +1020,8 @@ impl DmabufHandler for AppState {
     }
 }
 
+/// @brief Fractional-scale protocol: tells a newly-bound surface the output's current fractional
+/// scale so it renders at the right pixel density.
 impl FractionalScaleHandler for AppState {
     fn new_fractional_scale(
         &mut self,
@@ -900,11 +1038,9 @@ impl FractionalScaleHandler for AppState {
     }
 }
 
-/// Smithay requires a concrete type as the "target" of an input event; FocusTarget
-/// bridges that to the Wayland surface inside the Window/Popup/LayerSurface.
-/// Input-event target for Smithay's seat handlers: bridges keyboard, pointer,
-/// and touch events to the concrete Wayland surface behind a window, popup, or
-/// layer surface.
+/// @brief Input-event target for Smithay's seat handlers. Smithay requires a concrete type as the
+/// "target" of a keyboard / pointer / touch event; `FocusTarget` bridges that to the concrete
+/// Wayland surface behind a window, popup, or layer surface.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum FocusTarget {
@@ -913,18 +1049,23 @@ pub enum FocusTarget {
     LayerSurface(DesktopLayerSurface),
 }
 
+/// @brief Wrap a `Window` as a focus target.
 impl From<Window> for FocusTarget {
     fn from(w: Window) -> Self { FocusTarget::Window(w) }
 }
 
+/// @brief Wrap a popup as a focus target.
 impl From<PopupKind> for FocusTarget {
     fn from(p: PopupKind) -> Self { FocusTarget::Popup(p) }
 }
 
+/// @brief Wrap a layer surface as a focus target.
 impl From<DesktopLayerSurface> for FocusTarget {
     fn from(l: DesktopLayerSurface) -> Self { FocusTarget::LayerSurface(l) }
 }
 
+/// @brief Liveness of a focus target: true while its underlying window / popup / layer surface is
+/// still alive, so dead targets are dropped from focus.
 impl IsAlive for FocusTarget {
     fn alive(&self) -> bool {
         match self {
@@ -935,6 +1076,8 @@ impl IsAlive for FocusTarget {
     }
 }
 
+/// @brief Expose the wrapped target's underlying `wl_surface` and same-client checks so Smithay
+/// can route focus and selection ownership by client.
 impl WaylandFocus for FocusTarget {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         match self {
@@ -952,6 +1095,8 @@ impl WaylandFocus for FocusTarget {
     }
 }
 
+/// @brief Forward every keyboard event (enter / leave / key / modifiers) to the wrapped target's
+/// underlying `wl_surface`, which carries Smithay's real keyboard-target implementation.
 impl KeyboardTarget<AppState> for FocusTarget {
     fn enter(
         &self,
@@ -1015,6 +1160,8 @@ impl KeyboardTarget<AppState> for FocusTarget {
     }
 }
 
+/// @brief Forward drag-and-drop focus events (enter / motion / leave / drop) to the wrapped
+/// target's underlying `wl_surface`, reusing the `WlSurface` offer-data type.
 impl DndFocus<AppState> for FocusTarget {
     type OfferData<S: Source> = <WlSurface as DndFocus<AppState>>::OfferData<S>;
 
@@ -1085,6 +1232,8 @@ impl DndFocus<AppState> for FocusTarget {
     }
 }
 
+/// @brief Forward every pointer event (motion, buttons, axis, and all swipe / pinch / hold gesture
+/// phases) to the wrapped target's underlying `wl_surface`.
 impl PointerTarget<AppState> for FocusTarget {
     fn enter(&self, seat: &Seat<AppState>, data: &mut AppState, event: &MotionEvent) {
         if let Some(surface) = self.wl_surface() {
@@ -1259,6 +1408,8 @@ impl PointerTarget<AppState> for FocusTarget {
     }
 }
 
+/// @brief Forward every touch event (down / up / motion / frame / cancel / shape / orientation) to
+/// the wrapped target's underlying `wl_surface`.
 impl TouchTarget<AppState> for FocusTarget {
     fn down(&self, seat: &Seat<AppState>, data: &mut AppState, event: &DownEvent, serial: Serial) {
         if let Some(surface) = self.wl_surface() {
@@ -1327,6 +1478,9 @@ impl TouchTarget<AppState> for FocusTarget {
     }
 }
 
+/// @brief Map a Smithay `CursorIcon` to its CSS cursor-name string, used both for themed-cursor
+/// lookup and for the name handed to the Python cursor callback; unknown icons fall back to
+/// `"default"`.
 pub fn cursor_icon_to_str(icon: &CursorIcon) -> &'static str {
     match icon {
         CursorIcon::Default => "default",
@@ -1367,6 +1521,8 @@ pub fn cursor_icon_to_str(icon: &CursorIcon) -> &'static str {
     }
 }
 
+/// @brief Seat wiring: declares the keyboard / pointer / touch focus types and reacts to cursor
+/// changes and keyboard-focus moves.
 impl SeatHandler for AppState {
     type KeyboardFocus = FocusTarget;
     type PointerFocus = FocusTarget;
@@ -1375,12 +1531,15 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
-    // Client-requested cursor change (named, hidden, or surface-backed).
+    /// @brief A client requested a cursor change (named, hidden, or surface-backed): retain it as
+    /// the current icon and forward it to the Python cursor callback.
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
         self.send_cursor_image(&image);
     }
 
+    /// @brief Keep the primary selection's focus following keyboard focus, so middle-click paste
+    /// targets the currently focused client (or clears it when nothing is focused).
     fn focus_changed(&mut self, seat: &Seat<AppState>, focus: Option<&Self::KeyboardFocus>) {
         if let Some(focus_target) = focus {
             let dh = &self.dh;
@@ -1393,7 +1552,12 @@ impl SeatHandler for AppState {
     }
 }
 
-// Lets clients reposition the pointer (games/remote-desktop style warps).
+/// @brief Pointer-warp protocol: lets a client teleport the pointer to a surface-local position
+/// (games / remote-desktop style warps).
+///
+/// `warp_pointer` locates the requesting surface's origin in the global space, adds the requested
+/// surface-local offset to get a global position, recomputes what element lies under it, and emits
+/// a synthetic motion event so focus and enter/leave follow the warp.
 impl PointerWarpHandler for AppState {
     fn warp_pointer(
         &mut self,
@@ -1433,10 +1597,13 @@ impl PointerWarpHandler for AppState {
     }
 }
 
+/// @brief xdg-shell protocol: toplevel and popup lifecycle.
 impl XdgShellHandler for AppState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.shell_state
     }
+    /// @brief A new toplevel appears: wrap it in a `Window`, queue it for mapping, and register a
+    /// foreign-toplevel handle (seeded with title / app-id) stored on the surface for later updates.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
         self.pending_windows.push(window);
@@ -1449,12 +1616,17 @@ impl XdgShellHandler for AppState {
         
         with_states(surface.wl_surface(), |states| states.data_map.insert_if_missing(|| handle));
     }
+    /// @brief Register a new popup (menu, tooltip, combo-box list) with the `PopupManager` so it
+    /// takes part in grab and dismissal handling, then send the initial configure xdg-shell requires
+    /// before the client is allowed to draw it.
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface.clone())) {
             eprintln!("Failed to track popup: {:?}", err);
         }
         let _ = surface.send_configure();
     }
+    /// @brief Popup grab: find the popup's root surface and its window, then install a popup grab so
+    /// dismissal and pointer routing behave correctly.
     fn grab(
         &mut self,
         surface: PopupSurface,
@@ -1468,6 +1640,9 @@ impl XdgShellHandler for AppState {
             }
         }
     }
+    /// @brief Re-track a popup whose position changed (e.g. a submenu flipping sides to stay
+    /// on-screen) so the `PopupManager` follows its new geometry, then echo the client's reposition
+    /// token back to confirm the move took effect.
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
@@ -1479,6 +1654,9 @@ impl XdgShellHandler for AppState {
         }
         let _ = surface.send_repositioned(token);
     }
+    /// @brief A toplevel closed: drop it from the pending-window queue so a window that never
+    /// finished mapping can't linger there, and remove its foreign-toplevel handle so taskbar-style
+    /// clients stop listing a window that is gone.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if let Some(idx) = self.pending_windows.iter().position(|w| w.toplevel().map(|t| *t == surface).unwrap_or(false)) {
             self.pending_windows.remove(idx);
@@ -1489,16 +1667,18 @@ impl XdgShellHandler for AppState {
     }
 }
 
+/// @brief Per-client data attached to every Wayland client connection; holds the compositor's
+/// per-client surface state.
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
 }
+/// @brief Client lifecycle hooks; connect and disconnect need no bookkeeping here.
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-// Delegate macros wire up Smithay's internal event dispatching to the AppState struct.
 delegate_compositor!(AppState);
 delegate_shm!(AppState);
 delegate_output!(AppState);
@@ -1521,9 +1701,12 @@ delegate_presentation!(AppState);
 delegate_xdg_activation!(AppState);
 delegate_primary_selection!(AppState);
 
-/// Row stride (bytes) of a tightly-mapped RGBA8 GPU readback. Derived from the mapping
-/// length rather than assuming width*4, so a padded readback can't skew the cursor image;
-/// never returns less than one full row.
+/// @brief Row stride (bytes) of a tightly-mapped RGBA8 GPU readback, derived from the mapping
+/// length rather than assuming `width*4`.
+///
+/// Dividing the buffer length by the height recovers a padded stride, so a padded readback cannot
+/// skew the cursor image; the result never drops below one full `width*4` row, and a zero height
+/// short-circuits to one row to avoid dividing by zero.
 fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
     let row = width.saturating_mul(4);
     if height == 0 {
@@ -1536,12 +1719,15 @@ fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
 mod stride_tests {
     use super::rgba_readback_stride;
 
+    /// @brief A tightly-packed readback yields exactly `width*4` stride.
     #[test]
     fn packed_readback_is_width_times_four() {
         assert_eq!(rgba_readback_stride(64 * 4 * 48, 48, 64), 64 * 4);
         assert_eq!(rgba_readback_stride(3 * 4 * 2, 2, 3), 12);
     }
 
+    /// @brief A padded readback (extra bytes per row) recovers the true padded stride from the
+    /// buffer length.
     #[test]
     fn padded_readback_recovers_real_stride() {
         let (w, h, pad) = (3usize, 2usize, 4usize);
@@ -1549,10 +1735,12 @@ mod stride_tests {
         assert_eq!(rgba_readback_stride(stride * h, h, w), stride);
     }
 
+    /// @brief Extracting pixels with the recovered stride from a padded buffer reproduces the
+    /// written values with no row-to-row skew.
     #[test]
     fn padded_extraction_has_no_skew() {
         let (w, h) = (3usize, 2usize);
-        let stride = 16usize; // w*4 == 12, padded to 16
+        let stride = 16usize;
         let mut buf = vec![0u8; stride * h];
         for y in 0..h {
             for x in 0..w {
@@ -1572,11 +1760,13 @@ mod stride_tests {
         }
     }
 
+    /// @brief Zero height returns one full row instead of dividing by zero.
     #[test]
     fn zero_height_no_divide_by_zero() {
         assert_eq!(rgba_readback_stride(0, 0, 10), 40);
     }
 
+    /// @brief A buffer shorter than a single row still reports a full `width*4` row.
     #[test]
     fn truncated_buffer_keeps_full_row() {
         assert_eq!(rgba_readback_stride(10, 5, 64), 64 * 4);

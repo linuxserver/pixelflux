@@ -21,11 +21,11 @@ fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
     if v < lo { lo } else if v > hi { hi } else { v }
 }
 
-/// @brief Encode raw RGBA pixel data into a PNG image.
+/// @brief Turn a raw framebuffer into a PNG the Computer Use agent can actually look at.
 ///
-/// Takes a flat RGBA byte buffer and its dimensions, encodes it as PNG using
-/// the `image` crate, and returns the PNG bytes. Used by the screenshot action
-/// and the `zoom` crop path to produce the base64-encoded response payload.
+/// The `screenshot` and `zoom` crop paths have to hand the agent an image, and the API carries it
+/// as base64 PNG, so this encodes a flat RGBA buffer (with its dimensions) through the `image`
+/// crate and returns the PNG bytes for that response payload.
 pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, data.to_vec())
         .ok_or("Failed to create image buffer")?;
@@ -227,14 +227,16 @@ fn handle_action(
     }
 }
 
-/// @brief Execute a Computer Use API action.
+/// @brief Turn one parsed Computer Use request into a real action on the captured desktop — the
+/// bridge that lets an external AI agent see and drive the session.
 ///
-/// Dispatches a parsed Computer Use request to the corresponding compositor
-/// operation. Coordinates are clamped to the current framebuffer size, keyboard
-/// and pointer events are translated into compositor thread commands, and
-/// actions requiring framebuffer data (such as `screenshot` and `zoom`) request
-/// a fresh capture before encoding the JSON response. Returns either the JSON
-/// response payload or an error string describing why the action failed.
+/// Every action ultimately becomes a compositor thread command or a framebuffer read, so this is
+/// where the API's vocabulary meets the running compositor. Coordinates are clamped to the current
+/// framebuffer so a mistaken agent click cannot address off-screen pixels; keyboard and pointer
+/// actions translate into input events; and actions that must look at the screen (`screenshot`,
+/// `zoom`) request a fresh capture first, so the agent reasons about the current frame rather than
+/// a stale one. Returns the JSON response, or an error string explaining why the action could not
+/// run.
 fn handle_action_inner(
     req: CuActionRequest,
     tx: &smithay::reexports::calloop::channel::Sender<ThreadCommand>,
@@ -502,13 +504,15 @@ fn handle_action_inner(
     }
 }
 
-/// @brief HTTP server implementing the Anthropic Computer Use API.
+/// @brief Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
+/// the session much as a human viewer would.
 ///
-/// Listens on `0.0.0.0:<port>` for POST requests to `/computer-use`. Each
-/// request is a JSON action (screenshot, mouse_move, click, key, scroll, etc.).
-/// Framebuffer dimensions are queried fresh from the compositor on every
-/// request to stay correct across stream start/stop/resize cycles. Screenshots
-/// force a GPU readback for a single frame when in zero copy mode.
+/// It runs on its own thread listening on `0.0.0.0:<port>` for POST `/computer-use` JSON actions
+/// (screenshot, mouse_move, click, key, scroll, …). Framebuffer dimensions are re-queried from the
+/// compositor on every request rather than cached, because the stream can start, stop, or resize
+/// underneath the agent and a stale size would misplace every coordinate. A screenshot forces a
+/// one-frame GPU readback when the pipeline is in zero-copy mode, since that path never otherwise
+/// brings host pixels back to the CPU and the agent needs an image to look at.
 pub fn run_cu_server(
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     port: u16,

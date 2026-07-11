@@ -10,5 +10,8 @@
 #![allow(deref_nullptr)]
 #![allow(clippy::all)]
 
-// CUDA driver bindings (the subset NVENC needs). Regenerated in place by build.rs under `regen`.
+//! Raw FFI bindings for the CUDA driver API subset pixelflux's NVENC path links against,
+//! bindgen-generated into `src/bindgen/cuda.rs` and pulled in verbatim below. Regenerated in
+//! place by `build.rs` under the `regen` feature; a normal build compiles the committed file
+//! directly and needs neither libclang nor the CUDA toolkit.
 include!("bindgen/cuda.rs");

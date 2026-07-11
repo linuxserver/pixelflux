@@ -4,14 +4,22 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! X11 host capture. Grabs the root window into a shared memory segment (XShm via x11rb) as
-//! BGRA, composites the XFixes hardware cursor and the watermark on the CPU, and feeds each
-//! frame to [`X11Pipeline`] which owns damage/stripe/encode.
+//! X11 host capture: grab the root window into host memory as BGRA, composite the XFixes hardware
+//! cursor and the watermark on the CPU, and feed each frame to [`X11Pipeline`], which owns
+//! damage/stripe/encode. The grab goes through a shared-memory segment (XShm via x11rb) rather than
+//! a plain `GetImage` for one reason: a full-screen frame is far too large to copy through the X
+//! protocol socket every tick, so XShm has the server write the pixels straight into memory this
+//! process already has mapped.
 //!
-//! The whole pipeline runs on one thread (the caller's): the x11rb connection, the shm segment,
-//! and the encoder all live for the duration of [`run_capture`]. Multi-instance safety for the
-//! encoders is handled inside them (e.g. the libx264 open/close lock); each capture owns its own
-//! private xcb connection, so there is no shared X state to serialize here.
+//! [`run_capture`] splits the work across two threads because grabbing the next frame and encoding
+//! the previous one have no reason to wait on each other: the caller's thread grabs frames and owns
+//! the x11rb connection and the pool of shm surfaces, while a spawned encode thread owns the
+//! [`X11Pipeline`] (and thus the encoder) and runs the delivery callback, so the two overlap for
+//! throughput. Frames hand off through a bounded [`FramePool`] that carries only a raw pointer and
+//! geometry — never an X object, none of which is safe to share — so nothing X-related ever crosses
+//! the thread boundary and the encoder never has to touch X. Multi-instance safety for the encoders
+//! is handled inside them (e.g. the libx264 open/close lock); each capture owns its own private xcb
+//! connection, so there is no shared X state to serialize here.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -31,32 +39,43 @@ use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
-/// Cross-thread controls for a running capture. The owner (the `ScreenCapture` pyclass) flips
-/// these from the Python thread; the capture thread reads them at the top of each iteration and
-/// applies them to its `X11Pipeline`. This keeps request_idr / rate / fps changes off the
-/// pipeline's thread boundary: the pipeline and its encoder are only ever touched from the
-/// capture thread.
+/// @brief Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
+/// payloads) the owning `ScreenCapture` pyclass flips from the Python thread and the capture thread
+/// reads at the top of each iteration.
+///
+/// It exists so Python never has to reach into the pipeline. The `X11Pipeline` and its encoder are
+/// only safe to touch from the capture and encode threads, so `request_idr` / rate / fps / region
+/// changes are posted here as atomic flags and applied later on the thread that owns the pipeline,
+/// rather than mutating encoder state across the thread boundary from Python.
+///
+/// 1. **Lifecycle**: `stop` ends the capture loop; `force_idr` requests an on-demand keyframe on the
+///    next processed frame.
+/// 2. **Rate control** (gated by `rate_dirty`): `bitrate_kbps`, `vbv_mult_milli` (the VBV frame-time
+///    multiplier * 1000, held as an integer for atomics; `<= 0` selects the policy default), and
+///    `fps_milli` (target fps * 1000, re-read every frame for dynamic pacing and rate control). These
+///    atomics always hold the CURRENT values, so a pipeline rebuild can carry live rates forward.
+/// 3. **Tunables** (gated by `tunables_dirty`): one `LiveTunables` struct behind `tunables`, set
+///    rarely, carrying the per-frame quality knobs for the encode thread.
+/// 4. **Capture geometry**: `capture_cursor` toggles the cursor overlay (read on every grab);
+///    `region_dirty` guards `region` = `(x, y, w, h)` (w/h `<= 0` extends to the root edge), applied
+///    by the capture thread with the same drain/recreate machinery as auto-adjust.
 pub struct Controls {
     pub stop: AtomicBool,
     pub force_idr: AtomicBool,
     pub rate_dirty: AtomicBool,
     pub bitrate_kbps: AtomicI32,
-    /// VBV frame-time multiplier * 1000 (atomic-friendly; <= 0 = policy default).
     pub vbv_mult_milli: AtomicI32,
-    /// target fps * 1000 (atomic-friendly; re-read each frame for dynamic pacing + rate control).
     pub fps_milli: AtomicU64,
-    /// Pending per-frame tunables for the encode thread (one struct, set rarely).
     pub tunables_dirty: AtomicBool,
     pub tunables: Mutex<Option<crate::LiveTunables>>,
-    /// Cursor overlay toggle, read by the capture thread each grab.
     pub capture_cursor: AtomicBool,
-    /// Pending capture-region change (x, y, w, h; w/h <= 0 = to the root edge), applied by
-    /// the capture thread with the same drain/recreate machinery as auto-adjust.
     pub region_dirty: AtomicBool,
     pub region: Mutex<(i32, i32, i32, i32)>,
 }
 
 impl Controls {
+    /// @brief Seed the controls from the initial settings so the first loop iteration reads the
+    /// configured bitrate / VBV / fps / region / cursor state rather than defaults.
     pub fn new(s: &RustCaptureSettings) -> Self {
         Self {
             stop: AtomicBool::new(false),
@@ -74,8 +93,14 @@ impl Controls {
     }
 }
 
-/// A shared-memory image surface: a POSIX shm segment attached to both this process and the X
-/// server, into which `shm_get_image` writes one BGRA frame.
+/// @brief A shared-memory image surface: a POSIX shm segment mapped into both this process and the
+/// X server, into which `shm_get_image` writes one BGRA frame.
+///
+/// Both ends map the same physical pages, which is the whole point: a full-screen grab then costs no
+/// per-frame copy across the X socket, because the server's blit lands directly in memory the
+/// capture thread already reads. The surface owns the server-side segment id (`shmseg`), the local
+/// mapping (`addr` / `size`), and the geometry (`width` / `height` / `stride`) needed to interpret
+/// the bytes.
 struct ShmSurface {
     shmseg: u32,
     addr: *mut u8,
@@ -86,8 +111,16 @@ struct ShmSurface {
 }
 
 impl ShmSurface {
-    /// Allocate a shm segment of `width*height*4` bytes, attach it locally and to the X server,
-    /// then mark it `IPC_RMID` so the kernel frees it once both ends detach.
+    /// @brief Allocate a shm segment of `width*height*4` bytes, attach it both locally and to the X
+    /// server, and hand back a surface both ends can read.
+    ///
+    /// The segment is created with `shmget(IPC_PRIVATE)` and mapped locally via `shmat`, then
+    /// attached on the server (`shm_attach`). That attach is confirmed with a round-trip `check()`
+    /// BEFORE the segment is marked `IPC_RMID`: deleting only after both ends hold a reference means
+    /// the kernel frees the segment once this process and the server have both detached, never while
+    /// either still needs it. Every failure path unwinds the partial state (local detach and/or
+    /// `IPC_RMID`) so a failed allocation leaks neither memory nor a server attachment; a zero-sized
+    /// request is rejected up front.
     fn create(conn: &RustConnection, width: u16, height: u16) -> Result<Self, String> {
         let stride = width as usize * 4;
         let size = stride * height as usize;
@@ -112,8 +145,6 @@ impl ShmSurface {
                     return Err(format!("generate_id: {e}"));
                 }
             };
-            // Attach on the server, confirm with a round-trip, THEN mark for deletion so the
-            // segment survives until both this process and the server detach.
             let attach = conn
                 .shm_attach(shmseg, shmid as u32, false)
                 .map_err(|e| format!("shm_attach: {e}"))
@@ -134,11 +165,18 @@ impl ShmSurface {
         }
     }
 
+    /// @brief Borrow the mapped segment as a mutable byte slice for the capture blit and overlays.
     fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.addr, self.size) }
     }
 
-    /// Detach from the server (needs the connection) and locally. Call before drop.
+    /// @brief Detach the segment from the X server and then locally, clearing the mapped pointer.
+    ///
+    /// This is a manual method rather than a `Drop` impl because releasing the server-side
+    /// attachment is an X protocol request that needs the live connection, which a `Drop` could not
+    /// reach; the owner of the connection must call it before the surface is dropped. The order —
+    /// server `shm_detach` first, then the local `shmdt` — completes the release of the segment that
+    /// was marked `IPC_RMID` at creation, so the kernel reclaims it once neither end holds it.
     fn destroy(&mut self, conn: &RustConnection) {
         let _ = conn.shm_detach(self.shmseg);
         let _ = conn.flush();
@@ -149,12 +187,18 @@ impl ShmSurface {
     }
 }
 
-/// Resolve the capture dimensions from settings + the live root geometry. With auto-adjust (or an
-/// unset width/height) the capture tracks the full root; otherwise the requested size is clamped to
-/// what's available from the capture offset. H.264 needs even dimensions.
+/// @brief Resolve the capture dimensions `shm_get_image` will read, bounded so the region can never
+/// run past the live root from the capture offset.
+///
+/// The bound is the reason this function exists: a grab that ran off the root edge would fail the
+/// request outright, so the size is always clamped to what is actually there. With auto-adjust (or
+/// an unset width/height `<= 0`) the capture tracks the full root minus the capture offset;
+/// otherwise the requested size is clamped to what is available from that offset. `capture_x` /
+/// `capture_y` are floored at `>= 0` exactly as `shm_get_image` consumes them, and saturating
+/// subtraction plus a final `u16` clamp (minimum 2) keep pathological settings from overflowing or
+/// collapsing to an unusable surface. H.264 (`output_mode == 1`) requires even dimensions, so both
+/// are then rounded down to a multiple of two.
 fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16) {
-    // capture_x/y are clamped to >=0 the same way shm_get_image consumes them; saturating math
-    // plus a final u16 clamp keep pathological settings from overflowing or truncating.
     let cap_x = s.capture_x.max(0);
     let cap_y = s.capture_y.max(0);
     let avail_w = (root_w as i32).saturating_sub(cap_x).max(2);
@@ -178,8 +222,14 @@ fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16)
     (w as u16, h as u16)
 }
 
-/// Alpha-blend a source pixel (already split into r,g,b,a) over a BGRA destination pixel:
-/// opaque overwrites, partial alpha blends, fully transparent skips.
+/// @brief Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
+///
+/// Cursor and watermark pixels are overwhelmingly either fully opaque or fully transparent, and this
+/// runs per pixel per frame on the CPU, so the two extremes are special-cased to skip the blend
+/// arithmetic entirely: an opaque source (`a == 255`) simply overwrites, a fully transparent source
+/// (`a == 0`) is left as-is, and only genuine edge pixels pay for the integer source-over. In every
+/// case only the B / G / R bytes are written; the destination's alpha byte is left as the capture
+/// delivered it.
 #[inline]
 fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     if a == 255 {
@@ -194,16 +244,20 @@ fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     }
 }
 
-/// Frame-space top-left for the cursor image. XFixes reports the cursor position at its
-/// HOTSPOT; X draws the image with its top-left at (pos - hot). May go negative near the
-/// frame edges -- `overlay_cursor` clips per pixel, matching the server's own edge clipping.
+/// @brief Frame-space top-left of the cursor image, given the XFixes hotspot position.
+///
+/// XFixes reports the cursor position at its HOTSPOT; X draws the image with its top-left at
+/// `(pos - hot)`, and the capture origin `(cap_x, cap_y)` is subtracted to move it into frame space.
+/// The result may go negative near the frame edges, which `overlay_cursor` clips per pixel to match
+/// the server's own edge clipping.
 #[inline]
 fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
     (x as i32 - xhot as i32 - cap_x, y as i32 - yhot as i32 - cap_y)
 }
 
-/// Composite the XFixes cursor (ARGB `u32` per pixel) onto the BGRA frame at `(img_x,img_y)`
-/// (top-left), with per-pixel bounds clipping.
+/// @brief Composite the XFixes cursor (ARGB `u32` per pixel) onto the BGRA frame with its top-left
+/// at `(img_x, img_y)`, blending each pixel through `blend_pixel` with per-pixel bounds clipping so
+/// an image straddling a frame edge writes only its in-frame portion.
 #[allow(clippy::too_many_arguments)]
 fn overlay_cursor(
     frame: &mut [u8],
@@ -237,10 +291,15 @@ fn overlay_cursor(
     }
 }
 
-/// CPU watermark: holds the raw RGBA pixels in host memory plus the placement/animation state,
-/// for blending directly into the captured BGRA frame on the CPU.
+/// @brief CPU watermark: the raw RGBA pixels (row-major, `w*h*4`) in host memory plus the
+/// placement / animation state, blended directly into the captured BGRA frame.
+///
+/// The blend is on the CPU because the frame is already sitting in host shm memory before it reaches
+/// any encoder, so stamping the overlay there is both the cheapest place to do it and the one place
+/// it applies identically regardless of which encoder (hardware or software) runs downstream. The
+/// pixels are kept as RGBA straight from `image`'s decode and converted per pixel as they are blended.
 struct X11Watermark {
-    pixels: Vec<u8>, // RGBA, row-major, w*h*4
+    pixels: Vec<u8>,
     w: i32,
     h: i32,
     pos_x: i32,
@@ -253,6 +312,11 @@ struct X11Watermark {
 }
 
 impl X11Watermark {
+    /// @brief Load the watermark image at `path` into host RGBA, or return an unloaded stub.
+    ///
+    /// An empty path or any decode failure yields `loaded == false`, which every method treats as a
+    /// no-op, so a missing or broken watermark simply disables the overlay. The bouncing-animation
+    /// velocities are seeded here.
     fn load(path: &str) -> Self {
         let mut wm = Self {
             pixels: Vec::new(),
@@ -279,8 +343,14 @@ impl X11Watermark {
         wm
     }
 
-    /// Update the watermark's top-left placement for this frame from the location setting;
-    /// for the animated mode, advance the bouncing position and reflect off the frame edges.
+    /// @brief Set the watermark's top-left placement for this frame from the location enum; a stub
+    /// (unloaded) watermark returns immediately.
+    ///
+    /// The fixed corners and center are direct arithmetic. The animated mode advances a bouncing
+    /// position and reflects velocity off each frame edge, accumulating in the fractional `sub_x` /
+    /// `sub_y` rather than the integer `pos_x` / `pos_y`: a sub-pixel-per-frame velocity has to
+    /// survive between frames or the motion would either stall or snap by whole pixels, so the float
+    /// carries the remainder and `pos_x` / `pos_y` take its floor for the actual blit.
     fn update_position(&mut self, frame_w: i32, frame_h: i32, loc_enum: i32) {
         if !self.loaded {
             return;
@@ -330,6 +400,10 @@ impl X11Watermark {
         }
     }
 
+    /// @brief Alpha-blend the loaded watermark into the BGRA frame at its current position; a no-op
+    /// when unloaded. Clips per pixel at the frame bounds because the animated position — or a
+    /// watermark larger than the capture — can leave part of the image off-frame, and only the
+    /// in-frame portion may be written.
     fn blend_into(&self, frame: &mut [u8], stride: usize, frame_w: i32, frame_h: i32) {
         if !self.loaded {
             return;
@@ -358,10 +432,12 @@ impl X11Watermark {
     }
 }
 
-/// A captured raw BGRA frame held in a pooled shm surface, ready to encode. Carries the surface
-/// pointer + geometry so the encode thread reads it directly (no copy) and can rebuild its pipeline
-/// if the capture size changed (auto-adjust), plus the pool's surface generation so a rebuild also
-/// happens when the surfaces were recreated at the SAME size.
+/// @brief A captured raw BGRA frame held in a pooled shm surface, ready to encode.
+///
+/// It carries the surface pointer plus geometry so the encode thread reads the pixels directly (no
+/// copy) and can rebuild its pipeline when the capture size changed (auto-adjust). It also carries
+/// the pool's surface `generation`, so a rebuild is still triggered when the surfaces were recreated
+/// at the SAME size (a resize flap) and the new segments happen to reuse the old virtual addresses.
 struct RawFrame {
     idx: usize,
     ptr: *mut u8,
@@ -371,36 +447,44 @@ struct RawFrame {
     stride: usize,
     generation: u64,
 }
-// The pointer addresses a pooled shm surface the pool guarantees is not reused until the encode
-// thread recycles this frame, so the handle is safe to move across the thread boundary.
+/// @brief `RawFrame` is `Send`: its raw pointer addresses a pooled shm surface that the pool
+/// guarantees is not reused until the encode thread recycles this frame, so the handle is safe to
+/// move across the capture -> encode thread boundary.
 unsafe impl Send for RawFrame {}
 
+/// @brief Mutex-guarded interior of [`FramePool`]: the free-surface index list and the single
+/// capture -> encode handoff slot, under one lock so moving a surface between them — acquire,
+/// publish, take, recycle — is always a single atomic step.
 struct PoolInner {
     free: Vec<usize>,
     slot: Option<RawFrame>,
 }
 
-/// Demand-driven capture->encode handoff. The capture thread writes into a pooled surface and
-/// `publish`es it into a single slot; the encode thread `take`s it. Capture stays at most one frame
-/// ahead of encode: `acquire`/`publish` BLOCK (bounded) until the encoder frees a surface / drains
-/// the slot, so capture is throttled to the encode rate. Because X11 capture is pull-based (no
-/// backlog), this throttling -- rather than capturing-then-dropping -- means capture never wastes a
-/// full-resolution shm round-trip on a frame that would be discarded, while still overlapping the
-/// next capture with the current encode (the throughput win). The encoder only ever sees a
-/// contiguous frame stream, so the H.264 reference chain stays valid.
+/// @brief Demand-driven capture -> encode handoff: a bounded single-slot channel over a fixed set of
+/// pooled shm surfaces.
+///
+/// The capture thread writes into a pooled surface and `publish`es it into the single `slot`; the
+/// encode thread `take`s it. Capture stays at most one frame ahead of encode because `acquire` and
+/// `publish` BLOCK (bounded) until the encoder frees a surface / drains the slot, throttling capture
+/// to the encode rate. Since X11 capture is pull-based (no backlog), throttling — rather than
+/// capturing-then-dropping — means a full-resolution shm round-trip is never spent on a frame that
+/// would be discarded, while the next capture still overlaps the current encode (the throughput win).
+/// The encoder therefore only ever sees a contiguous frame stream, keeping the H.264 reference chain
+/// valid.
+///
+/// `generation` is bumped by the capture thread each time the backing shm surfaces are destroyed and
+/// recreated. Published frames carry it so the encode thread rebuilds its pipeline — dropping encoder
+/// state keyed to surface base pointers (e.g. NVENC's pinned-host registrations) — even when a resize
+/// flap lands back on the old dimensions and the recreated segments reuse the old virtual addresses.
 struct FramePool {
     inner: Mutex<PoolInner>,
     cv: Condvar,
     stop: AtomicBool,
-    /// Surface generation: bumped by the capture thread each time the shm surfaces backing the
-    /// pool are destroyed and recreated. Published frames carry it so the encode thread rebuilds
-    /// its pipeline -- dropping encoder state keyed to surface base pointers (e.g. NVENC's
-    /// pinned-host registrations) -- even when a resize flap lands back on the old dimensions and
-    /// the recreated segments reuse the old virtual addresses.
     generation: AtomicU64,
 }
 
 impl FramePool {
+    /// @brief Create a pool with `n` free surfaces, an empty handoff slot, and generation 0.
     fn new(n: usize) -> Self {
         Self {
             inner: Mutex::new(PoolInner { free: (0..n).collect(), slot: None }),
@@ -410,20 +494,23 @@ impl FramePool {
         }
     }
 
-    /// Capture: record that the surfaces were recreated. Only called after `drain_for_resize`
-    /// succeeded, so no frame from the previous generation is still in flight.
+    /// @brief Capture: record that the surfaces were recreated by advancing the generation. Only
+    /// called after `drain_for_resize` succeeded, so no frame from the previous generation is still
+    /// in flight.
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Current surface generation, stamped onto each published frame.
+    /// @brief Read the current surface generation, stamped onto each published frame.
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// Capture: get a free surface to write the next frame into, BLOCKING (bounded, re-checking
-    /// `stop` every 20ms) until one is free. This throttles capture to the encode rate so a
-    /// full-resolution capture is never spent on a frame that would be dropped. Returns None on stop.
+    /// @brief Capture: claim a free surface to write the next frame into, or `None` on stop.
+    ///
+    /// Blocks (bounded, re-checking `stop` every 20ms) until a surface is free, which throttles
+    /// capture to the encode rate so a full-resolution capture is never spent on a frame that would
+    /// be dropped. The bounded re-check means a stop that races the wait cannot hang the thread.
     fn acquire(&self, stop: &AtomicBool) -> Option<usize> {
         let mut g = self.inner.lock().unwrap();
         loop {
@@ -438,9 +525,11 @@ impl FramePool {
         }
     }
 
-    /// Capture: publish the just-captured frame into the single slot, BLOCKING (bounded) until the
-    /// encode thread has taken the previous one -- capture stays at most one frame ahead, never
-    /// dropping. Returns false (frame discarded) on stop.
+    /// @brief Capture: publish the just-captured frame into the single slot, or `false` (frame
+    /// discarded) on stop.
+    ///
+    /// Blocks (bounded, re-checking `stop` every 20ms) until the encode thread has taken the previous
+    /// frame, so capture stays at most one frame ahead and never drops under normal flow.
     fn publish(&self, frame: RawFrame, stop: &AtomicBool) -> bool {
         let mut g = self.inner.lock().unwrap();
         loop {
@@ -458,9 +547,10 @@ impl FramePool {
         }
     }
 
-    /// Encode: block until a frame is available (Some) or stop is signalled (None). The wait is
-    /// bounded (re-checking `stop` every 20ms) as defense-in-depth against a lost wakeup, so a
-    /// stop that races the park can never leave this thread blocked forever.
+    /// @brief Encode: block until a frame is available (`Some`) or stop is signalled (`None`).
+    ///
+    /// The wait is bounded (re-checking `stop` every 20ms) as defense-in-depth against a lost wakeup,
+    /// so a stop that races the park can never leave the encode thread blocked forever.
     fn take(&self) -> Option<RawFrame> {
         let mut g = self.inner.lock().unwrap();
         loop {
@@ -475,20 +565,24 @@ impl FramePool {
         }
     }
 
-    /// Encode: return a surface to the free list after it has been encoded.
+    /// @brief Encode: return a surface to the free list after it has been encoded, waking any waiter
+    /// parked in `acquire` / `publish` / `drain_for_resize`.
     fn recycle(&self, idx: usize) {
         self.inner.lock().unwrap().free.push(idx);
         self.cv.notify_all();
     }
 
-    /// Capture: before recreating surfaces (auto-adjust resize), reclaim the pending slot and wait
-    /// until every surface is back in the free list (the encode thread finished any in-flight
-    /// frame), so no surface is destroyed while the encode thread is reading it. The wait is bounded
-    /// and also breaks on stop (pool shutdown OR the external stop) -- with panic=abort gone, a
-    /// panicked/dead encode thread that never recycles must not wedge the capture thread here
-    /// forever; a requested stop unblocks it. Returns true if it fully drained (safe to recreate
-    /// surfaces), false if it aborted on stop (the caller then tears down, which joins the encode
-    /// thread before destroying surfaces, so the resize-safety guarantee still holds).
+    /// @brief Capture: before recreating surfaces (auto-adjust / region resize), reclaim the pending
+    /// slot and wait until every surface is back in the free list, so no surface is destroyed while
+    /// the encode thread is still reading it.
+    ///
+    /// Reclaiming the slot returns any un-taken frame to the free list; the loop then waits until
+    /// `free.len() == n`, i.e. the encode thread has finished any in-flight frame. The wait is bounded
+    /// and also breaks on stop — pool shutdown OR the external `stop` — so a panicked or dead encode
+    /// thread that never recycles cannot wedge the capture thread here forever; a requested stop
+    /// unblocks it. Returns `true` if it fully drained (safe to recreate surfaces), or `false` if it
+    /// aborted on stop — in which case the caller tears down, which joins the encode thread before
+    /// destroying surfaces, so the resize-safety guarantee still holds.
     fn drain_for_resize(&self, n: usize, stop: &AtomicBool) -> bool {
         let mut g = self.inner.lock().unwrap();
         if let Some(old) = g.slot.take() {
@@ -504,12 +598,14 @@ impl FramePool {
         true
     }
 
+    /// @brief Signal every waiter to stop and wake them, ending the encode thread's `take` loop.
+    ///
+    /// The inner mutex is acquired BEFORE storing `stop` and notifying, which closes the lost-wakeup
+    /// window: with the lock held, `take` is either still before its `stop` check or already parked on
+    /// the condvar (and will receive the notify), never in the gap between the two. The notify is
+    /// issued after the guard is dropped so the woken thread does not immediately re-block on the lock
+    /// this call holds.
     fn shutdown(&self) {
-        // Acquire the inner mutex BEFORE storing stop + notifying: this closes the lost-wakeup
-        // window where take() has checked stop==false but not yet parked -- holding the lock
-        // means take() is either still before its stop-check or already parked (and will get the
-        // notify). Notify after dropping the guard so the woken thread doesn't immediately block
-        // on the lock we hold.
         let g = self.inner.lock().unwrap();
         self.stop.store(true, Ordering::Release);
         drop(g);
@@ -517,18 +613,42 @@ impl FramePool {
     }
 }
 
-/// Encode thread body: pull the freshest captured frame, (re)build the pipeline if the size or
-/// surface generation changed, apply cross-thread controls, encode, recycle the surface, then
-/// deliver. Recycling before delivery means a slow consumer never holds a capture surface.
+/// @brief Encode thread body: consume captured frames from the pool, keep the [`X11Pipeline`] in
+/// step with the capture size and cross-thread controls, encode, recycle, and deliver.
+///
+/// The loop runs until [`FramePool::take`] returns `None` (stop). For each frame:
+///
+/// 1. **(Re)build the pipeline** when it is missing, the frame size changed, or the surface
+///    generation changed. A generation change alone forces the rebuild path because recreated shm
+///    segments often reuse the old virtual base addresses, so encoder state keyed to base pointers
+///    (NVENC's pinned-host cache) must be dropped even at identical dimensions. An in-place
+///    [`X11Pipeline::reshape`] is preferred — NVENC reconfigures its live session and the striped
+///    software path just re-derives stripe state — so a resize never stalls on a full encoder
+///    re-init; encoders that cannot follow in place (VAAPI/OpenH264) report `false` and the pipeline
+///    is rebuilt. On a rebuild the old pipeline (with its GPU session/surfaces) is dropped BEFORE the
+///    new one is built, so an auto-adjust resize never holds two full encoder allocations at once
+///    (transient 2x GPU memory). The rebuilt settings pull the CURRENT bitrate / VBV / fps from the
+///    controls atomics, carrying live rate changes forward instead of reverting to the capture-start
+///    values.
+/// 2. **Apply cross-thread controls** here, on the thread that owns the pipeline: a pending
+///    `force_idr` requests a keyframe; a `rate_dirty` swap (Acquire, pairing with the setters' Release
+///    stores so the bitrate / VBV / fps payload is never seen half-applied) pushes a live rate change;
+///    a `tunables_dirty` swap applies per-frame tunables into both the local settings copy and the
+///    pipeline.
+/// 3. **Encode and hand off**: read the pooled surface directly through its raw pointer — sound
+///    because the pool guarantees the surface is not reused until it is recycled — run
+///    [`X11Pipeline::process`], recycle the surface BEFORE delivering so a slow consumer never holds a
+///    capture surface, then deliver any encoded stripes through `on_frame`.
+///
+/// The optional Unix-socket recording sink (parity with the Wayland path) is bound ONCE here and
+/// owned outside the pipeline, so pipeline rebuilds on resize keep the socket listener and any
+/// attached recorders alive. It can only carry a single full-frame H.264 stream, so configurations
+/// that cannot produce one (JPEG output, or a striped CPU encoder) are warned about up front.
 fn encode_loop<F>(pool: &FramePool, controls: &Controls, settings: &RustCaptureSettings, on_frame: &mut F)
 where
     F: FnMut(Vec<EncodedStripe>),
 {
     let mut psettings = settings.clone();
-    // Optional Unix-socket H.264 fan-out (parity with the Wayland path). Bound ONCE per capture
-    // and owned here, outside the pipeline: rebuilds on auto-adjust resizes must keep the socket
-    // listener and any attached recorders alive. Full-frame H.264 only; warn on configurations
-    // that can't produce a single recordable stream.
     let recording_sink = RecordingSink::try_bind(&settings.recording_socket);
     if recording_sink.is_some() {
         if settings.output_mode == 0 {
@@ -543,19 +663,10 @@ where
 
     while let Some(frame) = pool.take() {
         let (fw, fh) = (frame.width as i32, frame.height as i32);
-        // Adapt on a size change OR a surface-generation change: recreated shm segments often
-        // reuse the old virtual base addresses, so encoder state keyed to base pointers (NVENC's
-        // pinned-host cache) must be dropped even when the dimensions are identical. Prefer an
-        // in-place reshape (NVENC reconfigures its live session; the striped software path just
-        // re-derives stripe state) so a resize never stalls on a full encoder re-init; encoders
-        // that cannot follow (VAAPI/OpenH264) rebuild as before.
         if pipeline.is_none() || pw != fw || ph != fh || pgen != frame.generation {
             let size_changed = pw != fw || ph != fh;
             psettings.width = fw;
             psettings.height = fh;
-            // The controls atomics always hold the CURRENT rate values (the update_* setters
-            // store them there), so a rebuild carries live bitrate/VBV/fps changes forward
-            // instead of reverting to the capture-start settings.
             psettings.video_bitrate_kbps = controls.bitrate_kbps.load(Ordering::Relaxed);
             psettings.video_vbv_multiplier =
                 controls.vbv_mult_milli.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -565,9 +676,6 @@ where
                 .as_mut()
                 .is_some_and(|pl| pl.reshape(&psettings, size_changed));
             if !reshaped {
-                // Drop the old pipeline (and its NVENC/VAAPI session + GPU surfaces) BEFORE
-                // building the new one, so an auto-adjust resize never holds two full encoder
-                // allocations at once (transient 2x GPU memory).
                 drop(pipeline.take());
                 pipeline = Some(X11Pipeline::new(psettings.clone(), recording_sink.clone()));
             }
@@ -577,9 +685,6 @@ where
         }
         let pl = pipeline.as_mut().unwrap();
 
-        // Cross-thread controls are applied here, on the thread that owns the pipeline. The
-        // Acquire on the rate_dirty swap pairs with the Release store on the update_* setters, so
-        // the payload (bitrate/vbv/fps) is fully visible -- never seen half-applied.
         if controls.force_idr.swap(false, Ordering::Relaxed) {
             pl.request_idr();
         }
@@ -589,7 +694,6 @@ where
             let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
             pl.update_rate(b, v, fps);
         }
-        // Live tunables land in both settings copies; encoders re-read them per frame.
         if controls.tunables_dirty.swap(false, Ordering::Acquire) {
             if let Some(t) = controls.tunables.lock().unwrap().take() {
                 t.apply_to(&mut psettings);
@@ -597,7 +701,6 @@ where
             }
         }
 
-        // SAFETY: the pool guarantees this surface is not reused until we recycle it below.
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let stripes = pl.process(buf, frame.stride);
         pool.recycle(frame.idx);
@@ -607,15 +710,46 @@ where
     }
 }
 
-/// Run the X11 capture pipeline until `stop` is set. Capture (this thread) grabs frames into a pool
-/// of shm surfaces and hands the freshest to an internal encode+deliver thread; `on_frame(stripes)`
-/// runs on that encode thread once per encoded frame. Splitting capture from encode lets the two
-/// overlap (throughput); dropping happens on raw frames before encode, so the delivered H.264 stays
-/// a valid contiguous reference chain. `encode_tid_tx` reports the encode thread's id (for the
-/// caller's re-entrant-stop handling).
+/// @brief Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
+/// threads that overlap for throughput.
 ///
-/// Blocking; intended to run on a dedicated thread. The X connection + shm surfaces live on this
-/// thread; the encoder lives on the encode thread; nothing X-related crosses threads.
+/// This (the caller's) thread performs setup and then the capture loop; a spawned encode thread runs
+/// [`encode_loop`] and invokes `on_frame(stripes)` once per encoded frame. The split lets capture and
+/// encode overlap, and because frames are throttled/dropped as RAW frames before encode, the delivered
+/// H.264 stays a valid contiguous reference chain.
+///
+/// 1. **Setup**: connect to X (a private connection) and require a 32-bpp BGRA root — the Z-pixmap
+///    byte depth must be 4, which modern servers use for depth 24/32 — then negotiate XShm and
+///    XFixes. XFixes is always negotiated (one round-trip) so the cursor overlay can be toggled on
+///    live even when capture started without it. Initial dimensions and origin are resolved from the
+///    settings and the live root geometry, and a [`FramePool`] of `POOL_N` = 3 shm surfaces is
+///    allocated — the working set (one in-capture, one in-slot, one in-encode) that a one-frame-ahead
+///    demand-driven capture needs, which also keeps the memory cost (`3 * W*H*4`, significant at 4K)
+///    bounded.
+/// 2. **Encode thread**: spawned with a raised scheduling priority; it reports its thread id back
+///    through `encode_tid_tx` so the caller can detect a re-entrant stop issued from inside the
+///    delivery callback.
+/// 3. **Capture loop** (until `stop`): fps is re-read each iteration for live pacing — sleep to the
+///    next frame deadline, or `yield_now` when already behind instead of busy-spinning.
+///    - **Live region change** (`region_dirty`): re-target the grab origin immediately (an x/y pan
+///      needs no surface work); a size change reuses the drain/recreate path below.
+///    - **Auto-adjust**: on a root geometry change, drain in-flight frames then recreate the surfaces
+///      and bump the generation (which the encode thread turns into a reshape or rebuild). The geometry
+///      is re-resolved AFTER the drain, because a slow drain can outlast another geometry change (a
+///      fast flap) and recreating at a stale size would make the next `shm_get_image` exceed the root;
+///      a fully-reverted flap keeps its surfaces as-is. A stop that races the drain breaks out to
+///      teardown.
+///    - **Grab**: acquire a pooled surface (blocks until the encoder frees one), then `shm_get_image`
+///      the region into it synchronously (`reply()` waits).
+///    - **Overlays**: composite the XFixes cursor (drawn at its hotspot-offset origin; live-toggleable)
+///      and the watermark onto the BGRA pixels on the CPU.
+///    - **Publish**: hand the finished frame to the encode thread (blocks until the slot is free;
+///      never drops). A stop observed while waiting in acquire/publish exits the loop.
+/// 4. **Teardown**: stop and JOIN the encode thread BEFORE destroying the shm surfaces it may still be
+///    reading, preserving the resize-safety guarantee.
+///
+/// Blocking; intended to run on a dedicated thread. The X connection and shm surfaces live on this
+/// thread and the encoder lives on the encode thread — nothing X-related crosses the boundary.
 pub fn run_capture<F>(
     settings: RustCaptureSettings,
     controls: Arc<Controls>,
@@ -630,7 +764,6 @@ where
     let root = conn.setup().roots[screen_num].root;
     let root_depth = conn.setup().roots[screen_num].root_depth;
 
-    // The Z-pixmap byte depth must be 4 (BGRA); modern servers use 32bpp for depth 24/32.
     let bpp = conn
         .setup()
         .pixmap_formats
@@ -648,8 +781,6 @@ where
         .map_err(|e| format!("shm_query_version: {e}"))?
         .reply()
         .map_err(|e| format!("XShm unavailable: {e}"))?;
-    // Always negotiate XFixes (one roundtrip) so the cursor overlay can be toggled on
-    // live even when the capture started without it.
     conn.xfixes_query_version(5, 0)
         .map_err(|e| format!("xfixes_query_version: {e}"))?
         .reply()
@@ -661,16 +792,11 @@ where
         .reply()
         .map_err(|e| format!("get_geometry reply: {e}"))?;
 
-    // Geometry-resolution settings, mutable so live capture-region changes re-target the
-    // grab (the encode side keys off the frame dimensions and follows by itself).
     let mut rsettings = settings.clone();
     let (mut cap_w, mut cap_h) = resolve_dims(geo.width, geo.height, &rsettings);
     let mut cap_x = rsettings.capture_x.max(0) as i16;
     let mut cap_y = rsettings.capture_y.max(0) as i16;
 
-    // Pool of shm surfaces. 3 is the working set (one in-capture, one in-slot, one in-encode); a
-    // demand-driven capture stays one frame ahead and blocks beyond that, so 3 suffices and keeps
-    // the memory cost (3 * W*H*4) bounded -- it matters at 4K.
     const POOL_N: usize = 3;
     let mut surfaces: Vec<ShmSurface> = Vec::with_capacity(POOL_N);
     for _ in 0..POOL_N {
@@ -680,8 +806,6 @@ where
 
     let mut watermark = X11Watermark::load(&settings.watermark_path);
 
-    // Encode + deliver thread: owns the pipeline + the Python callback, consumes raw frames from the
-    // pool. It reports its thread id so the caller can detect a re-entrant stop from the callback.
     let enc_pool = pool.clone();
     let enc_controls = controls.clone();
     let enc_settings = settings.clone();
@@ -696,11 +820,8 @@ where
 
     let result = (|| -> Result<(), String> {
         while !controls.stop.load(Ordering::Relaxed) {
-            // Dynamic pacing: re-read fps each iteration so update_framerate takes effect live.
             let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
             let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
-            // Frame pacing: sleep until the next deadline; if already behind, yield so a
-            // concurrent stop / other work can run instead of busy-spinning.
             let now = Instant::now();
             if now < next_frame {
                 std::thread::sleep(next_frame - now);
@@ -716,9 +837,6 @@ where
                 break;
             }
 
-            // Live region change: re-target the grab origin immediately (an x/y pan needs no
-            // surface work at all); a size change reuses the auto-adjust drain/recreate below
-            // by re-resolving against the new region settings.
             if controls.region_dirty.swap(false, Ordering::Acquire) {
                 let (nx, ny, nw, nh) = *controls.region.lock().unwrap();
                 rsettings.capture_x = nx;
@@ -747,24 +865,13 @@ where
                 }
             }
 
-            // Auto-adjust: on a geometry change, drain in-flight frames then recreate the surfaces
-            // (the encode thread reshapes or rebuilds its pipeline when it sees the new size or
-            // generation -- the generation covers a flap back to the old size before the encoder
-            // saw a frame).
             if settings.auto_adjust_screen_capture_size {
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
                     let (nw, nh) = resolve_dims(g.width, g.height, &rsettings);
                     if nw != cap_w || nh != cap_h {
-                        // If a stop races the drain, skip the recreate and fall through to teardown
-                        // (which joins the encode thread before destroying surfaces).
                         if !pool.drain_for_resize(POOL_N, &controls.stop) {
                             break;
                         }
-                        // The drain can outlast ANOTHER geometry change (a fast flap), so
-                        // re-resolve against the current root before recreating: surfaces at a
-                        // stale size would make the next shm_get_image exceed the root. If the
-                        // flap fully reverted, the surfaces are still right -- keep them (and
-                        // their generation: nothing the encoder holds went stale).
                         let (fw, fh) = conn
                             .get_geometry(root)
                             .ok()
@@ -787,8 +894,6 @@ where
                 }
             }
 
-            // Acquire a pooled surface (blocks until the encoder frees one) and grab the region into
-            // it (synchronous: reply() waits). None means stop was observed while waiting.
             let idx = match pool.acquire(&controls.stop) {
                 Some(i) => i,
                 None => break,
@@ -814,8 +919,6 @@ where
             let stride = surface.stride;
             let buf = surface.as_mut_slice();
 
-            // Cursor overlay (XFixes reports the hotspot position; draw at pos - hot, offset
-            // by the capture origin). Live-toggleable.
             if controls.capture_cursor.load(Ordering::Relaxed) {
                 if let Some(c) = conn
                     .xfixes_get_cursor_image()
@@ -846,14 +949,11 @@ where
                 }
             }
 
-            // Watermark overlay.
             if watermark.loaded {
                 watermark.update_position(frame_w, frame_h, settings.watermark_location_enum);
                 watermark.blend_into(buf, stride, frame_w, frame_h);
             }
 
-            // Hand the finished raw frame to the encode thread (blocks until the slot is free; never
-            // drops). A false return means stop was observed while waiting -- exit the loop.
             let published = pool.publish(
                 RawFrame {
                     idx,
@@ -873,7 +973,6 @@ where
         Ok(())
     })();
 
-    // Teardown: stop + join the encode thread BEFORE destroying surfaces it may still be reading.
     pool.shutdown();
     let _ = encode_thread.join();
     for s in surfaces.iter_mut() {
@@ -898,6 +997,8 @@ mod pool_tests {
         }
     }
 
+    /// @brief A full acquire -> publish -> take -> recycle round-trip returns the same surface, and
+    /// afterwards all three pool surfaces are acquirable again and distinct.
     #[test]
     fn roundtrip_then_recycle_returns_all_surfaces() {
         let p = FramePool::new(3);
@@ -907,7 +1008,6 @@ mod pool_tests {
         let f = p.take().unwrap();
         assert_eq!(f.idx, a);
         p.recycle(f.idx);
-        // All three surfaces are acquirable again and distinct.
         let (x, y, z) = (
             p.acquire(&stop).unwrap(),
             p.acquire(&stop).unwrap(),
@@ -916,27 +1016,34 @@ mod pool_tests {
         assert!(x != y && y != z && x != z);
     }
 
+    /// @brief With every surface held and `stop` set, `acquire` returns `None` after its bounded wait
+    /// rather than blocking forever.
     #[test]
     fn acquire_returns_none_when_exhausted_and_stopped() {
         let p = FramePool::new(2);
         let stop = AtomicBool::new(false);
         let _a = p.acquire(&stop).unwrap();
         let _b = p.acquire(&stop).unwrap();
-        stop.store(true, Ordering::Relaxed); // no free left + stop -> None (after the bounded wait)
+        stop.store(true, Ordering::Relaxed);
         assert!(p.acquire(&stop).is_none());
     }
 
+    /// @brief With the handoff slot already occupied and `stop` set, `publish` returns `false` (frame
+    /// discarded) instead of blocking.
     #[test]
     fn publish_returns_false_when_slot_full_and_stopped() {
         let p = FramePool::new(3);
         let stop = AtomicBool::new(false);
         let a = p.acquire(&stop).unwrap();
-        assert!(p.publish(dummy(a), &stop)); // slot now occupied
+        assert!(p.publish(dummy(a), &stop));
         let b = p.acquire(&stop).unwrap();
         stop.store(true, Ordering::Relaxed);
-        assert!(!p.publish(dummy(b), &stop)); // slot full + stop -> false (frame discarded)
+        assert!(!p.publish(dummy(b), &stop));
     }
 
+    /// @brief `drain_for_resize` blocks until every held surface has been recycled (`free == n`), then
+    /// reports a full drain and leaves the pool whole; a helper thread recycles the three held surfaces
+    /// shortly after the drain begins.
     #[test]
     fn drain_for_resize_waits_until_all_free() {
         let p = Arc::new(FramePool::new(3));
@@ -946,7 +1053,6 @@ mod pool_tests {
             p.acquire(&stop).unwrap(),
             p.acquire(&stop).unwrap(),
         ];
-        // Another thread recycles everything shortly; drain must block until free == 3.
         let p2 = p.clone();
         let t = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
@@ -954,29 +1060,28 @@ mod pool_tests {
                 p2.recycle(idx);
             }
         });
-        assert!(p.drain_for_resize(3, &stop)); // fully drained
+        assert!(p.drain_for_resize(3, &stop));
         t.join().unwrap();
-        // Pool is whole again.
         assert!(p.acquire(&stop).is_some());
     }
 
+    /// @brief A surface is held and never recycled (as a dead encode thread would leave it): setting
+    /// `stop` unblocks the bounded drain, which reports it did NOT fully drain instead of hanging.
     #[test]
     fn drain_for_resize_aborts_on_stop() {
-        // A surface is held (never recycled, as a dead encode thread would leave it); drain must not
-        // block forever -- setting stop unblocks it and it reports it did NOT fully drain.
         let p = FramePool::new(3);
         let stop = AtomicBool::new(false);
         let _held = p.acquire(&stop).unwrap();
         stop.store(true, Ordering::Relaxed);
-        assert!(!p.drain_for_resize(3, &stop)); // aborted on stop (bounded, no hang)
+        assert!(!p.drain_for_resize(3, &stop));
     }
 
+    /// @brief A W1 -> W2 -> W1 resize flap where the encoder never takes the W2 frame:
+    /// `drain_for_resize` reclaims the un-taken frame from the slot, the surfaces recreate twice, and
+    /// the next taken frame lands back on the ORIGINAL dimensions — so the bumped generation is the
+    /// only rebuild signal that invalidates encoder state keyed to the reused surface addresses.
     #[test]
     fn resize_flap_reclaim_changes_generation_at_identical_dims() {
-        // W1->W2->W1 flap where the encoder never takes the W2 frame: drain reclaims it
-        // from the slot, the surfaces recreate twice, and the next taken frame lands back
-        // on the ORIGINAL dimensions -- the generation change is then the only rebuild
-        // signal (it invalidates encoder state keyed to the reused surface addresses).
         let p = FramePool::new(3);
         let stop = AtomicBool::new(false);
         let a = p.acquire(&stop).unwrap();
@@ -987,7 +1092,6 @@ mod pool_tests {
         let f = p.take().unwrap();
         let (last_gen, last_dims) = (f.generation, (f.width, f.height));
         p.recycle(f.idx);
-        // Capture sees W2: drain, recreate (gen 1), publish a W2 frame.
         assert!(p.drain_for_resize(3, &stop));
         p.bump_generation();
         let b = p.acquire(&stop).unwrap();
@@ -995,7 +1099,6 @@ mod pool_tests {
             RawFrame { generation: p.generation(), width: 2560, height: 1600, ..dummy(b) },
             &stop
         ));
-        // W1 returns before the encoder takes: drain reclaims the W2 frame, recreate (gen 2).
         assert!(p.drain_for_resize(3, &stop));
         p.bump_generation();
         let c = p.acquire(&stop).unwrap();
@@ -1009,6 +1112,8 @@ mod pool_tests {
         assert_ne!(g.generation, last_gen, "generation is the only rebuild signal");
     }
 
+    /// @brief Recreating the surfaces bumps the generation, and frames published afterwards carry the
+    /// new value — the signal the encode thread uses to trigger a rebuild at identical dimensions.
     #[test]
     fn generation_bumps_on_recreate_and_rides_published_frames() {
         let p = FramePool::new(3);
@@ -1019,8 +1124,6 @@ mod pool_tests {
         let f = p.take().unwrap();
         assert_eq!(f.generation, 0);
         p.recycle(f.idx);
-        // Surfaces recreated (same dims): frames published afterwards must carry a NEW
-        // generation -- the encode thread's rebuild trigger.
         p.bump_generation();
         let b = p.acquire(&stop).unwrap();
         assert!(p.publish(RawFrame { generation: p.generation(), ..dummy(b) }, &stop));
@@ -1032,20 +1135,21 @@ mod pool_tests {
 mod cursor_tests {
     use super::*;
 
+    /// @brief `cursor_image_origin` subtracts both the hotspot and the capture-region offset from the
+    /// reported pointer position, and goes negative when the hotspot sits near the frame origin (the
+    /// result is clipped when drawn).
     #[test]
     fn origin_subtracts_hotspot_and_capture_offset() {
-        // Pointer at (100,80), hotspot (4,6): the image top-left is (96,74).
         assert_eq!(cursor_image_origin(100, 80, 4, 6, 0, 0), (96, 74));
-        // Capture region offset shifts it further.
         assert_eq!(cursor_image_origin(100, 80, 4, 6, 10, 20), (86, 54));
-        // Hotspot near the frame origin pushes the top-left negative (clipped when drawn).
         assert_eq!(cursor_image_origin(1, 1, 8, 8, 0, 0), (-7, -7));
     }
 
+    /// @brief `overlay_cursor` blits at the hotspot-offset origin, not the raw pointer position: a
+    /// 2x2 cursor with hotspot (1,1) at pointer (4,4) lands at (3,3)..(4,4), leaving the un-offset
+    /// (hotspot) corner untouched.
     #[test]
     fn overlay_blits_at_hotspot_offset_origin() {
-        // 8x8 BGRA frame; 2x2 opaque white cursor, hotspot (1,1), pointer at (4,4):
-        // pixels must land at (3,3)..(4,4), not at the hotspot position (4,4)..(5,5).
         let stride = 8 * 4;
         let mut frame = vec![0u8; stride * 8];
         let pixels = [0xFFFF_FFFFu32; 4];
@@ -1058,15 +1162,16 @@ mod cursor_tests {
         assert_eq!(px(5, 5), 0, "no pixel at the un-offset (hotspot) corner");
     }
 
+    /// @brief `overlay_cursor` clips a negative origin at the frame edge: with the origin at (-1,-1)
+    /// only the in-frame quadrant is written, landing the cursor's bottom-right pixel at (0,0).
     #[test]
     fn overlay_clips_negative_origin_at_frame_edge() {
-        // Hotspot at the frame corner: origin (-1,-1); only the in-frame quadrant lands.
         let stride = 4 * 4;
         let mut frame = vec![0u8; stride * 4];
         let pixels = [0xFFFF_FFFFu32; 4];
         let (ox, oy) = cursor_image_origin(0, 0, 1, 1, 0, 0);
         overlay_cursor(&mut frame, stride, 4, 4, 2, 2, &pixels, ox, oy);
-        assert_eq!(frame[0], 255); // (0,0) holds the cursor's bottom-right pixel
+        assert_eq!(frame[0], 255);
         assert!(frame[4..].iter().all(|&b| b == 0), "no writes outside (0,0)");
     }
 }
