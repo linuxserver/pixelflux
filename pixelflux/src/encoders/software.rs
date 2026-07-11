@@ -189,12 +189,12 @@ impl H264EncoderWrapper {
     /// @brief Open an x264 encoder tuned for real-time screen streaming, or `None` on failure.
     ///
     /// **Why this configuration.** These frames are captured live and must ship immediately, so the
-    /// encoder is optimized for latency over compression ratio: the `superfast` preset keeps encode
+    /// encoder is optimized for latency over compression ratio: the `ultrafast` preset keeps encode
     /// time under the frame budget, and `zerolatency` bars the frame reordering and lookahead
     /// buffering that would otherwise add pipeline delay. Everything below then bends x264 toward the
     /// pipeline's own keyframe and colour model instead of its broadcast-oriented defaults.
     ///
-    /// 1. **Preset/tune**: starts from the `superfast` preset with the `zerolatency` tune, then
+    /// 1. **Preset/tune**: starts from the `ultrafast` preset with the `zerolatency` tune, then
     ///    overrides resolution, frame rate (floored to 30 fps when under 1), and thread count.
     /// 2. **Infinite GOP**: `i_keyint_max` is set to x264's infinite sentinel and adaptive scene-cut
     ///    is disabled (`i_scenecut_threshold = 0`), so the encoder never injects an unrequested IDR
@@ -208,9 +208,9 @@ impl H264EncoderWrapper {
     ///      ceiling (stops over-spending on easy content); both are clamped to 51.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
     /// 4. **Colour**: I444 (full range) or I420 (limited range) CSP, BT.709 VUI primaries/transfer/
-    ///    matrix, and the matching `high444` / `high` profile.
-    /// 5. **Coding tools**: CABAC and the 8x8 transform are pinned on regardless of preset defaults,
-    ///    since every targeted hardware encoder and decoder already handles High/CABAC.
+    ///    matrix, and the matching `high444` / `baseline` profile.
+    /// 5. **Coding tools**: CABAC and the 8x8 transform are disabled, matching the low-latency
+    ///    baseline profile — CAVLC entropy coding with no 8x8 DCT — for minimal encode cost.
     /// 6. **Output**: repeated headers (SPS/PPS before each keyframe) and Annex-B framing, with
     ///    x264's own logging silenced.
     ///
@@ -222,7 +222,7 @@ impl H264EncoderWrapper {
                min_qp: i32, max_qp: i32) -> Option<Self> {
         unsafe {
             let mut param: x264_sys::x264_param_t = std::mem::zeroed();
-            let preset = CString::new("superfast").unwrap();
+            let preset = CString::new("ultrafast").unwrap();
             let tune = CString::new("zerolatency").unwrap();
 
             if x264_sys::x264_param_default_preset(&mut param, preset.as_ptr(), tune.as_ptr()) < 0 {
@@ -262,10 +262,8 @@ impl H264EncoderWrapper {
             param.vui.i_transfer = 1;
             param.vui.i_colmatrix = 1;
 
-            let profile = CString::new(if is_i444 { "high444" } else { "high" }).unwrap();
+            let profile = CString::new(if is_i444 { "high444" } else { "baseline" }).unwrap();
             x264_sys::x264_param_apply_profile(&mut param, profile.as_ptr());
-            param.b_cabac = 1;
-            param.analyse.b_transform_8x8 = 1;
 
             param.i_threads = threads;
             param.b_repeat_headers = 1;
@@ -508,45 +506,13 @@ pub struct StripeState {
 
 /// @brief Fast, non-cryptographic 64-bit content hash used only for in-memory change detection.
 ///
-/// 1. **Purpose**: compares a stripe against its own previous frame; the value is never persisted or
-///    sent on the wire, so only the property that identical bytes hash identically matters. A
-///    collision between two distinct stripes is ~2^-64, and the next real content change or a
-///    requested keyframe repaints any missed update anyway.
-/// 2. **Eight-lane FNV-1a**: the body processes interleaved 64-byte blocks as eight independent
-///    FNV-1a lanes (one per 8-byte word). Independent lanes break the serial multiply-dependency
-///    chain of a single accumulator — the ~6.5 GB/s single-thread bottleneck — letting the CPU keep
-///    several multiplies in flight.
-/// 3. **Fold and tail**: the eight lanes fold into one accumulator, then the sub-64-byte remainder
-///    is absorbed as whole 8-byte words followed by the trailing loose bytes.
+/// Uses xxh3: a SIMD-friendly hash that processes 64-byte blocks with parallel lanes,
+/// delivering near memory-bandwidth throughput. The value is never persisted or sent on the
+/// wire, so only the property that identical bytes hash identically matters. A collision
+/// between two distinct stripes is ~2^-64, and the next real content change or a requested
+/// keyframe repaints any missed update anyway.
 fn fast_hash(bytes: &[u8]) -> u64 {
-    const PRIME: u64 = 0x100000001b3;
-    const SEED: u64 = 0xcbf29ce484222325;
-    const LANES: usize = 8;
-    const STRIDE: usize = LANES * 8;
-
-    let mut h = [SEED; LANES];
-    let mut blocks = bytes.chunks_exact(STRIDE);
-    for b in &mut blocks {
-        for (lane, acc) in h.iter_mut().enumerate() {
-            let off = lane * 8;
-            let w = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
-            *acc = (*acc ^ w).wrapping_mul(PRIME);
-        }
-    }
-    let mut acc = SEED;
-    for lane in h {
-        acc = (acc ^ lane).wrapping_mul(PRIME);
-    }
-    let rem = blocks.remainder();
-    let mut words = rem.chunks_exact(8);
-    for w in &mut words {
-        let w = u64::from_le_bytes(w.try_into().unwrap());
-        acc = (acc ^ w).wrapping_mul(PRIME);
-    }
-    for &byte in words.remainder() {
-        acc = (acc ^ byte as u64).wrapping_mul(PRIME);
-    }
-    acc
+    xxhash_rust::xxh3::xxh3_64_with_seed(bytes, 0)
 }
 
 impl StripeState {
@@ -754,8 +720,8 @@ pub fn encode_cpu(
         settings.video_vbv_multiplier,
     ) / 1000)
         .max(1) as i32;
-    let h264_threads = if n_processing_stripes == 1 { 4 } else { 1 };
-    let csc_bands = if n_processing_stripes == 1 { 4 } else { 1 };
+    let h264_threads = 1;
+    let csc_bands = 1;
     let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
         recording_sink.cloned()
     } else {

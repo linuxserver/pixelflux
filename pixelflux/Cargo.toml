@@ -25,6 +25,7 @@ libc = "0.2"
 # fast_mode enables YuvConversionMode::Fast: empirically 1.23x faster than libyuv ARGBToI420
 # on x86-64-v3 (AVX2) at <=1 LSB error vs a float BT.709 reference (accuracy preserved).
 yuv = { version = "0.8.9", features = ["fast_mode"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 gbm = "0.14" 
 libloading = "0.8"
 xcursor = "0.3.1"
