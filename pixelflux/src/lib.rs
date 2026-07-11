@@ -3416,6 +3416,11 @@ impl ScreenCapture {
             }
         }
 
+        println!(
+            "[x11] Configuring Output: {}x{} @ {:.2} FPS (Encode Node: {})",
+            rs.width, rs.height, rs.target_fps, rs.encode_node_index
+        );
+
         let controls = Arc::new(crate::x11::Controls::new(&rs));
         live_x11().lock().unwrap().push(controls.clone());
         let c2 = controls.clone();

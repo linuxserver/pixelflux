@@ -928,6 +928,9 @@ where
     let mut pipeline: Option<X11Pipeline> = None;
     let (mut pw, mut ph) = (0i32, 0i32);
     let mut pgen = 0u64;
+    let mut last_log_time = Instant::now();
+    let mut frame_count: u64 = 0;
+    let mut stripe_count: u64 = 0;
 
     while let Some(frame) = pool.take() {
         let (fw, fh) = (frame.width as i32, frame.height as i32);
@@ -946,6 +949,28 @@ where
             if !reshaped {
                 drop(pipeline.take());
                 pipeline = Some(X11Pipeline::new(psettings.clone(), recording_sink.clone()));
+                if let Some(pl) = &pipeline {
+                    let enc_name = pl.encoder_name();
+                    let mut log_msg = format!(
+                        "[x11] Stream settings active -> Res: {}x{} | FPS: {:.1} | Encoder: {}",
+                        psettings.width, psettings.height, psettings.target_fps, enc_name
+                    );
+                    if psettings.output_mode == 0 {
+                        log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", psettings.jpeg_quality));
+                    } else {
+                        log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                        if psettings.video_fullcolor {
+                            log_msg.push_str(" | Colorspace: I444 (Full Range)");
+                        } else {
+                            log_msg.push_str(" | Colorspace: I420 (Limited Range)");
+                        }
+                    }
+                    log_msg.push_str(&format!(
+                        " | Damage Thresh: {}f | Damage Dur: {}f",
+                        psettings.damage_block_threshold, psettings.damage_block_duration
+                    ));
+                    println!("{}", log_msg);
+                }
             }
             pw = fw;
             ph = fh;
@@ -973,7 +998,25 @@ where
         let stripes = pl.process(buf, frame.stride);
         pool.recycle(frame.idx);
         if !stripes.is_empty() {
+            frame_count += 1;
+            stripe_count += stripes.len() as u64;
             on_frame(stripes);
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_log_time).as_secs_f64();
+        if elapsed >= 1.0 {
+            if settings.debug_logging {
+                let actual_fps = frame_count as f64 / elapsed;
+                let stripes_per_sec = stripe_count as f64 / elapsed;
+                println!(
+                    "[x11] Res: {}x{} Encoder: {} EncFPS: {:.2} EncStripes/s: {:.2}",
+                    psettings.width, psettings.height, pl.encoder_name(), actual_fps, stripes_per_sec
+                );
+            }
+            frame_count = 0;
+            stripe_count = 0;
+            last_log_time = now;
         }
     }
 }

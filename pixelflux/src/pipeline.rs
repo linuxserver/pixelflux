@@ -201,6 +201,7 @@ impl X11Pipeline {
     /// attached recorders mid-recording.
     pub fn new(settings: RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
+            println!("[x11] OpenH264 software encoder selected.");
             match Openh264Encoder::new(&settings, recording_sink.clone()) {
                 Some(e) => X11Encoder::Openh264(e),
                 None => {
@@ -211,29 +212,41 @@ impl X11Pipeline {
         } else if settings.output_mode == 1 && !settings.use_cpu && settings.encode_node_index != -1 {
             let encode_driver =
                 crate::get_gpu_driver(settings.encode_node_index.max(0));
+            println!("[x11] Encode Node Index: {} | Driver: {}", settings.encode_node_index.max(0), encode_driver);
             if !encode_driver.is_empty() && !encode_driver.contains("nvidia") {
                 if settings.video_fullcolor {
-                    eprintln!("[x11] 4:4:4 full-color requested; VAAPI lacks it, using software x264");
+                    println!("[x11] 4:4:4 full-color requested. VAAPI does not support this profile reliably. Falling back to CPU.");
                     X11Encoder::None
                 } else {
+                    println!("[x11] Initializing Unified VAAPI Encoder...");
                     match VaapiEncoder::new_host(&settings, recording_sink.clone()) {
-                        Ok(e) => X11Encoder::Vaapi(e),
+                        Ok(e) => {
+                            println!("[x11] VAAPI Encoder initialized successfully.");
+                            X11Encoder::Vaapi(e)
+                        }
                         Err(err) => {
-                            eprintln!("[x11] VAAPI init failed ({err}); falling back to software");
+                            eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
                             X11Encoder::None
                         }
                     }
                 }
             } else {
+                println!("[x11] Nvidia Encoder detected. Initializing NVENC...");
                 match NvencEncoder::new(&settings, std::ptr::null(), recording_sink.clone()) {
-                    Ok(e) => X11Encoder::Nvenc(e),
+                    Ok(e) => {
+                        println!("[x11] NVENC Encoder initialized successfully.");
+                        X11Encoder::Nvenc(e)
+                    }
                     Err(err) => {
-                        eprintln!("[x11] NVENC init failed ({err}); falling back to software");
+                        eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU.");
                         X11Encoder::None
                     }
                 }
             }
         } else {
+            if settings.output_mode == 1 {
+                println!("[x11] No GPU Encoder available -> Using CPU Software Encoding.");
+            }
             X11Encoder::None
         };
         Self {
@@ -250,6 +263,16 @@ impl X11Pipeline {
     /// @brief Request an on-demand keyframe on the next processed frame.
     pub fn request_idr(&mut self) {
         self.pending_force_idr = true;
+    }
+
+    /// @brief Return a human-readable encoder type string for logging.
+    pub fn encoder_name(&self) -> &str {
+        match &self.hw {
+            X11Encoder::Nvenc(_) => "NVENC",
+            X11Encoder::Vaapi(_) => "VAAPI",
+            X11Encoder::Openh264(_) => "OpenH264",
+            X11Encoder::None => "CPU",
+        }
     }
 
     /// @brief Adapt the live pipeline to recreated capture surfaces — and possibly a new size —
