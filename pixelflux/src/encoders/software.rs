@@ -639,12 +639,13 @@ pub struct EncodedStripe {
 ///      height) is emitted. The live CBR VBV budget is recomputed here from the bitrate/fps so it
 ///      rescales with live changes.
 /// 6. **Dispatch**: a single full-frame stripe runs inline (sequential — empirically faster than a
-///    one-element rayon job) and is given four x264 threads plus a four-band colour conversion so it
-///    still uses the cores; the thread count is capped at four because `zerolatency` makes x264
-///    slice-threaded, and more than four slices trips decode glitches in some Chromium builds.
-///    Multiple stripes instead run across the rayon pool with a single x264 thread and one
-///    conversion band each, since the parallelism there already comes from encoding the stripes
-///    concurrently. The recording sink is attached only in single-stripe mode, because the several
+///    one-element rayon job) with a single-band colour conversion and the same thread policy as the
+///    OpenH264 encoder — one fewer than the available cores, clamped to `[1, 4]`. The slice threads
+///    keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
+///    because `zerolatency` makes x264 slice-threaded and more than four slices trips decode
+///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread. Multiple stripes instead run across the
+///    rayon pool with a single x264 thread and one conversion band each, since the parallelism there
+///    already comes from encoding the stripes concurrently. The recording sink is attached only in single-stripe mode, because the several
 ///    independent sub-frame bitstreams of striped mode cannot be muxed into one recording.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
@@ -720,7 +721,14 @@ pub fn encode_cpu(
         settings.video_vbv_multiplier,
     ) / 1000)
         .max(1) as i32;
-    let h264_threads = 1;
+    // Full-frame x264 threads follow the same policy as the OpenH264 encoder:
+    // one fewer than the cores (headroom for the capture thread), clamped to
+    // [1, 4] to match the four-slice ceiling below.
+    let h264_threads = if n_processing_stripes == 1 {
+        num_cores.saturating_sub(1).clamp(1, 4) as i32
+    } else {
+        1
+    };
     let csc_bands = 1;
     let stripe_sink: Option<Arc<RecordingSink>> = if n_processing_stripes == 1 {
         recording_sink.cloned()

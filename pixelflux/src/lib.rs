@@ -1533,7 +1533,7 @@ fn run_wayland_thread(
         xdg_activation_state,
         primary_selection_state,
         popups,
-        frame_buffer: vec![0u8; (width * height * 4) as usize],
+        frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
         gles_renderer,
         pixman_renderer,
         gbm_device: gbm_device_raw,
@@ -1567,6 +1567,8 @@ fn run_wayland_thread(
         recording_sink: None,
         deliver_tx: None,
         deliver_join: None,
+        pending_hw_delivery: None,
+        pending_hw_damage: false,
         encode_pool: None,
         encode_join: None,
         encode_controls: Arc::new(WlEncodeControls::new()),
@@ -1642,38 +1644,72 @@ fn run_wayland_thread(
                             || (current_scale - settings.scale).abs() > 0.001
                             || current_refresh != target_refresh
                         {
-                            println!(
-                                "[Wayland] Configuring Output: {}x{} @ {:.2} FPS (Scale {:.2})",
-                                settings.width, settings.height, settings.target_fps, settings.scale
-                            );
-                            let new_mode = OutputMode {
-                                size: (settings.width, settings.height).into(),
-                                refresh: target_refresh,
-                            };
-                            output.change_current_state(
-                                Some(new_mode),
-                                Some(Transform::Normal),
-                                Some(OutputScale::Fractional(settings.scale)),
-                                Some((0, 0).into()),
-                            );
-                            output.set_preferred(new_mode);
-
-                            let pixel_count = (settings.width * settings.height) as usize;
-                            state.frame_buffer = vec![0u8; pixel_count * 4];
-
+                            // Allocate the GPU backing for the new dimensions BEFORE
+                            // committing anything: if the driver refuses (VRAM
+                            // exhaustion, dimensions it will not back), the whole
+                            // reconfigure is skipped and the previous mode + buffers
+                            // stay live. A failed resize must degrade to "no resize",
+                            // never panic the compositor thread — that would drop
+                            // every Wayland client with no recovery short of a
+                            // process restart. (The INITIAL allocation path already
+                            // degrades gracefully, to the software renderer.)
+                            let mut new_offscreen = None;
+                            let mut gbm_resize_failed = false;
                             if state.use_gpu {
                                 if let Some(gbm) = state.gbm_device.as_mut() {
-                                    let bo = gbm
-                                        .create_buffer_object(
-                                            settings.width as u32,
-                                            settings.height as u32,
-                                            GbmFormat::Argb8888,
-                                            BufferObjectFlags::RENDERING,
-                                        )
-                                        .expect("Failed to resize GBM buffer");
+                                    match gbm.create_buffer_object(
+                                        settings.width as u32,
+                                        settings.height as u32,
+                                        GbmFormat::Argb8888,
+                                        BufferObjectFlags::RENDERING,
+                                    ) {
+                                        Ok(bo) => {
+                                            let dmabuf = create_dmabuf_from_bo(&bo);
+                                            new_offscreen = Some((bo, dmabuf));
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[Wayland] GBM buffer resize to {}x{} failed ({:?}); keeping previous output mode.",
+                                                settings.width, settings.height, e
+                                            );
+                                            gbm_resize_failed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if gbm_resize_failed {
+                                // The mode commit below is skipped wholesale, so the
+                                // rest of this StartCapture (encoder setup, stored
+                                // settings) must also see the dimensions that are
+                                // actually live — otherwise the encoder and the
+                                // still-old buffers disagree on frame geometry.
+                                settings.width = current_w;
+                                settings.height = current_h;
+                                settings.scale = current_scale;
+                                settings.target_fps = current_refresh as f64 / 1000.0;
+                            } else {
+                                println!(
+                                    "[Wayland] Configuring Output: {}x{} @ {:.2} FPS (Scale {:.2})",
+                                    settings.width, settings.height, settings.target_fps, settings.scale
+                                );
+                                let new_mode = OutputMode {
+                                    size: (settings.width, settings.height).into(),
+                                    refresh: target_refresh,
+                                };
+                                output.change_current_state(
+                                    Some(new_mode),
+                                    Some(Transform::Normal),
+                                    Some(OutputScale::Fractional(settings.scale)),
+                                    Some((0, 0).into()),
+                                );
+                                output.set_preferred(new_mode);
 
-                                    let dmabuf = create_dmabuf_from_bo(&bo);
-                                    state.offscreen_buffer = Some((bo, dmabuf));
+                                let pixel_count =
+                                    (settings.width.max(0) as usize) * (settings.height.max(0) as usize);
+                                state.frame_buffer = vec![0u8; pixel_count * 4];
+
+                                if let Some(off) = new_offscreen.take() {
+                                    state.offscreen_buffer = Some(off);
                                 }
                             }
                         }
@@ -1833,6 +1869,8 @@ fn run_wayland_thread(
                         .flatten();
                     if let Some(tx) = state.deliver_tx.take() { drop(tx); }
                     if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
+                    state.pending_hw_delivery = None;
+                    state.pending_hw_damage = false;
                     if let Some(cb) = state.callback.take() {
                         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
                         let join = thread::spawn(move || {
@@ -1860,7 +1898,7 @@ fn run_wayland_thread(
                         if let Some(ref deliver_tx) = state.deliver_tx {
                             let pool = Arc::new(WlFramePool::new(
                                 WL_POOL_SURFACES,
-                                (settings.width * settings.height * 4) as usize,
+                                (settings.width.max(0) as usize) * (settings.height.max(0) as usize) * 4,
                             ));
                             state.pool_last_render = vec![0; WL_POOL_SURFACES];
                             state.render_seq = 0;
@@ -1876,6 +1914,13 @@ fn run_wayland_thread(
                             );
                             c.rate_dirty.store(false, Ordering::Relaxed);
                             c.force_idr.store(false, Ordering::Relaxed);
+                            // Also drop any leftover LiveTunables snapshot: UpdateTunables
+                            // sets it even when no encode thread is consuming (zero-copy
+                            // mode, or after StopCapture), and without this reset the new
+                            // encode thread's first frame would apply that stale snapshot
+                            // OVER the fresh StartCapture settings just established.
+                            c.tunables_dirty.store(false, Ordering::Relaxed);
+                            *c.tunables.lock().unwrap() = None;
                             let cfg = WlEncodeConfig {
                                 settings: settings.clone(),
                                 use_gpu: state.use_gpu,
@@ -1917,6 +1962,8 @@ fn run_wayland_thread(
                     *state.encode_stats.desc.lock().unwrap() = String::new();
                     if let Some(tx) = state.deliver_tx.take() { drop(tx); }
                     if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
+                    state.pending_hw_delivery = None;
+                    state.pending_hw_damage = false;
                 }
                 CalloopEvent::Msg(ThreadCommand::SetClipboardCallback(cb)) => {
                     state.clipboard_callback = Some(cb);
@@ -2462,7 +2509,7 @@ fn run_wayland_thread(
                             None => (state.frame_buffer.as_mut_ptr() as *mut u32, 0),
                         };
                         let mut image = unsafe {
-                            pixman::Image::from_raw_mut(pixman::FormatCode::A8R8G8B8, width as usize, height as usize, ptr, (width * 4) as usize, false).expect("Failed to create pixman image")
+                            pixman::Image::from_raw_mut(pixman::FormatCode::A8R8G8B8, width as usize, height as usize, ptr, (width as usize) * 4, false).expect("Failed to create pixman image")
                         };
                                     match renderer.bind(&mut image) {
                                     Ok(mut frame) => {
@@ -2635,12 +2682,42 @@ fn run_wayland_thread(
                             state.frame_counter = state.frame_counter.wrapping_add(1);
                         }
                     } else if let Some(ref mut encoder) = state.video_encoder {
+                        // Deliver the parked frame (if any) first, WITHOUT blocking:
+                        // this runs on the calloop thread, and a blocking send would
+                        // freeze input/command/Wayland dispatch for as long as the
+                        // Python consumer stalls (the readback path offloads its
+                        // sends to the wl-encode thread for exactly this reason).
+                        // While a frame stays parked, no new frame is encoded — an
+                        // encoded frame joins the H.264 reference chain and can
+                        // never be dropped — and the tick's damage is latched so
+                        // the pause never loses a change.
+                        let slot_free = match state.pending_hw_delivery.take() {
+                            None => true,
+                            Some(pending) => match state.deliver_tx.as_ref() {
+                                None => true,
+                                Some(tx) => match tx.try_send(pending) {
+                                    Ok(()) => true,
+                                    Err(std::sync::mpsc::TrySendError::Full(p)) => {
+                                        state.pending_hw_delivery = Some(p);
+                                        false
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => true,
+                                },
+                            },
+                        };
+                        if !slot_free {
+                            if !damage_rects.is_empty() {
+                                state.pending_hw_damage = true;
+                            }
+                        } else {
                         let is_animated = state.overlay_state.is_animated();
+                        let had_damage = !damage_rects.is_empty()
+                            || std::mem::take(&mut state.pending_hw_damage);
                         let decision = crate::pipeline::decide_hw_fullframe(
                             &mut state.vaapi_state,
                             &state.settings,
                             state.frame_counter,
-                            !damage_rects.is_empty(),
+                            had_damage,
                             is_animated,
                             requested_idr,
                         );
@@ -2680,10 +2757,19 @@ fn run_wayland_thread(
                                     state.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
                                     state.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref tx) = state.deliver_tx {
-                                        let _ = tx.send(vec![EncodedStripe {
+                                        let stripes = vec![EncodedStripe {
                                             data, data_type: 2, stripe_y_start: 0,
                                             stripe_height: height, frame_id: state.frame_counter as i32,
-                                        }]);
+                                        }];
+                                        // Non-blocking: a full slot parks the frame
+                                        // (delivered ahead of any new encode above).
+                                        match tx.try_send(stripes) {
+                                            Ok(()) => {}
+                                            Err(std::sync::mpsc::TrySendError::Full(s)) => {
+                                                state.pending_hw_delivery = Some(s);
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                                        }
                                     }
                                 }
                             } else if let Err(e) = result {
@@ -2692,6 +2778,7 @@ fn run_wayland_thread(
                         }
                         state.pending_force_idr = false;
                         state.frame_counter = state.frame_counter.wrapping_add(1);
+                        }
                     }
                     if let Some(resp) = state.pending_screenshot.take() {
                         if !state.frame_buffer.is_empty() {
@@ -3252,6 +3339,14 @@ struct ScState {
     /// The internal encode+deliver thread's id, so a re-entrant stop from inside the delivery
     /// callback (which runs on that thread) is detected and doesn't try to self-join.
     encode_thread_id: Option<thread::ThreadId>,
+    /// Handshake receiver kept when the bounded start-time wait for the encode thread id
+    /// lapsed (slow X11 setup precedes the encode-thread spawn): the id is late-resolved
+    /// from here on demand, so the re-entrant-stop guard still recognizes the encode
+    /// thread — with `encode_thread_id` stuck at `None`, a stop from inside the delivery
+    /// callback would join the capture thread, which joins the encode thread (the
+    /// caller), a deadlock cycle. The id send strictly precedes any callback running on
+    /// that thread, so a `try_recv` at stop time cannot miss it.
+    encode_tid_rx: Option<std::sync::mpsc::Receiver<thread::ThreadId>>,
 }
 
 /// @brief Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
@@ -3280,6 +3375,13 @@ impl ScreenCapture {
                 c.stop.store(true, Ordering::Relaxed);
             }
             let cur = Some(thread::current().id());
+            if st.encode_thread_id.is_none() {
+                if let Some(rx) = st.encode_tid_rx.as_ref() {
+                    if let Ok(id) = rx.try_recv() {
+                        st.encode_thread_id = Some(id);
+                    }
+                }
+            }
             let same = st.cap_thread_id == cur || st.encode_thread_id == cur;
             let controls = st.controls.take();
             let handle = st.handle.take();
@@ -3287,6 +3389,7 @@ impl ScreenCapture {
             st.backend = 0;
             st.cap_thread_id = None;
             st.encode_thread_id = None;
+            st.encode_tid_rx = None;
             (handle, same, backend, controls)
         };
         if let Some(c) = &controls {
@@ -3328,6 +3431,7 @@ impl ScreenCapture {
                 handle: None,
                 cap_thread_id: None,
                 encode_thread_id: None,
+                encode_tid_rx: None,
             }),
         }
     }
@@ -3468,11 +3572,12 @@ impl ScreenCapture {
                 }
             }
         });
-        let (tid, etid_res) = py.detach(move || {
+        let (tid, etid_res, etid_rx) = py.detach(move || {
             let tid = tid_rx.recv().ok();
             let etid_res = etid_rx.recv_timeout(std::time::Duration::from_secs(2));
-            (tid, etid_res)
+            (tid, etid_res, etid_rx)
         });
+        let mut late_etid_rx = None;
         let etid = match etid_res {
             Ok(id) => Some(id),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3485,7 +3590,13 @@ impl ScreenCapture {
                     .unwrap_or_else(|| "X11 capture thread exited during start".to_string());
                 return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Slow pre-spawn X11 setup: the id will still arrive on this
+                // channel. Keep the receiver so stop_internal can late-resolve
+                // it — a None id would blind the re-entrant-stop guard.
+                late_etid_rx = Some(etid_rx);
+                None
+            }
         };
         let mut st = self.inner.lock().unwrap();
         st.backend = 1;
@@ -3493,6 +3604,7 @@ impl ScreenCapture {
         st.handle = Some(handle);
         st.cap_thread_id = tid;
         st.encode_thread_id = etid;
+        st.encode_tid_rx = late_etid_rx;
         Ok(())
     }
 

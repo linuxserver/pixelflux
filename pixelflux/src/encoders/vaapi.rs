@@ -444,6 +444,10 @@ impl VaapiEncoder {
             }
             set_opt(&mut opts, "async_depth", "1");
             set_opt(&mut opts, "profile", "high");
+            // No SEI: the default identifier/timing/recovery_point units are
+            // consumed by nothing in this pipeline, and SEI-bearing frames can
+            // freeze Chromium m128+ WebRTC clients when packet loss hits them.
+            set_opt(&mut opts, "sei", "0");
             set_opt(&mut opts, "level", "4.1");
 
             let ret = ff::avcodec_open2(encoder_ctx, codec, &mut opts);
@@ -708,6 +712,10 @@ impl VaapiEncoder {
         }
         set_opt(&mut opts, "async_depth", "1");
         set_opt(&mut opts, "profile", "high");
+        // No SEI: the default identifier/timing/recovery_point units are
+        // consumed by nothing in this pipeline, and SEI-bearing frames can
+        // freeze Chromium m128+ WebRTC clients when packet loss hits them.
+        set_opt(&mut opts, "sei", "0");
         set_opt(&mut opts, "level", "4.1");
 
         let ret = ff::avcodec_open2(self.encoder_ctx, self.codec, &mut opts);

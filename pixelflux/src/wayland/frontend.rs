@@ -289,6 +289,16 @@ pub struct AppState {
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
     pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
     pub deliver_join: Option<std::thread::JoinHandle<()>>,
+    /// Zero-copy frame parked after a full delivery channel. The hardware encode and
+    /// its delivery both run on the calloop thread, and a blocking send there would
+    /// freeze input/command/Wayland dispatch for as long as the Python consumer
+    /// stalls. An encoded frame is part of the H.264 reference chain and can never
+    /// be dropped, so it parks here instead, and new encodes pause until it leaves.
+    pub pending_hw_delivery: Option<Vec<crate::encoders::software::EncodedStripe>>,
+    /// Damage seen on ticks skipped while `pending_hw_delivery` was parked, folded
+    /// into the next encode's change detection so a change that happened during the
+    /// pause is never lost (each tick's damage list is otherwise discarded).
+    pub pending_hw_damage: bool,
     pub encode_pool: Option<Arc<crate::WlFramePool>>,
     pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
     pub encode_controls: Arc<crate::WlEncodeControls>,
@@ -603,8 +613,11 @@ impl AppState {
     /// targets the current selection rather than the previous one. It clones the callback, opens a
     /// pipe, and asks the owning client source to write the chosen mime into the pipe's writer. A
     /// spawned reader thread then reads the response — capped at 64 MiB so a hostile client cannot
-    /// balloon memory — and, unless the interpreter is finalizing, delivers the bytes to Python. The
-    /// `PY_SHUTDOWN` checks keep this off a shutting-down interpreter.
+    /// balloon memory, and bounded by a 10 s poll deadline so a client that takes the selection but
+    /// never writes nor closes its fd cannot pin the thread forever (each clipboard change would
+    /// otherwise leak one zombie thread + pipe) — and, unless the interpreter is finalizing,
+    /// delivers the bytes to Python. The `PY_SHUTDOWN` checks keep this off a shutting-down
+    /// interpreter.
     pub(crate) fn process_pending_clipboard_read(&mut self) {
         let Some(mime) = self.pending_clipboard_read.take() else { return };
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -625,8 +638,46 @@ impl AppState {
         }
         std::thread::spawn(move || {
             use std::io::Read;
+            use std::os::fd::AsRawFd;
+            const CAP: usize = 64 * 1024 * 1024;
+            const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+            let start = Instant::now();
             let mut buf = Vec::new();
-            if (&reader).take(64 * 1024 * 1024).read_to_end(&mut buf).is_err() || buf.is_empty() {
+            let mut chunk = [0u8; 65536];
+            loop {
+                let Some(remaining) = DEADLINE.checked_sub(start.elapsed()) else { return };
+                let mut pfd = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+                let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if ready == 0 {
+                    return;
+                }
+                match (&reader).read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let room = CAP - buf.len();
+                        let take_n = n.min(room);
+                        buf.extend_from_slice(&chunk[..take_n]);
+                        if buf.len() == CAP {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => return,
+                }
+            }
+            if buf.is_empty() {
                 return;
             }
             if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {

@@ -977,7 +977,7 @@ impl NvencEncoder {
                 encodeHeight: height,
                 darWidth: width,
                 darHeight: height,
-                frameRateNum: settings.target_fps as u32,
+                frameRateNum: settings.target_fps.max(1.0) as u32,
                 frameRateDen: 1,
                 enablePTD: 1,
                 encodeConfig: &mut config,
@@ -1390,6 +1390,11 @@ impl NvencEncoder {
             if self.init_params.frameRateNum != fps {
                 self.init_params.frameRateNum = fps;
                 self.init_params.frameRateDen = 1;
+                self.encode_config.encodeCodecConfig.h264Config.level = min_h264_level(
+                    self.init_params.encodeWidth,
+                    self.init_params.encodeHeight,
+                    fps,
+                );
                 changed = true;
             }
             if !changed {
