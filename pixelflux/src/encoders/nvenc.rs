@@ -32,7 +32,7 @@ use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
 
-/// @brief EGL C-interop type aliases and the `EGL_*` attribute constants used to wrap a dmabuf as
+/// EGL C-interop type aliases and the `EGL_*` attribute constants used to wrap a dmabuf as
 /// an `EGLImageKHR` for CUDA import.
 type EGLDisplay = *const c_void;
 type EGLImageKHR = *mut c_void;
@@ -52,11 +52,11 @@ const EGL_HEIGHT: EGLint = 0x3056;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
 const EGL_NONE: EGLint = 0x3038;
 
-/// @brief Opaque CUDA graphics-resource handle for the EGL interop path — an `EGLImageKHR`
+/// Opaque CUDA graphics-resource handle for the EGL interop path — an `EGLImageKHR`
 /// registered with CUDA maps to one of these.
 type CUgraphicsResource = *mut c_void;
 
-/// @brief A CUDA frame mapped from an EGLImage: the `cuGraphicsResourceGetMappedEglFrame` result
+/// A CUDA frame mapped from an EGLImage: the `cuGraphicsResourceGetMappedEglFrame` result
 /// describing the imported dmabuf's plane pointers, geometry, pitch and pixel format.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -73,7 +73,7 @@ struct CUeglFrame {
     cu_format: u32,
 }
 
-/// @brief The mapped frame's plane pointers, as either CUDA arrays or pitch-linear device
+/// The mapped frame's plane pointers, as either CUDA arrays or pitch-linear device
 /// pointers — `CUeglFrame::frame_type` selects which arm of the union is valid.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -91,7 +91,7 @@ type EglCreateImageKhrFn = unsafe extern "C" fn(
 ) -> EGLImageKHR;
 type EglDestroyImageKhrFn = unsafe extern "C" fn(dpy: EGLDisplay, image: EGLImageKHR) -> EGLBoolean;
 
-/// @brief Dynamically loaded EGL entry points (from `libEGL`) for creating and destroying the
+/// Dynamically loaded EGL entry points (from `libEGL`) for creating and destroying the
 /// `EGLImageKHR` that wraps a dmabuf. `_lib` keeps the library resident for the pointers' life.
 struct EglFunctions {
     _lib: Library,
@@ -100,7 +100,7 @@ struct EglFunctions {
     eglDestroyImageKHR: EglDestroyImageKhrFn,
 }
 
-/// @brief Dynamically loaded CUDA driver-API entry points (from `libcuda`) for context, device,
+/// Dynamically loaded CUDA driver-API entry points (from `libcuda`) for context, device,
 /// memory, host-pin and EGL-interop calls. `_lib` keeps the library resident for the pointers' life.
 struct CudaFunctions {
     _lib: Library,
@@ -155,7 +155,7 @@ struct CudaFunctions {
     cuGetErrorName: unsafe extern "C" fn(error: CUresult, pStr: *mut *const c_char) -> CUresult,
 }
 
-/// @brief Dynamically loaded NVENC entry points (from `libnvidia-encode`).
+/// Dynamically loaded NVENC entry points (from `libnvidia-encode`).
 ///
 /// - **`create_instance`** (`NvEncodeAPICreateInstance`): fills an `NV_ENCODE_API_FUNCTION_LIST`
 ///   with the driver's encode entry points for a requested API-version word.
@@ -172,11 +172,11 @@ struct NvencLibrary {
     get_max_version: Option<unsafe extern "C" fn(*mut u32) -> NVENCSTATUS>,
 }
 
-/// @brief Negotiated NVENC API version `(major, minor)`, resolved once per process. `None` until
+/// Negotiated NVENC API version `(major, minor)`, resolved once per process. `None` until
 /// `nvenc_negotiate` runs; every struct-version word and the session `apiVersion` derive from it.
 static NVENC_NEG_VER: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
 
-/// @brief The NVENCAPI structs this encoder must stamp with a per-SDK version word — enumerated
+/// The NVENCAPI structs this encoder must stamp with a per-SDK version word — enumerated
 /// here precisely because getting that word exactly right is the whole mechanism that lets one
 /// compiled binary satisfy every driver's version check.
 ///
@@ -205,7 +205,7 @@ enum NvStruct {
 }
 
 impl NvStruct {
-    /// @brief The `(struct revision, 1<<31 flag)` this struct uses under the SDK identified by the
+    /// The `(struct revision, 1<<31 flag)` this struct uses under the SDK identified by the
     /// packed API version `api` (`(major<<4)|minor`) — the only two sub-fields that move between
     /// SDKs, and thus the entire per-version knowledge stamping a struct actually needs.
     ///
@@ -255,7 +255,7 @@ impl NvStruct {
     }
 }
 
-/// @brief Assemble the `NVENCAPI_STRUCT_VERSION` word for struct `s` at API version `(maj, min)`.
+/// Assemble the `NVENCAPI_STRUCT_VERSION` word for struct `s` at API version `(maj, min)`.
 ///
 /// The 32-bit word packs, from `NvStruct::rev` and the API version:
 ///
@@ -272,7 +272,7 @@ fn nvenc_struct_ver(s: NvStruct, maj: u32, min: u32) -> u32 {
     (maj & 0xFF) | ((min & 0xF) << 24) | (rev << 16) | (0x7 << 28) | ((high_bit as u32) << 31)
 }
 
-/// @brief The process's effective NVENC API version `(major, minor)`: the negotiated value once
+/// The process's effective NVENC API version `(major, minor)`: the negotiated value once
 /// `nvenc_negotiate` has run, otherwise the pinned `NVENCAPI_VERSION` decomposed (major in the low
 /// byte, minor at bit 24) as the pre-negotiation fallback.
 #[inline]
@@ -283,7 +283,7 @@ fn nvenc_cur_ver() -> (u32, u32) {
         .unwrap_or((NVENCAPI_VERSION & 0xFF, (NVENCAPI_VERSION >> 24) & 0xFF))
 }
 
-/// @brief The struct-version word for `s` tagged with the process's negotiated API version — the
+/// The struct-version word for `s` tagged with the process's negotiated API version — the
 /// value every NVENCAPI struct literal assigns to its `version` field.
 #[inline]
 fn sv(s: NvStruct) -> u32 {
@@ -291,7 +291,7 @@ fn sv(s: NvStruct) -> u32 {
     nvenc_struct_ver(s, m, n)
 }
 
-/// @brief The negotiated session `apiVersion` word (`major | minor<<24`) passed to
+/// The negotiated session `apiVersion` word (`major | minor<<24`) passed to
 /// `NvEncOpenEncodeSessionEx` — note the minor sits at bit 24 here, unlike the `(major<<4)|minor`
 /// packing that `NvStruct::rev` matches on.
 #[inline]
@@ -300,7 +300,7 @@ fn neg_api() -> u32 {
     m | (n << 24)
 }
 
-/// @brief Resolve the process-wide NVENC API version once, by probing the driver newest-first and
+/// Resolve the process-wide NVENC API version once, by probing the driver newest-first and
 /// remembering the highest version it accepts.
 ///
 /// The bundled nv-codec-headers are NVENC 13.0 (`pinned`), so a current driver negotiates 13.0
@@ -367,7 +367,7 @@ fn nvenc_negotiate(lib: &NvencLibrary) {
     });
 }
 
-/// @brief Cached CUDA import of a dmabuf, keyed by fd so a recurring capture buffer is imported
+/// Cached CUDA import of a dmabuf, keyed by fd so a recurring capture buffer is imported
 /// once: the `EGLImageKHR`, the CUDA graphics resource it registers as, and the mapped `CUeglFrame`.
 /// Torn down on drop / reconfigure.
 struct CachedDmaBuf {
@@ -376,7 +376,7 @@ struct CachedDmaBuf {
     egl_frame: CUeglFrame,
 }
 
-/// @brief GUID selecting the H.264 **High** profile (4:2:0) for `NV_ENC_CONFIG::profileGUID`.
+/// GUID selecting the H.264 **High** profile (4:2:0) for `NV_ENC_CONFIG::profileGUID`.
 const NV_ENC_H264_PROFILE_HIGH_GUID: GUID = GUID {
     Data1: 0x205b553d,
     Data2: 0x5f01,
@@ -384,7 +384,7 @@ const NV_ENC_H264_PROFILE_HIGH_GUID: GUID = GUID {
     Data4: [0x91, 0x84, 0xda, 0x32, 0x77, 0x5b, 0x55, 0x9b],
 };
 
-/// @brief GUID selecting the H.264 **High 4:4:4 Predictive** profile for full-color encoding.
+/// GUID selecting the H.264 **High 4:4:4 Predictive** profile for full-color encoding.
 const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
     Data1: 0x7ac663cb,
     Data2: 0xa598,
@@ -392,7 +392,7 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
     Data4: [0xb8, 0x44, 0x33, 0x9b, 0x26, 0x1a, 0x7d, 0x5c],
 };
 
-/// @brief A live NVENC H.264 encoder session with its CUDA context and interop resources.
+/// A live NVENC H.264 encoder session with its CUDA context and interop resources.
 ///
 /// One instance owns a CUDA context bound to a specific GPU plus an NVENC session and everything
 /// the three input paths need:
@@ -444,7 +444,7 @@ pub struct NvencEncoder {
 
 unsafe impl Send for NvencEncoder {}
 
-/// @brief Release every GPU resource the session holds, in the one teardown order the drivers
+/// Release every GPU resource the session holds, in the one teardown order the drivers
 /// tolerate, so nothing leaks and no still-referenced handle is ever freed out from under the
 /// driver.
 ///
@@ -523,7 +523,7 @@ impl Drop for NvencEncoder {
     }
 }
 
-/// @brief The lowest H.264 level (nvcodec-sys numeric encoding: 52/60/61/62 for 5.2/6.0/6.1/6.2)
+/// The lowest H.264 level (nvcodec-sys numeric encoding: 52/60/61/62 for 5.2/6.0/6.1/6.2)
 /// whose Annex-A limits fit this resolution and frame rate, floored at 5.2.
 ///
 /// A frame's cost is measured two ways against Annex-A Table A-1: **MaxFS**, the frame size in
@@ -553,7 +553,7 @@ fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
 }
 
 impl NvencEncoder {
-    /// @brief Resolve EGL at runtime rather than link against it, so one binary boots even on hosts
+    /// Resolve EGL at runtime rather than link against it, so one binary boots even on hosts
     /// without EGL — it is needed only by the zero-copy dmabuf path — and reach the
     /// `eglCreateImageKHR` / `eglDestroyImageKHR` entry points through `eglGetProcAddress` because
     /// they are KHR *extensions* the base `libEGL` is not obliged to export as plain symbols.
@@ -594,7 +594,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Resolve the CUDA driver library (`libcuda.so.1`, or `nvcuda.dll` on Windows) at
+    /// Resolve the CUDA driver library (`libcuda.so.1`, or `nvcuda.dll` on Windows) at
     /// runtime so the crate links against no CUDA SDK and still runs wherever a driver is installed,
     /// binding every `cu*` entry point up front so the per-frame hot path is plain indirect calls
     /// with no repeated symbol lookups. A missing symbol errors with its name, turning an ABI
@@ -652,7 +652,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Resolve `libnvidia-encode` at runtime for the same reason as CUDA — no SDK to link,
+    /// Resolve `libnvidia-encode` at runtime for the same reason as CUDA — no SDK to link,
     /// runs against whatever driver ships — binding `NvEncodeAPICreateInstance` as the sole entry
     /// point every later encode call is reached through. `NvEncodeAPIGetMaxSupportedVersion` is kept
     /// optional and bound only when present, because very old drivers lack it; negotiation then falls
@@ -680,7 +680,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Turn a `CUresult` into the driver's own error name via `cuGetErrorName` so a failure
+    /// Turn a `CUresult` into the driver's own error name via `cuGetErrorName` so a failure
     /// logs something diagnosable (e.g. `CUDA_ERROR_OUT_OF_MEMORY`) instead of a bare integer,
     /// falling back to the numeric code only when the name is unavailable.
     unsafe fn get_error_string(cuda: &CudaFunctions, err: CUresult) -> String {
@@ -692,7 +692,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Log the CUDA devices CUDA can enumerate — a debug aid when session init fails to find
+    /// Log the CUDA devices CUDA can enumerate — a debug aid when session init fails to find
     /// or bind the expected GPU.
     unsafe fn probe_devices(cuda: &CudaFunctions) {
         let mut count = 0;
@@ -710,7 +710,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief The PCI bus ID of the GPU behind `/dev/dri/renderD<128+index>`, read from the sysfs
+    /// The PCI bus ID of the GPU behind `/dev/dri/renderD<128+index>`, read from the sysfs
     /// device symlink, so CUDA can bind to the same physical GPU the capture render node lives on.
     fn get_pci_bus_id(render_index: i32) -> Option<String> {
         let path = format!("/sys/class/drm/renderD{}/device", 128 + render_index);
@@ -724,7 +724,7 @@ impl NvencEncoder {
         None
     }
 
-    /// @brief Build a live NVENC session: bind CUDA to the target GPU, open and configure the H.264
+    /// Build a live NVENC session: bind CUDA to the target GPU, open and configure the H.264
     /// encoder, and allocate its input and output buffers.
     ///
     /// The sequence:
@@ -1101,7 +1101,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Resize the live session to `settings` in place, folding in the current rate / QP /
+    /// Resize the live session to `settings` in place, folding in the current rate / QP /
     /// fps, without tearing it down.
     ///
     /// The NVENC session, CUDA context and bitstream buffers survive, so a resize costs a few
@@ -1291,7 +1291,7 @@ impl NvencEncoder {
         Ok(())
     }
 
-    /// @brief Drop every page-locked host registration, under the pushed CUDA context.
+    /// Drop every page-locked host registration, under the pushed CUDA context.
     ///
     /// Called when the capture's shm segments are recreated at unchanged dimensions: the new
     /// segments often reuse the old base addresses, so a stale registration would alias fresh memory.
@@ -1312,13 +1312,13 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Swap the recording fan-out sink for a session kept alive across capture restarts —
+    /// Swap the recording fan-out sink for a session kept alive across capture restarts —
     /// each restart rebinds the socket, so the previous sink must not be written to after the swap.
     pub fn set_recording_sink(&mut self, sink: Option<Arc<RecordingSink>>) {
         self.recording_sink = sink;
     }
 
-    /// @brief Reconfigure the live session's ConstQP when `target_qp` differs from the current QP,
+    /// Reconfigure the live session's ConstQP when `target_qp` differs from the current QP,
     /// returning whether a reconfigure actually happened.
     ///
     /// A no-op in CBR mode (bitrate-controlled, so QP-based paint-over does not apply) and when the
@@ -1357,7 +1357,7 @@ impl NvencEncoder {
         false
     }
 
-    /// @brief Apply a runtime rate-control / frame-rate change to the live session.
+    /// Apply a runtime rate-control / frame-rate change to the live session.
     ///
     /// In CBR mode the target bitrate, max bitrate and VBV buffer size are updated (the VBV is
     /// ignored outside CBR); the target fps is updated in either mode. The session is reconfigured
@@ -1415,7 +1415,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Encode one mapped input picture and return its bitstream bytes behind the wire header.
+    /// Encode one mapped input picture and return its bitstream bytes behind the wire header.
     ///
     /// The shared tail of all three encode paths:
     ///
@@ -1504,7 +1504,7 @@ impl NvencEncoder {
         Ok(output)
     }
 
-    /// @brief Encode a dmabuf frame zero-copy, by importing it through EGL into CUDA.
+    /// Encode a dmabuf frame zero-copy, by importing it through EGL into CUDA.
     ///
     /// Applies any pending ConstQP change, then works under the pushed CUDA context:
     ///
@@ -1644,7 +1644,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
+    /// Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
     /// CPU-side colour conversion.
     ///
     /// The packed rows are copied host→device into the registered ARGB surface and NVENC's hardware
@@ -1718,7 +1718,7 @@ impl NvencEncoder {
         }
     }
 
-    /// @brief Encode a raw planar frame — NV12 (4:2:0) or YUV444 — uploaded host→device.
+    /// Encode a raw planar frame — NV12 (4:2:0) or YUV444 — uploaded host→device.
     ///
     /// The planar-input counterpart to `encode_cpu_argb`, used when the caller has already produced
     /// YUV. The chroma format follows the session's `chromaFormatIDC` (3 ⇒ YUV444, else NV12). Flow
@@ -1937,7 +1937,7 @@ impl NvencEncoder {
 mod gpu_tests {
     use super::*;
 
-    /// @brief Test helper: H.264 full-frame capture settings at `w×h`, `fps`, CRF 25.
+    /// Test helper: H.264 full-frame capture settings at `w×h`, `fps`, CRF 25.
     fn settings(w: i32, h: i32, fps: f64) -> RustCaptureSettings {
         RustCaptureSettings {
             width: w,
@@ -1949,7 +1949,7 @@ mod gpu_tests {
         }
     }
 
-    /// @brief Test helper: a `w×h` BGRA frame filled with a hashed gradient (offset by `seed`) so
+    /// Test helper: a `w×h` BGRA frame filled with a hashed gradient (offset by `seed`) so
     /// the content has structure and encodes are non-trivial.
     fn frame(w: usize, h: usize, seed: u8) -> Vec<u8> {
         let mut f = vec![0u8; w * h * 4];
@@ -1963,7 +1963,7 @@ mod gpu_tests {
         f
     }
 
-    /// @brief Test helper: read the big-endian width/height (bytes 6-9) from a 10-byte wire header.
+    /// Test helper: read the big-endian width/height (bytes 6-9) from a 10-byte wire header.
     fn wire_dims(pkt: &[u8]) -> (u16, u16) {
         (
             u16::from_be_bytes([pkt[6], pkt[7]]),
@@ -1971,7 +1971,7 @@ mod gpu_tests {
         )
     }
 
-    /// @brief End-to-end in-place resize on a real GPU: encode 720p, grow to 1080p and verify the
+    /// End-to-end in-place resize on a real GPU: encode 720p, grow to 1080p and verify the
     /// first post-resize frame is an IDR (steady frames are P), shrink to 480p, exercise the
     /// rejection cases (beyond headroom, chroma flip, RC-mode flip) and confirm the session still
     /// encodes afterward, and optionally dump a decodable stream. Ignored by default; run with
@@ -2053,7 +2053,7 @@ mod gpu_tests {
         }
     }
 
-    /// @brief On a real GPU, a CBR session resized 720p→1080p folds the new bitrate into the resize
+    /// On a real GPU, a CBR session resized 720p→1080p folds the new bitrate into the resize
     /// reconfigure (asserts `averageBitRate` updated to 8 Mbit/s) and the first post-resize frame is
     /// an IDR at the new dimensions. Ignored by default.
     #[test]
@@ -2081,7 +2081,7 @@ mod gpu_tests {
         assert_eq!(wire_dims(&pkt), (1920, 1080));
     }
 
-    /// @brief On a real GPU, print the device-memory cost of one 1080p session (via `nvidia-smi`),
+    /// On a real GPU, print the device-memory cost of one 1080p session (via `nvidia-smi`),
     /// for measuring the reconfigure-headroom overhead. Ignored by default.
     #[test]
     #[ignore]
@@ -2103,7 +2103,7 @@ mod gpu_tests {
         println!("VRAM delta for one 1080p session: {} MiB", used_mb() - before);
     }
 
-    /// @brief On a real GPU, a session that starts taller than the default 2304 headroom (portrait
+    /// On a real GPU, a session that starts taller than the default 2304 headroom (portrait
     /// 4K: 2160×4096, within NVENC's 4096 H.264 cap) takes its own size as the `maxEncode` ceiling
     /// and encodes at that resolution. Ignored by default.
     #[test]
@@ -2125,7 +2125,7 @@ mod gpu_tests {
 mod version_tests {
     use super::*;
 
-    /// @brief Every version-tagged struct, in one fixed order, paired with its pinned compile-time
+    /// Every version-tagged struct, in one fixed order, paired with its pinned compile-time
     /// `NV_ENC_*_VER` constant — the reference both version tests iterate.
     const ALL: [(NvStruct, u32); 12] = [
         (NvStruct::FunctionList, NV_ENCODE_API_FUNCTION_LIST_VER),
@@ -2142,7 +2142,7 @@ mod version_tests {
         (NvStruct::LockBitstream, NV_ENC_LOCK_BITSTREAM_VER),
     ];
 
-    /// @brief For the pinned nvcodec-sys version, `nvenc_struct_ver` must reproduce every
+    /// For the pinned nvcodec-sys version, `nvenc_struct_ver` must reproduce every
     /// compile-time `NV_ENC_*_VER` constant exactly — guaranteeing a current driver is stamped
     /// byte-for-byte identically — and the packed major/minor must round-trip `NVENCAPI_VERSION`.
     /// Fails loudly if the bundled header is bumped without extending the revision table.
@@ -2156,7 +2156,7 @@ mod version_tests {
         assert_eq!(maj | (min << 24), NVENCAPI_VERSION);
     }
 
-    /// @brief `nvenc_struct_ver` must reproduce the exact `NV_ENC_*_VER` words each SDK defined, for
+    /// `nvenc_struct_ver` must reproduce the exact `NV_ENC_*_VER` words each SDK defined, for
     /// every negotiable version 10.0 through 13.0.
     ///
     /// The expected words are hardcoded from `nvEncodeAPI.h` at the FFmpeg nv-codec-headers tags

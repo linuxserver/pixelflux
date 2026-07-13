@@ -29,13 +29,13 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Once;
 
-/// @brief The ioctl command number (`_IOC_NR`, bits 0-7) that identifies the RM control escape —
+/// The ioctl command number (`_IOC_NR`, bits 0-7) that identifies the RM control escape —
 /// the low byte the request gate keys on to recognize `NV_RM_CONTROL_REQUEST`. Kept as a named
 /// constant only for documentation and the `ioc_nr_extracts_low_byte` unit test, hence
 /// `#[allow(dead_code)]`.
 #[allow(dead_code)]
 const NV_ESC_RM_CONTROL: c_ulong = 0x2A;
-/// @brief The RM control ioctl the gate recognizes: `_IOWR('F'=0x46, NR=0x2A,
+/// The RM control ioctl the gate recognizes: `_IOWR('F'=0x46, NR=0x2A,
 /// sizeof(NVOS54_PARAMETERS)=32)`, encoding DIR=READ|WRITE, TYPE=0x46, NR=0x2A, SIZE=0x20.
 ///
 /// Matching is by DIR|TYPE|NR with the encoded `_IOC_SIZE` deliberately masked off (via
@@ -45,37 +45,37 @@ const NV_ESC_RM_CONTROL: c_ulong = 0x2A;
 /// gate keys on DIR|TYPE|NR and validates the true per-command parameter layout separately via
 /// `ctrl.params_size`. This is the deliberate middle ground.
 const NV_RM_CONTROL_REQUEST: c_ulong = 0xC020_462A;
-/// @brief Locates the `_IOC_SIZE` field so it can be cleared for size-agnostic request matching:
+/// Locates the `_IOC_SIZE` field so it can be cleared for size-agnostic request matching:
 /// the 14-bit encoded parameter size lives at bit 16 of an ioctl request (`asm-generic/ioctl.h`).
 /// Paired with `IOC_SIZEMASK` by `ioc_no_size`.
 const IOC_SIZESHIFT: u32 = 16;
-/// @brief 14-bit mask covering the `_IOC_SIZE` field (`(1 << 14) - 1`); shifted by `IOC_SIZESHIFT`
+/// 14-bit mask covering the `_IOC_SIZE` field (`(1 << 14) - 1`); shifted by `IOC_SIZESHIFT`
 /// and cleared from a request by `ioc_no_size` so the driver's param-struct size cannot affect the
 /// match.
 const IOC_SIZEMASK: c_ulong = 0x3FFF;
-/// @brief Identifies the attached-GPU enumeration response the filter rewrites — RM control command
+/// Identifies the attached-GPU enumeration response the filter rewrites — RM control command
 /// `NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS`, matched against `NvRmControlParams::cmd`.
 const GPU_GET_ATTACHED_IDS: u32 = 0x0201;
-/// @brief Identifies the probed-GPU enumeration response the filter rewrites — RM control command
+/// Identifies the probed-GPU enumeration response the filter rewrites — RM control command
 /// `NV0000_CTRL_CMD_GPU_GET_PROBED_IDS`, matched against `NvRmControlParams::cmd`.
 const GPU_GET_PROBED_IDS: u32 = 0x0214;
-/// @brief The RM ABI caps attached GPUs at 32, so this is the fixed `gpuIds` array capacity in both
+/// The RM ABI caps attached GPUs at 32, so this is the fixed `gpuIds` array capacity in both
 /// enumeration params structs — and the bound the filter's scans and scratch buffers are sized to.
 const MAX_ATTACHED_GPUS: usize = 32;
-/// @brief Marks the end of the live ids: the RM fills unused `gpuIds` slots with this sentinel, so
+/// Marks the end of the live ids: the RM fills unused `gpuIds` slots with this sentinel, so
 /// the first `INVALID_GPU_ID` terminates the populated prefix the filter scans and rewrites.
 const INVALID_GPU_ID: u32 = 0xFFFF_FFFF;
-/// @brief The `params_size` that marks an ATTACHED response and tells it apart from PROBED: both
+/// The `params_size` that marks an ATTACHED response and tells it apart from PROBED: both
 /// structs open with the same `gpuIds[32]`, so only the exact total size (here `gpuIds[32]` =
 /// `4 * MAX_ATTACHED_GPUS`) disambiguates them before the shared leading array is rewritten.
 const ATTACHED_PARAMS_SIZE: usize = 4 * MAX_ATTACHED_GPUS;
-/// @brief The `params_size` that marks a PROBED response and tells it apart from ATTACHED: this
+/// The `params_size` that marks a PROBED response and tells it apart from ATTACHED: this
 /// struct is `gpuIds[32]` followed by `excludedGpuIds[32]` (`4 * MAX_ATTACHED_GPUS * 2`). Only the
 /// shared leading `gpuIds[32]` is rewritten; the trailing `excludedGpuIds[32]` lists GPUs to
 /// exclude, not to use, so it is deliberately left untouched.
 const PROBED_PARAMS_SIZE: usize = 4 * MAX_ATTACHED_GPUS * 2;
 
-/// @brief The param block the RM control ioctl hands back (`NVOS54_PARAMETERS`, 32 bytes, pointed at
+/// The param block the RM control ioctl hands back (`NVOS54_PARAMETERS`, 32 bytes, pointed at
 /// by `arg`) — modeled here so the filter can identify and validate an enumeration call before it
 /// touches the GPU-id array it carries.
 ///
@@ -93,40 +93,40 @@ struct NvRmControlParams {
     status: u32,
 }
 
-/// @brief The `DT_*` `.dynamic` tags the GOT patch needs to locate a library's symbol, string, and
+/// The `DT_*` `.dynamic` tags the GOT patch needs to locate a library's symbol, string, and
 /// relocation tables — spelled out here because libc exposes `PT_DYNAMIC` but not these individual
 /// values. `DT_NULL` (0) terminates the array.
 const DT_NULL: i64 = 0;
-/// @brief ELF `.dynamic` tag `DT_PLTRELSZ` (2): total byte size of the PLT relocation table.
+/// ELF `.dynamic` tag `DT_PLTRELSZ` (2): total byte size of the PLT relocation table.
 const DT_PLTRELSZ: i64 = 2;
-/// @brief ELF `.dynamic` tag `DT_RELA` (7): address of the general relocation table (`.rela.dyn`).
+/// ELF `.dynamic` tag `DT_RELA` (7): address of the general relocation table (`.rela.dyn`).
 const DT_RELA: i64 = 7;
-/// @brief ELF `.dynamic` tag `DT_RELASZ` (8): total byte size of the `.rela.dyn` relocation table.
+/// ELF `.dynamic` tag `DT_RELASZ` (8): total byte size of the `.rela.dyn` relocation table.
 const DT_RELASZ: i64 = 8;
-/// @brief ELF `.dynamic` tag `DT_STRTAB` (5): address of the dynamic string table (symbol names).
+/// ELF `.dynamic` tag `DT_STRTAB` (5): address of the dynamic string table (symbol names).
 const DT_STRTAB: i64 = 5;
-/// @brief ELF `.dynamic` tag `DT_SYMTAB` (6): address of the dynamic symbol table.
+/// ELF `.dynamic` tag `DT_SYMTAB` (6): address of the dynamic symbol table.
 const DT_SYMTAB: i64 = 6;
-/// @brief ELF `.dynamic` tag `DT_JMPREL` (23): address of the PLT relocation table (`.rela.plt`).
+/// ELF `.dynamic` tag `DT_JMPREL` (23): address of the PLT relocation table (`.rela.plt`).
 const DT_JMPREL: i64 = 23;
 
-/// @brief Why the filter also handles eager GOT binds: `R_X86_64_GLOB_DAT` (6) names a GOT slot
+/// Why the filter also handles eager GOT binds: `R_X86_64_GLOB_DAT` (6) names a GOT slot
 /// bound eagerly, the form `-fno-plt` builds use — and NVIDIA libraries route `ioctl` through such a
 /// slot in `.rela.dyn`. Alongside `R_X86_64_JUMP_SLOT`, it names a GOT entry holding a function
 /// pointer the filter repoints.
 const R_X86_64_GLOB_DAT: u32 = 6;
-/// @brief The classic lazily-bound PLT GOT slot the filter repoints: `R_X86_64_JUMP_SLOT` (7), found
+/// The classic lazily-bound PLT GOT slot the filter repoints: `R_X86_64_JUMP_SLOT` (7), found
 /// in `.rela.plt`, names a GOT entry holding a function pointer — the common case, paired with
 /// `R_X86_64_GLOB_DAT` for the `-fno-plt` case.
 const R_X86_64_JUMP_SLOT: u32 = 7;
 
-/// @brief Identity of the RM control device, cached so the hook only rewrites responses that truly
+/// Identity of the RM control device, cached so the hook only rewrites responses that truly
 /// came from it: the `rdev` of `/dev/nvidiactl`, resolved once at `install()`. A value of 0 means it
 /// was never resolved, in which case the fd-identity gate is skipped and matching falls back to the
 /// request/size checks alone.
 static NVIDIACTL_RDEV: AtomicU64 = AtomicU64::new(0);
 
-/// @brief One `Elf64_Dyn` entry, modeled so the GOT patch can iterate a library's `.dynamic` array:
+/// One `Elf64_Dyn` entry, modeled so the GOT patch can iterate a library's `.dynamic` array:
 /// a `d_tag` (`DT_*`) paired with `d_un`, the 64-bit `d_val`/`d_ptr` union interpreted per tag.
 #[repr(C)]
 struct Elf64Dyn {
@@ -134,7 +134,7 @@ struct Elf64Dyn {
     d_un: u64,
 }
 
-/// @brief One `Elf64_Rela` relocation entry, modeled so the patch can find each GOT slot and the
+/// One `Elf64_Rela` relocation entry, modeled so the patch can find each GOT slot and the
 /// symbol it binds: `r_offset` (the target GOT slot, base-relative), `r_info` (packed symbol index +
 /// relocation type, split by `elf64_r_sym`/`elf64_r_type`), and the unused `r_addend`.
 #[repr(C)]
@@ -144,21 +144,21 @@ struct Elf64Rela {
     r_addend: i64,
 }
 
-/// @brief Extract the symbol-table index from an `Elf64_Rela` `r_info` field (its high 32 bits) —
+/// Extract the symbol-table index from an `Elf64_Rela` `r_info` field (its high 32 bits) —
 /// how the patch learns which symbol a relocation binds, so it can check for `ioctl`.
 #[inline]
 fn elf64_r_sym(info: u64) -> u64 {
     info >> 32
 }
 
-/// @brief Extract the relocation type from an `Elf64_Rela` `r_info` field (its low 32 bits) — how
+/// Extract the relocation type from an `Elf64_Rela` `r_info` field (its low 32 bits) — how
 /// the patch tells a `JUMP_SLOT`/`GLOB_DAT` GOT entry from relocations it must ignore.
 #[inline]
 fn elf64_r_type(info: u64) -> u32 {
     (info & 0xffff_ffff) as u32
 }
 
-/// @brief Extract the `_IOC_NR` command byte (bits 0-7) of an ioctl request — the field that names
+/// Extract the `_IOC_NR` command byte (bits 0-7) of an ioctl request — the field that names
 /// the command. Used only by documentation and the `ioc_nr_extracts_low_byte` unit test, hence
 /// `#[allow(dead_code)]`.
 #[allow(dead_code)]
@@ -167,7 +167,7 @@ fn ioc_nr(req: c_ulong) -> c_ulong {
     req & 0xFF
 }
 
-/// @brief Strip the `_IOC_SIZE` field from a request (leaving DIR|TYPE|NR) so the gate stays bound
+/// Strip the `_IOC_SIZE` field from a request (leaving DIR|TYPE|NR) so the gate stays bound
 /// to the exact RM control command without coupling to any one driver's param-struct size — a driver
 /// that changes `sizeof(NVOS54_PARAMETERS)` must still match.
 #[inline]
@@ -175,7 +175,7 @@ fn ioc_no_size(req: c_ulong) -> c_ulong {
     req & !(IOC_SIZEMASK << IOC_SIZESHIFT)
 }
 
-/// @brief The reachability test the whole filter turns on: a GPU id is kept only if its
+/// The reachability test the whole filter turns on: a GPU id is kept only if its
 /// `/dev/nvidia{minor}` node is actually present in the container, checked here via `access(F_OK)` on
 /// a NUL-terminated path.
 fn node_present(minor: u32) -> bool {
@@ -183,7 +183,7 @@ fn node_present(minor: u32) -> bool {
     unsafe { libc::access(path.as_ptr() as *const c_char, libc::F_OK) == 0 }
 }
 
-/// @brief Map an RM `gpuId` to the `/dev/nvidia` minor that `node_present` needs: the id only
+/// Map an RM `gpuId` to the `/dev/nvidia` minor that `node_present` needs: the id only
 /// carries a PCI address, not a device minor, so this bridges the two by scanning
 /// `/proc/driver/nvidia/gpus`, returning -1 when no match is found.
 ///
@@ -238,7 +238,7 @@ fn gpuid_to_minor(gpu_id: u32) -> i32 {
     -1
 }
 
-/// @brief Drop the hidden GPUs from a `gpuIds[]` array in place — but only ever a strict subset, so
+/// Drop the hidden GPUs from a `gpuIds[]` array in place — but only ever a strict subset, so
 /// the filter can never accidentally blank out every GPU and strand the container with none. Ids
 /// that pass `keep` are compacted to the front and the rest back-filled with `INVALID_GPU_ID`.
 ///
@@ -272,7 +272,7 @@ fn filter_ids(ids: &mut [u32; MAX_ATTACHED_GPUS], keep: impl Fn(u32) -> bool) {
     }
 }
 
-/// @brief The seam where a hidden GPU gets scrubbed out: the `ioctl` wrapper installed into the
+/// The seam where a hidden GPU gets scrubbed out: the `ioctl` wrapper installed into the
 /// NVIDIA libraries' GOT slots, which forwards to the real `libc::ioctl` and then post-processes the
 /// response. The three steps below exist only to make interposing on `ioctl` safe:
 ///
@@ -295,7 +295,7 @@ unsafe extern "C" fn filtered_ioctl(fd: c_int, req: c_ulong, arg: *mut c_void) -
     rc
 }
 
-/// @brief Scrub the hidden GPUs out of a successful `GET_ATTACHED_IDS` / `GET_PROBED_IDS` response so
+/// Scrub the hidden GPUs out of a successful `GET_ATTACHED_IDS` / `GET_PROBED_IDS` response so
 /// the NVIDIA libraries never try to peer-init a GPU the container cannot reach: it drops every id
 /// whose `/dev/nvidia` node is absent. Split from `filtered_ioctl` so the whole thing runs under
 /// `catch_unwind`.
@@ -358,7 +358,7 @@ unsafe fn rewrite_attached_ids(fd: c_int, rc: c_int, req: c_ulong, arg: *mut c_v
     }
 }
 
-/// @brief Reports the current `PROT_*` protection of the page holding `addr` (from
+/// Reports the current `PROT_*` protection of the page holding `addr` (from
 /// `/proc/self/maps`, or -1 when the address is not found or maps is unreadable) for two reasons the
 /// GOT patch depends on: so it can refuse to dereference an address that a wrong relative/absolute
 /// guess landed in an unreadable page, and so it can restore a patched GOT page to its true original
@@ -405,7 +405,7 @@ fn page_prot(addr: usize) -> i32 {
     -1
 }
 
-/// @brief Turn a `DT_*` `d_ptr` into an absolute address across libc implementations that disagree
+/// Turn a `DT_*` `d_ptr` into an absolute address across libc implementations that disagree
 /// on what it holds: glibc pre-relocates these pointers to absolute, while musl leaves them
 /// file-relative, so the patch cannot assume either. The heuristic treats a value below the load
 /// `base` as a relative offset to add to `base`, and a value at or above `base` as already absolute.
@@ -419,7 +419,7 @@ fn dyn_addr(base: usize, v: u64) -> usize {
     }
 }
 
-/// @brief Repoint every `ioctl` GOT slot in one loaded library to `filtered_ioctl` by walking its
+/// Repoint every `ioctl` GOT slot in one loaded library to `filtered_ioctl` by walking its
 /// `PT_DYNAMIC` array — the only way to interpose without an LD_PRELOAD object — and it must cover
 /// both the lazy-PLT and `-fno-plt` relocation forms because NVIDIA ships the latter.
 ///
@@ -482,7 +482,7 @@ unsafe fn patch_ioctl_got(base: usize, dynp: *const Elf64Dyn) {
     }
 }
 
-/// @brief Repoint exactly the `ioctl` GOT slots in one relocation table to `filtered_ioctl` and
+/// Repoint exactly the `ioctl` GOT slots in one relocation table to `filtered_ioctl` and
 /// nothing else — every candidate entry is name-checked so no other symbol the library imports is
 /// disturbed. It handles both the `JUMP_SLOT` and `GLOB_DAT` entry forms.
 ///
@@ -536,7 +536,7 @@ unsafe fn patch_reloc_table(
     }
 }
 
-/// @brief `dl_iterate_phdr` callback: for each loaded object matching a targeted NVIDIA library,
+/// `dl_iterate_phdr` callback: for each loaded object matching a targeted NVIDIA library,
 /// find its `PT_DYNAMIC` segment and hand it to `patch_ioctl_got`. Returns 0 to keep iterating.
 ///
 /// 1. **Panic firewall**: the whole body runs under `catch_unwind` because a panic must not unwind
@@ -576,7 +576,7 @@ unsafe extern "C" fn patch_phdr_cb(
     0
 }
 
-/// @brief True when at least one host GPU is hidden from the container — the only situation that
+/// True when at least one host GPU is hidden from the container — the only situation that
 /// can trigger the peer-init bug, so it gates whether the filter installs at all.
 ///
 /// Compares two counts: `host` is the number of GPUs the kernel driver knows, from the non-dot
@@ -591,7 +591,7 @@ fn has_hidden_gpus() -> bool {
     host > visible && visible > 0
 }
 
-/// @brief Install the `GET_ATTACHED_IDS`/`GET_PROBED_IDS` GOT filter, at most once and only when a
+/// Install the `GET_ATTACHED_IDS`/`GET_PROBED_IDS` GOT filter, at most once and only when a
 /// host GPU is hidden from the container. Idempotent and safe to call before every NVENC session
 /// open (guarded by a `Once`).
 ///
@@ -629,7 +629,7 @@ pub fn install() {
 mod tests {
     use super::*;
 
-    /// @brief Dropping a strict subset compacts the survivors and back-fills the rest: of three
+    /// Dropping a strict subset compacts the survivors and back-fills the rest: of three
     /// live ids, keeping two (0x100, 0x300) rewrites the array so the survivors move to the front
     /// and every trailing slot becomes `INVALID_GPU_ID`.
     #[test]
@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(ids[3], INVALID_GPU_ID);
     }
 
-    /// @brief Fail-safe when every id is kept: `nkept == total`, so the array is left exactly as-is
+    /// Fail-safe when every id is kept: `nkept == total`, so the array is left exactly as-is
     /// rather than needlessly rewritten.
     #[test]
     fn filter_noop_when_all_kept() {
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(ids[2], INVALID_GPU_ID);
     }
 
-    /// @brief Fail-safe when no id is kept: `nkept == 0` never blanks the array, so the ids survive
+    /// Fail-safe when no id is kept: `nkept == 0` never blanks the array, so the ids survive
     /// untouched instead of leaving zero usable GPUs.
     #[test]
     fn filter_noop_when_none_kept() {
@@ -670,14 +670,14 @@ mod tests {
         assert_eq!(ids[1], 0xBB);
     }
 
-    /// @brief `ioc_nr` extracts the low NR byte: the full request `0xC020462A` yields
+    /// `ioc_nr` extracts the low NR byte: the full request `0xC020462A` yields
     /// `NV_ESC_RM_CONTROL` (0x2A).
     #[test]
     fn ioc_nr_extracts_low_byte() {
         assert_eq!(ioc_nr(0xC020462A), NV_ESC_RM_CONTROL);
     }
 
-    /// @brief Proves the property the whole gate rests on — matching stays size-agnostic yet
+    /// Proves the property the whole gate rests on — matching stays size-agnostic yet
     /// NR-precise — so a future driver revision cannot silently defeat it. A request that shares
     /// DIR|TYPE|NR but encodes a different `_IOC_SIZE` (here 0x30, versus the canonical 0x20 =
     /// `sizeof(NVOS54_PARAMETERS)`) still matches once the size is masked off, so a driver whose
@@ -693,7 +693,7 @@ mod tests {
         assert_ne!(ioc_no_size(other_nr), base);
     }
 
-    /// @brief Guards against silent NVIDIA ABI drift by pinning the on-wire layout the size dispatch
+    /// Guards against silent NVIDIA ABI drift by pinning the on-wire layout the size dispatch
     /// relies on: ATTACHED params are `gpuIds[32]` (128 bytes) and PROBED params are
     /// `gpuIds[32] + excludedGpuIds[32]` (256 bytes). Because both lead with the same `gpuIds[32]`,
     /// these exact sizes are what let the exact-size guards disambiguate the two commands;

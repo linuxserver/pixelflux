@@ -4,6 +4,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! Wayland cursor shape resolution: converts a `CursorImageStatus` into a PNG image buffer
+//! suitable for the Python cursor callback. Uses `xcursor` to load the system cursor theme
+//! and render the appropriate frame at the current scale.
+
 use image::{ImageBuffer, Rgba};
 use std::io::Cursor as IoCursor;
 use std::io::Read;
@@ -13,7 +17,7 @@ use xcursor::{
     CursorTheme,
 };
 
-/// @brief The loaded XCursor theme, held for the whole capture so cursor lookups stay cheap.
+/// The loaded XCursor theme, held for the whole capture so cursor lookups stay cheap.
 ///
 /// The default cursor's frames are parsed once and kept here because they are consulted on nearly
 /// every frame; the theme handle is retained alongside them so the rarer named cursors (`hand1`,
@@ -25,7 +29,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// @brief Load the theme named by `XCURSOR_THEME` (default `"default"`) at the requested size.
+    /// Load the theme named by `XCURSOR_THEME` (default `"default"`) at the requested size.
     ///
     /// `size_override` comes from `CaptureSettings.cursor_size` (selkies `--cursor-size` /
     /// `XCURSOR_SIZE`); a value `<= 0` falls back to 24. When the theme's default icon cannot be
@@ -57,20 +61,20 @@ impl Cursor {
         Cursor { icons, theme, size }
     }
 
-    /// @brief The default cursor's animation frame for `time`, at the theme size times `scale`.
+    /// The default cursor's animation frame for `time`, at the theme size times `scale`.
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
         let size = self.size * scale;
         frame(time.as_millis() as u32, size, &self.icons)
     }
 
-    /// @brief A named cursor's animation frame for `time`, or `None` when the theme lacks it.
+    /// A named cursor's animation frame for `time`, or `None` when the theme lacks it.
     pub fn get_image_by_name(&self, name: &str, scale: u32, time: Duration) -> Option<Image> {
         let icons = load_icon(&self.theme, name).ok()?;
         let size = self.size * scale;
         Some(frame(time.as_millis() as u32, size, &icons))
     }
 
-    /// @brief A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
+    /// A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
     pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
@@ -91,7 +95,7 @@ impl Cursor {
     }
 }
 
-/// @brief All frames of the theme variant whose pixel size is closest to `size`. XCursor files
+/// All frames of the theme variant whose pixel size is closest to `size`. XCursor files
 /// bundle the same cursor at several sizes, and choosing the nearest one avoids scaling a
 /// mismatched bitmap into a blurry or aliased cursor.
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
@@ -104,7 +108,7 @@ fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
         .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
 }
 
-/// @brief Pick which animation frame to show for the elapsed time, so animated cursors (a spinner,
+/// Pick which animation frame to show for the elapsed time, so animated cursors (a spinner,
 /// a progress ring) actually advance instead of freezing on frame zero; it maps the time onto the
 /// frames by cycling their cumulative delays.
 fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
@@ -122,7 +126,7 @@ fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
     unreachable!()
 }
 
-/// @brief Parse the named icon from the theme's cursor file into its frames.
+/// Parse the named icon from the theme's cursor file into its frames.
 ///
 /// Empty parses are rejected so `nearest_images`'s `min_by_key().unwrap()` cannot panic on a
 /// cursor file that has a valid header but zero images.

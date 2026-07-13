@@ -29,7 +29,7 @@ use openh264::encoder::{
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
 
-/// @brief Suppresses OpenH264's built-in periodic IDR so the GOP is effectively infinite and a
+/// Suppresses OpenH264's built-in periodic IDR so the GOP is effectively infinite and a
 /// keyframe costs bitrate only when something genuinely needs one.
 ///
 /// A wall-clock keyframe cadence spikes bitrate and dents quality on a screen that is not changing,
@@ -38,7 +38,7 @@ use openh264::OpenH264API;
 /// reaches it within a session.
 const INFINITE_INTRA_PERIOD: u32 = 300_000;
 
-/// @brief A deliberately huge bitrate value (100 Mbps, still well under H.264 level 5.2's cap) used
+/// A deliberately huge bitrate value (100 Mbps, still well under H.264 level 5.2's cap) used
 /// wherever rate control must be kept from becoming the binding constraint. Two such places:
 ///
 /// 1. **CRF/CQP rate budget**: passed as the target bitrate so the pinned QP — not the bitrate —
@@ -49,7 +49,7 @@ const INFINITE_INTRA_PERIOD: u32 = 300_000;
 ///    ceiling first is what lets `set_live_bitrate` move the target freely.
 const BITRATE_CEILING_BPS: u32 = 100_000_000;
 
-/// @brief One capture session's worth of OpenH264 state, kept alive between frames because the
+/// One capture session's worth of OpenH264 state, kept alive between frames because the
 /// encoder's reference chain and rate-control state must persist across the whole session — and the
 /// I420 plane buffers are reused every frame to keep the per-frame hot path free of allocation.
 ///
@@ -74,7 +74,7 @@ pub struct Openh264Encoder {
 }
 
 impl Openh264Encoder {
-    /// @brief Build an OpenH264 encoder from the capture settings, or `None` on init failure.
+    /// Build an OpenH264 encoder from the capture settings, or `None` on init failure.
     ///
     /// `None` lets the caller fall back to the x264 software stripe path. Like the NVENC/VAAPI
     /// encoders, this one writes raw Annex-B directly to `recording_sink` and self-prepends the
@@ -177,7 +177,7 @@ impl Openh264Encoder {
         Some(me)
     }
 
-    /// @brief Give every frame four fixed slices and explicit VUI colour signaling (BT.709, limited
+    /// Give every frame four fixed slices and explicit VUI colour signaling (BT.709, limited
     /// range) — the two properties a streaming client depends on that OpenH264 will not produce on
     /// its own: without the slices, encode and decode cannot parallelize; without VUI, the picture
     /// can arrive visibly dark.
@@ -241,7 +241,7 @@ impl Openh264Encoder {
         self.encoder.force_intra_frame();
     }
 
-    /// @brief Apply a live bitrate (kbps) and/or framerate change in place, so the session keeps its
+    /// Apply a live bitrate (kbps) and/or framerate change in place, so the session keeps its
     /// reference chain and infinite GOP instead of taking the visible reset a full rebuild would
     /// force on the viewer.
     ///
@@ -269,7 +269,7 @@ impl Openh264Encoder {
         }
     }
 
-    /// @brief Move the live CBR target to `bps` — but raise the max-bitrate ceiling first, because
+    /// Move the live CBR target to `bps` — but raise the max-bitrate ceiling first, because
     /// OpenH264 refuses any target above the max that construction pinned to the session's *starting*
     /// bitrate.
     ///
@@ -314,7 +314,7 @@ impl Openh264Encoder {
         }
     }
 
-    /// @brief Marshal one `SBitrateInfo` FFI struct and issue a single `SetOption` (BITRATE or
+    /// Marshal one `SBitrateInfo` FFI struct and issue a single `SetOption` (BITRATE or
     /// MAX_BITRATE) for the given layer, returning the raw return code (0 on success). Exists so the
     /// ceiling-raise and the target-set in `set_live_bitrate` share one unsafe marshalling path
     /// rather than open-coding the same `zeroed()`-and-cast dance twice.
@@ -330,7 +330,7 @@ impl Openh264Encoder {
         unsafe { self.encoder.raw_api().set_option(option, std::ptr::addr_of_mut!(info).cast()) }
     }
 
-    /// @brief Encode one host frame and return it framed exactly like the hardware full-frame
+    /// Encode one host frame and return it framed exactly like the hardware full-frame
     /// encoders, so the client demuxes this software path with the same code and cannot tell a
     /// GPU-less session apart. Returns an empty buffer when the frame produced no payload.
     ///
@@ -420,7 +420,7 @@ impl Openh264Encoder {
 mod tests {
     use super::*;
 
-    /// @brief Build a busy, motion-carrying test frame (high-entropy per-pixel content) so the
+    /// Build a busy, motion-carrying test frame (high-entropy per-pixel content) so the
     /// rate controller produces non-trivial P-frames. Fine under CBR (the RC raises QP to fit) but
     /// pathological for a pinned low QP, so the CRF test uses the compressible `gradient_frame`.
     fn busy_frame(w: usize, h: usize, t: usize) -> Vec<u8> {
@@ -438,7 +438,7 @@ mod tests {
         f
     }
 
-    /// @brief Build a smooth diagonal-gradient test frame (moderate, realistic screen-like detail):
+    /// Build a smooth diagonal-gradient test frame (moderate, realistic screen-like detail):
     /// compressible enough not to overflow at a low pinned QP, yet detailed enough that the QP
     /// visibly scales the output size.
     fn gradient_frame(w: usize, h: usize, t: usize) -> Vec<u8> {
@@ -456,7 +456,7 @@ mod tests {
         f
     }
 
-    /// @brief A forced first frame is emitted as a typed IDR with a valid wire header and Annex-B
+    /// A forced first frame is emitted as a typed IDR with a valid wire header and Annex-B
     /// payload; re-encoding identical content (no scene change) yields a typed delta (P) frame
     /// whose header carries the passed frame number.
     #[test]
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(&p[2..4], &[0, 7], "frame_id must come from frame_number");
     }
 
-    /// @brief With `omit_stripe_headers` set, the output is bare Annex-B (start-code prefixed) with
+    /// With `omit_stripe_headers` set, the output is bare Annex-B (start-code prefixed) with
     /// no 10-byte wire header.
     #[test]
     fn omit_stripe_headers_yields_bare_annexb() {
@@ -506,7 +506,7 @@ mod tests {
         );
     }
 
-    /// @brief In CBR mode a lower target bitrate compresses harder: summed output over a busy
+    /// In CBR mode a lower target bitrate compresses harder: summed output over a busy
     /// sequence at 200 kbps is smaller than at 8000 kbps.
     #[test]
     fn lower_bitrate_yields_smaller_output() {
@@ -529,7 +529,7 @@ mod tests {
         assert!(low < high, "lower target bitrate should compress harder (low={low}, high={high})");
     }
 
-    /// @brief Dropping the CBR target live via `reconfigure_rate` (as the web UI slider does)
+    /// Dropping the CBR target live via `reconfigure_rate` (as the web UI slider does)
     /// shrinks subsequent output versus the initial higher-bitrate run.
     #[test]
     fn live_reconfigure_rate_takes_effect() {
@@ -552,7 +552,7 @@ mod tests {
         assert!(low < high, "live bitrate drop should shrink output (low={low}, high={high})");
     }
 
-    /// @brief Raising the CBR target live above the session's initial bitrate is accepted (not
+    /// Raising the CBR target live above the session's initial bitrate is accepted (not
     /// rejected) — which requires lifting OpenH264's max-bitrate ceiling that construction pins to
     /// the starting target — and grows subsequent output well beyond the initial low-bitrate run.
     #[test]
@@ -577,7 +577,7 @@ mod tests {
         assert!(high > low * 3 / 2, "live bitrate raise should grow output (low={low}, high={high})");
     }
 
-    /// @brief In CRF/CQP mode (bitrate-mode RC with a pinned `min == max` QP), a higher `video_crf`
+    /// In CRF/CQP mode (bitrate-mode RC with a pinned `min == max` QP), a higher `video_crf`
     /// — a higher constant QP, stronger compression — produces smaller output than a lower CRF,
     /// confirming the constant QP is actually applied. Uses the compressible gradient frame so a
     /// low pinned QP does not overflow.
@@ -608,7 +608,7 @@ mod tests {
         );
     }
 
-    /// @brief Both input byte orders encode valid, wire-headered Annex-B: the Wayland GLES readback
+    /// Both input byte orders encode valid, wire-headered Annex-B: the Wayland GLES readback
     /// delivers RGBA and X11 delivers BGRA, so `encode_host_argb` is exercised with `rgba_input`
     /// both true and false (colour correctness is verified end-to-end, not here).
     #[test]
@@ -639,7 +639,7 @@ mod tests {
 mod slice_tests {
     use super::*;
 
-    /// @brief A single IDR frame carries at least six NALs (SPS + PPS + four IDR slices),
+    /// A single IDR frame carries at least six NALs (SPS + PPS + four IDR slices),
     /// confirming the fixed four-slice configuration primed by `enable_four_slices`.
     #[test]
     fn four_slices_per_frame() {
@@ -667,7 +667,7 @@ mod slice_tests {
         assert!(nals >= 6, "expected 4-slice IDR (>=6 NALs), got {nals}");
     }
 
-    /// @brief Build a deterministic per-frame noise image — the worst case for rate control
+    /// Build a deterministic per-frame noise image — the worst case for rate control
     /// (incompressible, and screen-mode scene-change detection fires on every frame).
     fn noise_frame(w: usize, h: usize, seed: u32) -> Vec<u8> {
         let mut x = seed.wrapping_mul(2654435761).max(1);
@@ -684,7 +684,7 @@ mod slice_tests {
         v
     }
 
-    /// @brief Diagnostic that the CBR rate controller responds to its target on incompressible
+    /// Diagnostic that the CBR rate controller responds to its target on incompressible
     /// noise, and that QP pinning works.
     ///
     /// Runs 60 noise frames each at CBR 4 Mbps / 500 kbps and at CRF QP51 / QP25, printing
@@ -747,7 +747,7 @@ mod slice_tests {
         assert!(qp51 * 4 < qp25, "QP pinning sanity: 51 must compress far harder than 25");
     }
 
-    /// @brief The four-slice re-init in `enable_four_slices` preserves the CBR rate-control
+    /// The four-slice re-init in `enable_four_slices` preserves the CBR rate-control
     /// parameters: after construction the live `SEncParamExt` still shows the target bitrate, frame
     /// rate, QP headroom (max 51), and enabled frame-skip intact.
     #[test]
@@ -788,7 +788,7 @@ mod slice_tests {
 mod rebuild_cost {
     use super::*;
 
-    /// @brief Measure that constructing the encoder at 1080p is cheap — on the order of
+    /// Measure that constructing the encoder at 1080p is cheap — on the order of
     /// milliseconds.
     ///
     /// OpenH264 has no in-place resolution change (its `SetOption(SVC_ENCODE_PARAM_EXT)`

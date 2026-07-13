@@ -4,6 +4,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! HTTP server implementing the [Anthropic Computer Use](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo) specification.
+//!
+//! Enabled by setting the `PIXELFLUX_CU` environment variable to the listen port. The server
+//! handles `POST /computer-use` requests for screenshots, mouse/keyboard injection, scrolling,
+//! and cursor position queries — all targeting the Wayland compositor owned by the same process.
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -21,7 +27,7 @@ fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
     if v < lo { lo } else if v > hi { hi } else { v }
 }
 
-/// @brief Turn a raw framebuffer into a PNG the Computer Use agent can actually look at.
+/// Turn a raw framebuffer into a PNG the Computer Use agent can actually look at.
 ///
 /// The `screenshot` and `zoom` crop paths have to hand the agent an image, and the API carries it
 /// as base64 PNG, so this encodes a flat RGBA buffer (with its dimensions) through the `image`
@@ -227,7 +233,7 @@ fn handle_action(
     }
 }
 
-/// @brief Turn one parsed Computer Use request into a real action on the captured desktop — the
+/// Turn one parsed Computer Use request into a real action on the captured desktop — the
 /// bridge that lets an external AI agent see and drive the session.
 ///
 /// Every action ultimately becomes a compositor thread command or a framebuffer read, so this is
@@ -504,7 +510,7 @@ fn handle_action_inner(
     }
 }
 
-/// @brief Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
+/// Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
 /// the session much as a human viewer would.
 ///
 /// It runs on its own thread listening on `0.0.0.0:<port>` for POST `/computer-use` JSON actions

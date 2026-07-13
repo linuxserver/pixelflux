@@ -8,26 +8,26 @@ name = "pixelflux"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module"] }
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
 wayland-server = { version = "0.31.10", features = ["dlopen"] }
-wayland-protocols = { version = "0.31", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["server"] }
 crossbeam-channel = "0.5"
-calloop = "0.12"
+calloop = "0.14"
 turbojpeg = "1.3" 
 rayon = "1.10"
 x264-sys = "0.2.2"
 # BSD-licensed Cisco OpenH264 as an alternative software H.264 encoder; builds the
 # vendored C source (needs a C toolchain + nasm), no runtime download. openh264-sys2
 # is used for the raw set_option live-bitrate path the safe wrapper doesn't expose.
-openh264 = "0.8"
-openh264-sys2 = "0.8"
+openh264 = "0.9"
+openh264-sys2 = "0.9"
 libc = "0.2"
 # fast_mode enables YuvConversionMode::Fast: empirically 1.23x faster than libyuv ARGBToI420
 # on x86-64-v3 (AVX2) at <=1 LSB error vs a float BT.709 reference (accuracy preserved).
 yuv = { version = "0.8.9", features = ["fast_mode"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-gbm = "0.14" 
-libloading = "0.8"
+gbm = "0.18" 
+libloading = "0.9"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image. Pure-Rust XCB; links the system libxcb.

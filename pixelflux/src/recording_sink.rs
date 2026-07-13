@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Sender, TrySendError};
 
-/// @brief Bounds how long a single `write` to a recorder's socket may block, so a
+/// Bounds how long a single `write` to a recorder's socket may block, so a
 /// stalled reader cannot wedge its writer thread indefinitely. Without it, a
 /// recorder that stops draining would leave `write` blocked forever, and the
 /// writer could never again check its `stop` flag or make progress; the timeout
@@ -33,7 +33,7 @@ use crossbeam_channel::{bounded, Sender, TrySendError};
 /// merely-slow-but-healthy reader still gets its frames.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// @brief Throttles the accept thread's poll loop, trading a little connection
+/// Throttles the accept thread's poll loop, trading a little connection
 /// pickup latency for not burning a CPU on empty polls. The listener is
 /// deliberately nonblocking so the thread can observe `shutdown` between attempts
 /// instead of parking forever inside `accept()`; the price of that choice is that
@@ -42,7 +42,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// waits for the thread to notice `shutdown` and exit.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// @brief Bounds how long the recorded stream can run without a decode entry
+/// Bounds how long the recorded stream can run without a decode entry
 /// point — the reason a periodic keyframe cadence exists at all. An infinite GOP
 /// would leave a saved file decodable only from its very first frame and
 /// unrecoverable after any gap, so `should_force_idr` requests a fresh IDR every
@@ -51,7 +51,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// `bind`), so a mid-stream joiner need not wait out the cadence.
 const DEFAULT_KEYINT_FRAMES: u32 = 60;
 
-/// @brief Bounds each recorder's backlog so one slow reader can neither grow
+/// Bounds each recorder's backlog so one slow reader can neither grow
 /// memory without limit nor push back on the shared encode thread. Fan-out is a
 /// non-blocking `try_send` into this per-client queue; a reader that falls this
 /// far behind is judged unable to keep up and dropped, sacrificing that one
@@ -60,7 +60,7 @@ const DEFAULT_KEYINT_FRAMES: u32 = 60;
 /// to cap the memory a doomed client can waste.
 const CLIENT_QUEUE_CAP: usize = 256;
 
-/// @brief The sink's handle to one connected recorder — deliberately just the
+/// The sink's handle to one connected recorder — deliberately just the
 /// feed end and a kill switch, never the socket itself. Giving each client its
 /// own bounded channel and a dedicated writer thread that alone owns the stream
 /// is what keeps one slow reader from stalling the fan-out or its peers; the sink
@@ -74,7 +74,7 @@ struct ClientHandle {
     stop: Arc<AtomicBool>,
 }
 
-/// @brief Taps the encoder's H.264 elementary stream to recorders over a Unix
+/// Taps the encoder's H.264 elementary stream to recorders over a Unix
 /// socket, kept out of band from the live viewer transport so recording neither
 /// perturbs nor depends on what viewers see. That separation is the point: a
 /// recorder can attach, stall, or detach without touching the WebSocket / WebRTC
@@ -97,7 +97,7 @@ pub struct RecordingSink {
 }
 
 impl RecordingSink {
-    /// @brief The best-effort entry point to recording: yields a shared sink only
+    /// The best-effort entry point to recording: yields a shared sink only
     /// when recording is both configured and successfully bound, and `None`
     /// otherwise — because recording is an optional tap that must never block or
     /// crash capture. An empty `settings_path` means the feature is simply off; a
@@ -118,7 +118,7 @@ impl RecordingSink {
         }
     }
 
-    /// @brief Stand up the socket and the one long-lived thread that owns it —
+    /// Stand up the socket and the one long-lived thread that owns it —
     /// together the entire listening half of the sink. A single dedicated accept
     /// thread, rather than polling folded into the encode path, is what lets
     /// recorders connect at any point during capture without the frame path ever
@@ -228,7 +228,7 @@ impl RecordingSink {
         })
     }
 
-    /// @brief The sink's answer to "does the recorded stream need a keyframe
+    /// The sink's answer to "does the recorded stream need a keyframe
     /// now?", which the encoder folds into its own keyframe decision — the single
     /// hook through which recording bends the encoder's GOP to its needs (an
     /// immediate entry point for a joiner, a periodic one for seekability) without
@@ -251,7 +251,7 @@ impl RecordingSink {
         }
     }
 
-    /// @brief Hand one encoded frame to every recorder without ever blocking the
+    /// Hand one encoded frame to every recorder without ever blocking the
     /// caller — which matters because the caller is the real-time encode thread,
     /// and a stall here would hitch the live stream for viewers, not just for
     /// recorders. Every choice below serves that constraint: non-blocking sends, a
@@ -312,7 +312,7 @@ impl RecordingSink {
 }
 
 impl Drop for RecordingSink {
-    /// @brief Tear the sink down promptly and completely — stop accepting, end
+    /// Tear the sink down promptly and completely — stop accepting, end
     /// every writer thread, free the socket path — so no thread or bound node
     /// outlives the sink. The subtlety it exists to handle is that a writer thread
     /// can be stuck in either of two states, and each needs a different nudge to
@@ -341,7 +341,7 @@ impl Drop for RecordingSink {
     }
 }
 
-/// @brief Get one whole frame onto a recorder's socket, or fail cleanly — never
+/// Get one whole frame onto a recorder's socket, or fail cleanly — never
 /// leave a partial frame behind, because a truncated Annex-B NAL corrupts the
 /// recorded stream from that point on. Since the socket carries a write timeout,
 /// even a healthy reader can absorb only part of a `write` at a time, so this
@@ -391,7 +391,7 @@ fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> s
     Ok(())
 }
 
-/// @brief The pure cadence arithmetic behind `should_force_idr`, pulled out so
+/// The pure cadence arithmetic behind `should_force_idr`, pulled out so
 /// its off-by-one and its degenerate-cadence guard can be reasoned about and
 /// unit-tested free of the atomics and threading that surround the real counter.
 ///
@@ -408,7 +408,7 @@ fn idr_due(frames_since_idr: u32, keyint_frames: u32) -> bool {
 mod tests {
     use super::idr_due;
 
-    /// @brief The very first call after construction is always due:
+    /// The very first call after construction is always due:
     /// `frames_since_idr` starts at `u32::MAX`, which is what lets a client
     /// that joins before any frame has been encoded still receive an IDR as
     /// its first frame.
@@ -417,7 +417,7 @@ mod tests {
         assert!(idr_due(u32::MAX, 60));
     }
 
-    /// @brief A cadence of 60 is not due until the 59th `frames_since_idr`
+    /// A cadence of 60 is not due until the 59th `frames_since_idr`
     /// value (the 60th call after a reset) and stays due afterward, matching
     /// the reset-on-due bookkeeping in `should_force_idr`.
     #[test]
@@ -429,7 +429,7 @@ mod tests {
         assert!(idr_due(60, keyint));
     }
 
-    /// @brief A `keyint_frames` of 0 or 1 cannot underflow the saturating
+    /// A `keyint_frames` of 0 or 1 cannot underflow the saturating
     /// subtraction and instead makes every call due, at any frame count.
     #[test]
     fn keyint_zero_and_one_do_not_underflow() {

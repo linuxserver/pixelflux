@@ -4,15 +4,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! @brief Headless Smithay compositor that stands in for a real display server so ordinary Wayland
+//! Headless Smithay compositor that stands in for a real display server so ordinary Wayland
 //! clients have somewhere to render — their composited output is exactly what the capture pipeline
 //! reads back and H.264-encodes. There is no monitor, KMS, or libinput in this process, so
 //! everything a desktop session normally receives from hardware — an output to map windows onto, a
 //! seat to deliver input to, a clipboard to share — this frontend has to synthesize itself.
 //!
-//! This module owns [`AppState`], the single context threaded through every Smithay protocol
+//! This module owns `AppState`, the single context threaded through every Smithay protocol
 //! handler, and implements those handlers: `wl_compositor` commit handling with the window
-//! map/configure/focus state machine, seat/keyboard/pointer/touch routing through [`FocusTarget`],
+//! map/configure/focus state machine, seat/keyboard/pointer/touch routing through `FocusTarget`,
 //! clipboard and primary-selection bridging to Python, and the xdg-shell / layer-shell /
 //! xdg-activation / decoration / fractional-scale / dmabuf wiring. It also resolves cursor images
 //! to PNG for the Python callback and provides the serial and monotonic-time helpers the input
@@ -138,19 +138,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
-/// @brief Hand out the next unique, monotonically increasing Wayland event serial. Wayland tags
-/// each event — and the requests that event authorizes — with a serial so both the client and
-/// Smithay can prove a request was caused by a specific event: a popup grab or a selection change is
-/// honored only if it carries the serial of the input event that triggered it. Every injected input
-/// event therefore has to draw a fresh value from this one process-wide counter.
+/// Hand out the next unique, monotonically increasing Wayland event serial.
+///
+/// Wayland tags each event with a serial so clients and Smithay can prove a request was caused
+/// by a specific event (popup grab, selection change). Every injected input event draws a fresh
+/// value from this process-wide atomic counter.
+///
+/// # Returns
+///
+/// A new [`Serial`] value.
 pub fn next_serial() -> Serial {
     Serial::from(SERIAL_COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
-/// @brief Millisecond timestamp for a pointer / keyboard / touch event. Wayland stamps every input
-/// event with a time that clients rely on to order events relative to one another and to time
-/// interactions such as double-click and drag thresholds, and the protocol fixes that field to a
-/// `u32` millisecond count — so this samples `CLOCK_MONOTONIC` and wraps it into exactly that domain.
+/// Millisecond timestamp for pointer / keyboard / touch events.
+///
+/// Samples `CLOCK_MONOTONIC` and wraps it to a `u32` millisecond count as required by the
+/// Wayland protocol for input event timestamps.
+///
+/// # Returns
+///
+/// Monotonic time in milliseconds, wrapping at `u32::MAX`.
 pub fn wayland_time() -> u32 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
@@ -159,10 +167,14 @@ pub fn wayland_time() -> u32 {
     (ts.tv_sec as u32).wrapping_mul(1000).wrapping_add((ts.tv_nsec as u32) / 1_000_000)
 }
 
-/// @brief Microsecond timestamp for relative-pointer motion. Relative motion — the raw-delta path
-/// used by pointer-locked games and similar consumers — carries a higher-resolution `u64`
-/// microsecond time than the millisecond input clock so that sub-frame motion deltas stay
-/// distinguishable; this samples `CLOCK_MONOTONIC` at that finer resolution.
+/// Microsecond timestamp for relative-pointer motion.
+///
+/// Samples `CLOCK_MONOTONIC` at microsecond resolution for the higher-resolution `u64` time
+/// field used by the relative-pointer protocol.
+///
+/// # Returns
+///
+/// Monotonic time in microseconds, wrapping at `u64::MAX`.
 pub fn wayland_utime() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
@@ -171,7 +183,7 @@ pub fn wayland_utime() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
 }
 
-/// @brief The one hardware H.264 encoder session backing a capture. Only a single GPU backend is
+/// The one hardware H.264 encoder session backing a capture. Only a single GPU backend is
 /// ever live for a given capture, and VA-API and NVENC expose entirely different session types, so
 /// this enum is what lets the render and delivery code pass around "the hardware encoder" without
 /// caring which vendor path actually produced the frames.
@@ -181,7 +193,7 @@ pub enum GpuEncoder {
     Nvenc(NvencEncoder),
 }
 
-/// @brief Central context threaded through every Smithay handler; owns the Wayland globals, the
+/// Central context threaded through every Smithay handler; owns the Wayland globals, the
 /// GBM/EGL (or pixman) renderer state, and the capture/encode pipeline state.
 ///
 /// A single `AppState` lives for the whole compositor thread and is mutated in place by the
@@ -308,7 +320,7 @@ pub struct AppState {
     pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
-/// @brief Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
+/// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
 /// confinement region, so activation and cursor-position hints are accepted as no-ops; the global
 /// still exists so clients may bind it without error.
 impl PointerConstraintsHandler for AppState {
@@ -322,7 +334,7 @@ impl PointerConstraintsHandler for AppState {
     ) {}
 }
 
-/// @brief Foreign-toplevel-list protocol: exposes the managed state so Smithay can advertise each
+/// Foreign-toplevel-list protocol: exposes the managed state so Smithay can advertise each
 /// toplevel (title / app-id) to listing clients such as taskbars.
 impl ForeignToplevelListHandler for AppState {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
@@ -330,7 +342,7 @@ impl ForeignToplevelListHandler for AppState {
     }
 }
 
-/// @brief xdg-activation protocol: hands out activation tokens and, on redemption, raises the
+/// xdg-activation protocol: hands out activation tokens and, on redemption, raises the
 /// target window.
 ///
 /// `token_created` accepts every token. `request_activation` honors a token only while it is fresh
@@ -360,7 +372,7 @@ impl XdgActivationHandler for AppState {
     }
 }
 
-/// @brief Carry the X11-style primary selection so middle-click paste works between clients.
+/// Carry the X11-style primary selection so middle-click paste works between clients.
 /// Exposing the managed state lets Smithay record which client currently owns the primary selection;
 /// `focus_changed` then keeps that ownership tracking keyboard focus, so a middle-click pastes from
 /// whichever client the user is actually working in.
@@ -370,7 +382,7 @@ impl PrimarySelectionHandler for AppState {
     }
 }
 
-/// @brief Default every toplevel to server-side decorations so clients don't bake their own title
+/// Default every toplevel to server-side decorations so clients don't bake their own title
 /// bars and borders into the captured image.
 ///
 /// The frontend shows fullscreen application content with no window-manager chrome, so a client
@@ -402,7 +414,7 @@ impl XdgDecorationHandler for AppState {
     }
 }
 
-/// @brief wlr-layer-shell protocol: places panels / overlays / backgrounds (layer surfaces).
+/// wlr-layer-shell protocol: places panels / overlays / backgrounds (layer surfaces).
 ///
 /// `new_layer_surface` resolves the requested output (or the first output), configures the surface
 /// to that output's full pixel size, and maps it into the output's layer map so the render loop
@@ -441,7 +453,7 @@ impl WlrLayerShellHandler for AppState {
     fn layer_destroyed(&mut self, _surface: WlrLayerSurface) {}
 }
 
-/// @brief Core `wl_compositor` protocol: per-surface commit handling plus the window
+/// Core `wl_compositor` protocol: per-surface commit handling plus the window
 /// map/configure/focus state machine.
 impl CompositorHandler for AppState {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -451,7 +463,7 @@ impl CompositorHandler for AppState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-    /// @brief Fold a client's `wl_surface.commit` into compositor state and — the reason the window
+    /// Fold a client's `wl_surface.commit` into compositor state and — the reason the window
     /// logic lives in this handler — walk a brand-new toplevel through the xdg-shell handshake it
     /// must finish before it may be shown.
     ///
@@ -606,7 +618,7 @@ impl CompositorHandler for AppState {
 
 
 impl AppState {
-    /// @brief Drain a clipboard read staged by `new_selection` and hand `(mime, bytes)` to the
+    /// Drain a clipboard read staged by `new_selection` and hand `(mime, bytes)` to the
     /// Python callback off-thread.
     ///
     /// Runs from the loop *after* the dispatch that stored the new client source, so the request
@@ -691,7 +703,7 @@ impl AppState {
     }
 
 
-    /// @brief Resolve a `CursorImageStatus` to PNG bytes plus hotspot and invoke the Python cursor
+    /// Resolve a `CursorImageStatus` to PNG bytes plus hotspot and invoke the Python cursor
     /// callback. Also re-invoked from the calloop command handlers to replay the retained cursor
     /// when a callback re-registers or a capture restarts.
     ///
@@ -936,7 +948,7 @@ impl AppState {
     }
 }
 
-/// @brief Clipboard mime types the bridge can hand to Python, most specific first; `new_selection`
+/// Clipboard mime types the bridge can hand to Python, most specific first; `new_selection`
 /// picks the first of these that the client's source offers.
 const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "image/png",
@@ -950,13 +962,13 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "TEXT",
 ];
 
-/// @brief Selection (clipboard) bridge between Wayland clients and Python. `SelectionUserData` is
+/// Selection (clipboard) bridge between Wayland clients and Python. `SelectionUserData` is
 /// the Python-owned payload `(mime, bytes)` served to pasting clients when Python holds the
 /// selection.
 impl SelectionHandler for AppState {
     type SelectionUserData = std::sync::Arc<(String, Vec<u8>)>;
 
-    /// @brief A client took the clipboard: pick the best offered mime and stage it for the loop to
+    /// A client took the clipboard: pick the best offered mime and stage it for the loop to
     /// read.
     ///
     /// Only client-owned clipboard (not primary) selections are relayed to Python. Among the
@@ -992,7 +1004,7 @@ impl SelectionHandler for AppState {
         let _ = seat;
     }
 
-    /// @brief A client pastes the Python-owned selection: stream the stored bytes into the client's
+    /// A client pastes the Python-owned selection: stream the stored bytes into the client's
     /// fd on a spawned thread, since the receiving pipe may backpressure.
     fn send_selection(
         &mut self,
@@ -1014,36 +1026,36 @@ impl SelectionHandler for AppState {
     }
 }
 
-/// @brief `wl_data_device` protocol: exposes the managed state for drag-and-drop and clipboard
+/// `wl_data_device` protocol: exposes the managed state for drag-and-drop and clipboard
 /// data transfers.
 impl DataDeviceHandler for AppState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
     }
 }
-/// @brief wlr-data-control protocol: exposes the managed state so privileged clients can read and
+/// wlr-data-control protocol: exposes the managed state so privileged clients can read and
 /// set selections.
 impl DataControlHandler for AppState {
     fn data_control_state(&mut self) -> &mut DataControlState {
         &mut self.data_control_state
     }
 }
-/// @brief Marker impl enabling Wayland drag-and-drop grabs with Smithay's default behavior.
+/// Marker impl enabling Wayland drag-and-drop grabs with Smithay's default behavior.
 impl WaylandDndGrabHandler for AppState {}
-/// @brief Buffer lifecycle hook: buffer destruction needs no bookkeeping here.
+/// Buffer lifecycle hook: buffer destruction needs no bookkeeping here.
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
-/// @brief `wl_shm` protocol: exposes the shared-memory buffer state.
+/// `wl_shm` protocol: exposes the shared-memory buffer state.
 impl ShmHandler for AppState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
-/// @brief Output protocol marker impl (no per-output callbacks are needed).
+/// Output protocol marker impl (no per-output callbacks are needed).
 impl OutputHandler for AppState {}
 
-/// @brief Linux-dmabuf protocol: imports client dmabufs into the GLES renderer.
+/// Linux-dmabuf protocol: imports client dmabufs into the GLES renderer.
 ///
 /// `dmabuf_imported` attempts the import into the GLES renderer and signals the client through the
 /// notifier — success only when a GLES renderer exists and the import succeeds, otherwise failure
@@ -1071,7 +1083,7 @@ impl DmabufHandler for AppState {
     }
 }
 
-/// @brief Fractional-scale protocol: tells a newly-bound surface the output's current fractional
+/// Fractional-scale protocol: tells a newly-bound surface the output's current fractional
 /// scale so it renders at the right pixel density.
 impl FractionalScaleHandler for AppState {
     fn new_fractional_scale(
@@ -1089,7 +1101,7 @@ impl FractionalScaleHandler for AppState {
     }
 }
 
-/// @brief Input-event target for Smithay's seat handlers. Smithay requires a concrete type as the
+/// Input-event target for Smithay's seat handlers. Smithay requires a concrete type as the
 /// "target" of a keyboard / pointer / touch event; `FocusTarget` bridges that to the concrete
 /// Wayland surface behind a window, popup, or layer surface.
 #[derive(Debug, Clone, PartialEq)]
@@ -1100,22 +1112,22 @@ pub enum FocusTarget {
     LayerSurface(DesktopLayerSurface),
 }
 
-/// @brief Wrap a `Window` as a focus target.
+/// Wrap a `Window` as a focus target.
 impl From<Window> for FocusTarget {
     fn from(w: Window) -> Self { FocusTarget::Window(w) }
 }
 
-/// @brief Wrap a popup as a focus target.
+/// Wrap a popup as a focus target.
 impl From<PopupKind> for FocusTarget {
     fn from(p: PopupKind) -> Self { FocusTarget::Popup(p) }
 }
 
-/// @brief Wrap a layer surface as a focus target.
+/// Wrap a layer surface as a focus target.
 impl From<DesktopLayerSurface> for FocusTarget {
     fn from(l: DesktopLayerSurface) -> Self { FocusTarget::LayerSurface(l) }
 }
 
-/// @brief Liveness of a focus target: true while its underlying window / popup / layer surface is
+/// Liveness of a focus target: true while its underlying window / popup / layer surface is
 /// still alive, so dead targets are dropped from focus.
 impl IsAlive for FocusTarget {
     fn alive(&self) -> bool {
@@ -1127,7 +1139,7 @@ impl IsAlive for FocusTarget {
     }
 }
 
-/// @brief Expose the wrapped target's underlying `wl_surface` and same-client checks so Smithay
+/// Expose the wrapped target's underlying `wl_surface` and same-client checks so Smithay
 /// can route focus and selection ownership by client.
 impl WaylandFocus for FocusTarget {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
@@ -1146,7 +1158,7 @@ impl WaylandFocus for FocusTarget {
     }
 }
 
-/// @brief Forward every keyboard event (enter / leave / key / modifiers) to the wrapped target's
+/// Forward every keyboard event (enter / leave / key / modifiers) to the wrapped target's
 /// underlying `wl_surface`, which carries Smithay's real keyboard-target implementation.
 impl KeyboardTarget<AppState> for FocusTarget {
     fn enter(
@@ -1211,7 +1223,7 @@ impl KeyboardTarget<AppState> for FocusTarget {
     }
 }
 
-/// @brief Forward drag-and-drop focus events (enter / motion / leave / drop) to the wrapped
+/// Forward drag-and-drop focus events (enter / motion / leave / drop) to the wrapped
 /// target's underlying `wl_surface`, reusing the `WlSurface` offer-data type.
 impl DndFocus<AppState> for FocusTarget {
     type OfferData<S: Source> = <WlSurface as DndFocus<AppState>>::OfferData<S>;
@@ -1283,7 +1295,7 @@ impl DndFocus<AppState> for FocusTarget {
     }
 }
 
-/// @brief Forward every pointer event (motion, buttons, axis, and all swipe / pinch / hold gesture
+/// Forward every pointer event (motion, buttons, axis, and all swipe / pinch / hold gesture
 /// phases) to the wrapped target's underlying `wl_surface`.
 impl PointerTarget<AppState> for FocusTarget {
     fn enter(&self, seat: &Seat<AppState>, data: &mut AppState, event: &MotionEvent) {
@@ -1459,7 +1471,7 @@ impl PointerTarget<AppState> for FocusTarget {
     }
 }
 
-/// @brief Forward every touch event (down / up / motion / frame / cancel / shape / orientation) to
+/// Forward every touch event (down / up / motion / frame / cancel / shape / orientation) to
 /// the wrapped target's underlying `wl_surface`.
 impl TouchTarget<AppState> for FocusTarget {
     fn down(&self, seat: &Seat<AppState>, data: &mut AppState, event: &DownEvent, serial: Serial) {
@@ -1529,7 +1541,7 @@ impl TouchTarget<AppState> for FocusTarget {
     }
 }
 
-/// @brief Map a Smithay `CursorIcon` to its CSS cursor-name string, used both for themed-cursor
+/// Map a Smithay `CursorIcon` to its CSS cursor-name string, used both for themed-cursor
 /// lookup and for the name handed to the Python cursor callback; unknown icons fall back to
 /// `"default"`.
 pub fn cursor_icon_to_str(icon: &CursorIcon) -> &'static str {
@@ -1572,7 +1584,7 @@ pub fn cursor_icon_to_str(icon: &CursorIcon) -> &'static str {
     }
 }
 
-/// @brief Seat wiring: declares the keyboard / pointer / touch focus types and reacts to cursor
+/// Seat wiring: declares the keyboard / pointer / touch focus types and reacts to cursor
 /// changes and keyboard-focus moves.
 impl SeatHandler for AppState {
     type KeyboardFocus = FocusTarget;
@@ -1582,14 +1594,14 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
-    /// @brief A client requested a cursor change (named, hidden, or surface-backed): retain it as
+    /// A client requested a cursor change (named, hidden, or surface-backed): retain it as
     /// the current icon and forward it to the Python cursor callback.
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
         self.send_cursor_image(&image);
     }
 
-    /// @brief Keep the primary selection's focus following keyboard focus, so middle-click paste
+    /// Keep the primary selection's focus following keyboard focus, so middle-click paste
     /// targets the currently focused client (or clears it when nothing is focused).
     fn focus_changed(&mut self, seat: &Seat<AppState>, focus: Option<&Self::KeyboardFocus>) {
         if let Some(focus_target) = focus {
@@ -1603,7 +1615,7 @@ impl SeatHandler for AppState {
     }
 }
 
-/// @brief Pointer-warp protocol: lets a client teleport the pointer to a surface-local position
+/// Pointer-warp protocol: lets a client teleport the pointer to a surface-local position
 /// (games / remote-desktop style warps).
 ///
 /// `warp_pointer` locates the requesting surface's origin in the global space, adds the requested
@@ -1648,12 +1660,12 @@ impl PointerWarpHandler for AppState {
     }
 }
 
-/// @brief xdg-shell protocol: toplevel and popup lifecycle.
+/// xdg-shell protocol: toplevel and popup lifecycle.
 impl XdgShellHandler for AppState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.shell_state
     }
-    /// @brief A new toplevel appears: wrap it in a `Window`, queue it for mapping, and register a
+    /// A new toplevel appears: wrap it in a `Window`, queue it for mapping, and register a
     /// foreign-toplevel handle (seeded with title / app-id) stored on the surface for later updates.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
@@ -1667,7 +1679,7 @@ impl XdgShellHandler for AppState {
         
         with_states(surface.wl_surface(), |states| states.data_map.insert_if_missing(|| handle));
     }
-    /// @brief Register a new popup (menu, tooltip, combo-box list) with the `PopupManager` so it
+    /// Register a new popup (menu, tooltip, combo-box list) with the `PopupManager` so it
     /// takes part in grab and dismissal handling, then send the initial configure xdg-shell requires
     /// before the client is allowed to draw it.
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -1676,7 +1688,7 @@ impl XdgShellHandler for AppState {
         }
         let _ = surface.send_configure();
     }
-    /// @brief Popup grab: find the popup's root surface and its window, then install a popup grab so
+    /// Popup grab: find the popup's root surface and its window, then install a popup grab so
     /// dismissal and pointer routing behave correctly.
     fn grab(
         &mut self,
@@ -1691,7 +1703,7 @@ impl XdgShellHandler for AppState {
             }
         }
     }
-    /// @brief Re-track a popup whose position changed (e.g. a submenu flipping sides to stay
+    /// Re-track a popup whose position changed (e.g. a submenu flipping sides to stay
     /// on-screen) so the `PopupManager` follows its new geometry, then echo the client's reposition
     /// token back to confirm the move took effect.
     fn reposition_request(
@@ -1705,7 +1717,7 @@ impl XdgShellHandler for AppState {
         }
         let _ = surface.send_repositioned(token);
     }
-    /// @brief A toplevel closed: drop it from the pending-window queue so a window that never
+    /// A toplevel closed: drop it from the pending-window queue so a window that never
     /// finished mapping can't linger there, and remove its foreign-toplevel handle so taskbar-style
     /// clients stop listing a window that is gone.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1718,13 +1730,13 @@ impl XdgShellHandler for AppState {
     }
 }
 
-/// @brief Per-client data attached to every Wayland client connection; holds the compositor's
+/// Per-client data attached to every Wayland client connection; holds the compositor's
 /// per-client surface state.
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
 }
-/// @brief Client lifecycle hooks; connect and disconnect need no bookkeeping here.
+/// Client lifecycle hooks; connect and disconnect need no bookkeeping here.
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
@@ -1752,7 +1764,7 @@ delegate_presentation!(AppState);
 delegate_xdg_activation!(AppState);
 delegate_primary_selection!(AppState);
 
-/// @brief Row stride (bytes) of a tightly-mapped RGBA8 GPU readback, derived from the mapping
+/// Row stride (bytes) of a tightly-mapped RGBA8 GPU readback, derived from the mapping
 /// length rather than assuming `width*4`.
 ///
 /// Dividing the buffer length by the height recovers a padded stride, so a padded readback cannot
@@ -1770,14 +1782,14 @@ fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
 mod stride_tests {
     use super::rgba_readback_stride;
 
-    /// @brief A tightly-packed readback yields exactly `width*4` stride.
+    /// A tightly-packed readback yields exactly `width*4` stride.
     #[test]
     fn packed_readback_is_width_times_four() {
         assert_eq!(rgba_readback_stride(64 * 4 * 48, 48, 64), 64 * 4);
         assert_eq!(rgba_readback_stride(3 * 4 * 2, 2, 3), 12);
     }
 
-    /// @brief A padded readback (extra bytes per row) recovers the true padded stride from the
+    /// A padded readback (extra bytes per row) recovers the true padded stride from the
     /// buffer length.
     #[test]
     fn padded_readback_recovers_real_stride() {
@@ -1786,7 +1798,7 @@ mod stride_tests {
         assert_eq!(rgba_readback_stride(stride * h, h, w), stride);
     }
 
-    /// @brief Extracting pixels with the recovered stride from a padded buffer reproduces the
+    /// Extracting pixels with the recovered stride from a padded buffer reproduces the
     /// written values with no row-to-row skew.
     #[test]
     fn padded_extraction_has_no_skew() {
@@ -1811,13 +1823,13 @@ mod stride_tests {
         }
     }
 
-    /// @brief Zero height returns one full row instead of dividing by zero.
+    /// Zero height returns one full row instead of dividing by zero.
     #[test]
     fn zero_height_no_divide_by_zero() {
         assert_eq!(rgba_readback_stride(0, 0, 10), 40);
     }
 
-    /// @brief A buffer shorter than a single row still reports a full `width*4` row.
+    /// A buffer shorter than a single row still reports a full `width*4` row.
     #[test]
     fn truncated_buffer_keeps_full_row() {
         assert_eq!(rgba_readback_stride(10, 5, 64), 64 * 4);

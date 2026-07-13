@@ -18,20 +18,26 @@ use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use std::sync::Arc;
 
-/// @brief Outcome of the full-frame H.264 send decision produced by `decide_hw_fullframe`.
+/// Outcome of the full-frame H.264 send decision produced by `decide_hw_fullframe`.
 pub struct HwFrameDecision {
     pub send: bool,
     pub force_idr: bool,
     pub target_qp: u32,
 }
 
-/// @brief Whether a scheduled keyframe is due this tick — the escape hatch for consumers that
-/// cannot ask for one on their own.
+/// Whether a scheduled keyframe is due this tick.
 ///
-/// The default (`keyframe_interval_s <= 0`) is an infinite GOP with no scheduled IDRs at all,
-/// because a wall-clock keyframe cadence spikes bitrate and dents quality on a screen that isn't
-/// changing. A positive interval buys that back as a fixed ~N-second recovery cadence, which is
-/// only worth its cost for a consumer that has no channel to request an on-demand keyframe.
+/// The default (`keyframe_interval_s <= 0`) is an infinite GOP with no scheduled IDRs. A positive
+/// interval buys a fixed ~N-second recovery cadence for consumers that cannot request one on demand.
+///
+/// # Arguments
+///
+/// * `settings` - Capture settings; reads `keyframe_interval_s` and `target_fps`.
+/// * `frame_counter` - Current frame number (wrapping `u16`).
+///
+/// # Returns
+///
+/// `true` if a periodic IDR should be forced on this frame.
 pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> bool {
     let secs = settings.keyframe_interval_s;
     if secs <= 0.0 {
@@ -42,39 +48,31 @@ pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> b
     (frame_counter as u64).is_multiple_of(interval)
 }
 
-/// @brief The one send / quality / keyframe policy every full-frame H.264 encoder obeys, shaped so
-/// a static screen costs almost nothing to stream yet a client that just joined or reset can always
-/// recover a clean picture.
+/// The send / quality / keyframe policy every full-frame H.264 encoder obeys.
 ///
-/// **Why it is shaped this way.** A wall-clock keyframe schedule would waste bitrate and dent
-/// quality while nothing on screen moves, so the GOP is left infinite and an IDR is forced only
-/// when some consumer genuinely needs a fresh decode entry point. But a single forced keyframe is
-/// not enough on its own: under CBR that lone keyframe decodes poorly, and a damage-gated static
-/// stream would then send nothing more to sharpen it. So every forced IDR is followed by a short
-/// "recovery burst" that keeps streaming until rate control converges. All of this lives in one
-/// function precisely so the three encoders (NVENC / VAAPI / OpenH264) cannot drift apart.
+/// A static screen costs almost nothing to stream; a client that just joined or reset can always
+/// recover a clean picture. The GOP is left infinite and an IDR is forced only when a consumer
+/// genuinely needs a fresh decode entry point. Every forced IDR is followed by a short "recovery
+/// burst" that keeps streaming until rate control converges. All three encoders (NVENC / VAAPI /
+/// OpenH264) share this one function so they cannot drift apart.
 ///
-/// Inputs: `is_dirty` is the motion signal (Wayland compositor damage, or an X11 stripe-hash
-/// change); `is_animated` forces a send for animated overlays; `requested_idr` is an on-demand
-/// request (client join / reset, recording cadence); and `st` carries the paint-over bookkeeping
-/// this function advances. The states are resolved in priority order, each choosing the send flag
-/// and QP for the reason noted:
+/// Priority order: (1) recovery burst in progress, (2) always-on streaming/animated modes,
+/// (3) motion detected, (4) recovery keyframe on static screen, (5) paint-over refresh.
 ///
-/// 1. **Recovery burst in progress** — keep streaming the static screen so CBR can refine the
-///    keyframe just sent; real motion aborts the burst and drops back to the base QP. `burst_qp` is
-///    the paint-over QP only when that is enabled and actually lower, since the goal here is to
-///    sharpen, not just to keep bytes flowing.
-/// 2. **Always-on modes** — streaming mode and animated overlays have no "static" state to optimize
-///    for, so they send every frame unconditionally.
-/// 3. **Motion** — the screen changed, so send at the base QP, force an IDR only if one is due, and
-///    reset the paint-over bookkeeping (the still image it was refining is gone).
-/// 4. **Recovery keyframe on a static screen** — the join / reset case the whole burst mechanism
-///    exists for: force the IDR and arm the burst, deliberately leaving `no_motion_frame_count`
-///    untouched so a periodic recovery cannot restart and then starve the paint-over countdown.
-/// 5. **Paint-over refresh** — once the screen has sat idle for `paint_over_trigger_frames`, spend a
-///    few low-QP P-frames sharpening the still image against the existing reference chain (no IDR,
-///    so no bitrate spike), because an idle screen would otherwise stay stuck at whatever quality
-///    the last motion happened to leave behind.
+/// # Arguments
+///
+/// * `st` - Per-stripe mutable state carrying paint-over and burst bookkeeping.
+/// * `settings` - Capture settings; reads CRF, paint-over CRF, burst frames, trigger frames,
+///   streaming mode, and keyframe interval.
+/// * `frame_counter` - Current frame number (wrapping `u16`).
+/// * `is_dirty` - Motion signal from the backend (compositor damage or stripe-hash change).
+/// * `is_animated` - Forces a send for animated overlays.
+/// * `requested_idr` - On-demand IDR request (client join / reset / recording cadence).
+///
+/// # Returns
+///
+/// [`HwFrameDecision`] with `send` (whether to encode this frame), `force_idr` (force a
+/// keyframe), and `target_qp` (quality target for rate control).
 pub fn decide_hw_fullframe(
     st: &mut StripeState,
     settings: &RustCaptureSettings,
@@ -148,7 +146,7 @@ pub fn decide_hw_fullframe(
     HwFrameDecision { send: send_frame, force_idr, target_qp }
 }
 
-/// @brief Hardware encoder bound to the X11 (host-ARGB) pipeline. Software JPEG/x264 needs no
+/// Hardware encoder bound to the X11 (host-ARGB) pipeline. Software JPEG/x264 needs no
 /// persistent encoder object (`encode_cpu` owns per-stripe x264 state), so it is `None`.
 #[allow(clippy::large_enum_variant)]
 enum X11Encoder {
@@ -158,7 +156,7 @@ enum X11Encoder {
     Openh264(Openh264Encoder),
 }
 
-/// @brief Everything the X11 host-ARGB path has to remember between frames.
+/// Everything the X11 host-ARGB path has to remember between frames.
 ///
 /// Unlike the Wayland backend, X11 capture has no compositor to report what changed, so this
 /// context exists to hold the state that stands in for that missing damage signal: the per-stripe
@@ -181,24 +179,21 @@ pub struct X11Pipeline {
 }
 
 impl X11Pipeline {
-    /// @brief Build the context, choosing the full-frame encoder for the X11 host-ARGB path.
+    /// Build the context, choosing the full-frame encoder for the X11 host-ARGB path.
     ///
-    /// The encoder is selected from the settings and the chosen device's kernel driver:
+    /// # Arguments
     ///
-    /// - **OpenH264** when H.264 output is selected and `use_openh264` is set: an explicit opt-in
-    ///   to the software OpenH264 encoder, which is full-frame like the hardware path.
-    /// - **Hardware** when H.264 is selected, software is not forced, and a device is chosen
-    ///   (`encode_node_index`: auto resolves to ID 0, the first GPU; `-1` means explicit software).
-    ///   An NVIDIA driver — or no detectable GPU, since the attempt is cheap and falls back — goes
-    ///   to NVENC; any other GPU driver goes to VA-API. The one exception is a 4:4:4 full-color
-    ///   request, which defers to software x264: VA-API has no reliable 4:4:4 H.264 profile while
-    ///   x264's high444 does, so this avoids a silent CPU fallback.
-    /// - **Software** (`X11Encoder::None`) otherwise, and on any hardware init failure.
+    /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`,
+    ///   `encode_node_index`, and `video_fullcolor` fields drive encoder selection.
+    /// * `recording_sink` - Optional Unix-socket H.264 fan-out. Owned by the caller; not
+    ///   rebound on auto-adjust resizes to avoid tearing down the socket listener.
     ///
-    /// EGL is unused on the CPU-ARGB path, so NVENC is handed a null display. `recording_sink` is
-    /// bound once per capture and OWNED BY THE CALLER: the pipeline is rebuilt on auto-adjust
-    /// resizes, and re-binding the sink there would tear down the socket listener and disconnect
-    /// attached recorders mid-recording.
+    /// # Encoder selection
+    ///
+    /// 1. **OpenH264** — when `use_openh264` is set (explicit opt-in, full-frame software).
+    /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
+    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls to x264).
+    /// 4. **Software** (`X11Encoder::None`) — on any hardware init failure or explicit software.
     pub fn new(settings: RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");
@@ -260,12 +255,12 @@ impl X11Pipeline {
         }
     }
 
-    /// @brief Request an on-demand keyframe on the next processed frame.
+    /// Request an on-demand keyframe on the next processed frame.
     pub fn request_idr(&mut self) {
         self.pending_force_idr = true;
     }
 
-    /// @brief Return a human-readable encoder type string for logging.
+    /// Return a human-readable encoder type string for logging.
     pub fn encoder_name(&self) -> &str {
         match &self.hw {
             X11Encoder::Nvenc(_) => "NVENC",
@@ -275,20 +270,17 @@ impl X11Pipeline {
         }
     }
 
-    /// @brief Adapt the live pipeline to recreated capture surfaces — and possibly a new size —
-    /// without rebuilding it.
+    /// Adapt the live pipeline to recreated capture surfaces without rebuilding it.
     ///
-    /// Returns `false` when the active encoder cannot follow in place and the caller must rebuild;
-    /// `settings` carries the new geometry plus the current live rates. Behavior per encoder:
+    /// # Arguments
     ///
-    /// - **Same dimensions, new shm segments**: only NVENC keys state to the old base addresses
-    ///   (its pinned-host cache), so its pinned hosts are released; every other path hashes content
-    ///   and needs nothing.
-    /// - **New dimensions, NVENC**: reconfigured in place; a rejected reconfigure returns `false`.
-    /// - **New dimensions, software x264/JPEG**: the striped path re-derives per-stripe state from
-    ///   the settings on the next `process()`, so clearing that state below is the whole resize.
-    /// - **New dimensions, VAAPI or OpenH264**: their surfaces / sessions are fixed-size, so this
-    ///   returns `false` to force a rebuild.
+    /// * `settings` - New geometry plus current live rates.
+    /// * `size_changed` - Whether the capture dimensions changed.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the pipeline was successfully adapted in place; `false` when the active encoder
+    /// cannot follow (VAAPI, OpenH264 on resize) and the caller must rebuild.
     pub fn reshape(&mut self, settings: &RustCaptureSettings, size_changed: bool) -> bool {
         if !size_changed {
             if let X11Encoder::Nvenc(enc) = &mut self.hw {
@@ -313,7 +305,7 @@ impl X11Pipeline {
         true
     }
 
-    /// @brief Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
+    /// Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
     /// kb; ignored unless CBR is active) and the target fps. NVENC and OpenH264 reconfigure their
     /// live session immediately; VAAPI re-opens its codec context to apply the new rate; the x264
     /// software path picks the new values up on the next `process()` (encode_cpu reads the updated
@@ -332,34 +324,22 @@ impl X11Pipeline {
         }
     }
 
-    /// @brief Apply live per-frame tunables (quality, paint-over, streaming mode, keyframe
+    /// Apply live per-frame tunables (quality, paint-over, streaming mode, keyframe
     /// cadence); every encoder re-reads them from the settings on the next process().
     pub fn update_tunables(&mut self, t: &crate::LiveTunables) {
         t.apply_to(&mut self.settings);
     }
 
-    /// @brief Encode one host-ARGB frame (B,G,R,A order, `stride` bytes per row) and return the
-    /// encoded stripes — empty when nothing changed. Borrows `argb` for the call only.
+    /// Encode one host-ARGB frame and return the encoded stripes.
     ///
-    /// Two paths, chosen by whether a hardware / OpenH264 encoder is bound:
+    /// # Arguments
     ///
-    /// - **Full-frame H.264** (`hw` set): frame-level damage comes from whole-frame content
-    ///   hashing, except in streaming mode which sends every frame and skips the hash.
-    ///   `decide_hw_fullframe` makes the identical send decision for every encoder; only the
-    ///   submission differs — NVENC encodes ARGB directly, VAAPI uploads and VA-VPP converts to
-    ///   NV12 on the GPU, and OpenH264 (bitrate-controlled, so the paint-over QP does not apply)
-    ///   takes BGRA host pixels. A configured recording sink forces an IDR on connect and every N
-    ///   frames so a late recorder starts on a keyframe, matching the Wayland path.
-    /// - **Striped software JPEG/x264** (`hw` is `None`): `encode_cpu` hashes per stripe. The GOP
-    ///   is infinite, so stripes keyframe only on demand or on the optional configured interval;
-    ///   each stripe encoder keyframes its own first frame at (re)init, and an explicit request
-    ///   also forces a full JPEG resend so a joining viewer receives every stripe.
+    /// * `argb` - Packed BGRA pixel buffer (B,G,R,A byte order, `stride` bytes per row).
+    /// * `stride` - Bytes per row (must equal `width * 4` for the software path).
     ///
-    /// The software path assumes tightly-packed `width*4` rows: `encode_cpu` / `content_dirty`
-    /// index rows at `width*4` and do not thread the producer `stride` through. Every current
-    /// producer satisfies this (X11 XShm BGRA and the Wayland readback both deliver packed rows);
-    /// a future padded-stride producer would need `encode_cpu` taught to honor `stride`, which the
-    /// hardware paths above already pass through. The `debug_assert` guards that invariant.
+    /// # Returns
+    ///
+    /// Vec of [`EncodedStripe`] — empty when nothing changed.
     pub fn process(&mut self, argb: &[u8], stride: usize) -> Vec<EncodedStripe> {
         let width = self.settings.width;
         let height = self.settings.height;
@@ -450,7 +430,7 @@ impl X11Pipeline {
 mod tests {
     use super::*;
 
-    /// @brief Software JPEG path emits on change and stays silent while static: the first frame
+    /// Software JPEG path emits on change and stays silent while static: the first frame
     /// sends every stripe (all dirty vs init), an identical static frame sends nothing, and a
     /// frame with changed top rows re-sends the dirty stripes. `use_cpu` forces the software path
     /// and paint-over is disabled to keep the static-frame assertions clean.
@@ -480,7 +460,7 @@ mod tests {
         assert!(n3 > 0, "changed frame should emit dirty stripes");
     }
 
-    /// @brief Software x264, paint-over off, non-streaming: a requested IDR on a static screen is
+    /// Software x264, paint-over off, non-streaming: a requested IDR on a static screen is
     /// followed by a short recovery burst so rate control can refine the keyframe, instead of the
     /// stream going silent and stranding an unrefined keyframe. The stream goes quiet again once
     /// the burst ends.
@@ -527,7 +507,7 @@ mod tests {
         }
     }
 
-    /// @brief With no motion and no request, nothing is emitted at any frame-counter position —
+    /// With no motion and no request, nothing is emitted at any frame-counter position —
     /// the GOP is infinite, so there is no scheduled IDR to break the silence.
     #[test]
     fn static_frames_stay_silent_without_request() {
@@ -540,7 +520,7 @@ mod tests {
         }
     }
 
-    /// @brief A requested IDR on a static screen (client resume / join) emits a base-QP keyframe
+    /// A requested IDR on a static screen (client resume / join) emits a base-QP keyframe
     /// and arms a recovery burst; subsequent static frames stream burst frames at the paint QP
     /// with no new keyframe, and real motion aborts the burst and reverts to the base QP.
     #[test]
@@ -561,7 +541,7 @@ mod tests {
         assert_eq!(st.h264_burst_frames_remaining, 0);
     }
 
-    /// @brief With paint-over off, a forced keyframe still needs following frames so CBR rate
+    /// With paint-over off, a forced keyframe still needs following frames so CBR rate
     /// control can refine the static image (streaming mode would mask this by always sending);
     /// the recovery burst supplies them at the base QP.
     #[test]
@@ -591,7 +571,7 @@ mod tests {
         assert!(!periodic_idr_due(&s, 0) && !periodic_idr_due(&s, 120));
     }
 
-    /// @brief After `paint_over_trigger_frames` idle frames, paint-over fires as a refining
+    /// After `paint_over_trigger_frames` idle frames, paint-over fires as a refining
     /// P-frame at the paint QP (no IDR spike) and arms a burst; the next frame continues the burst
     /// at the paint QP, still without a forced IDR.
     #[test]
@@ -632,7 +612,7 @@ mod tests {
 
 #[cfg(test)]
 mod vbv_tests {
-    /// @brief VBV sizing policy: an infinite GOP uses 1.5 frames of headroom, scheduled keyframes
+    /// VBV sizing policy: an infinite GOP uses 1.5 frames of headroom, scheduled keyframes
     /// relax to 3 frames, and an explicit multiplier overrides both and rescales with bitrate.
     #[test]
     fn vbv_policy() {

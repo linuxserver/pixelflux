@@ -5,17 +5,17 @@
  */
 
 //! X11 host capture: grab the root window into host memory as BGRA, composite the XFixes hardware
-//! cursor and the watermark on the CPU, and feed each frame to [`X11Pipeline`], which owns
+//! cursor and the watermark on the CPU, and feed each frame to [`pipeline::X11Pipeline`], which owns
 //! damage/stripe/encode. The grab goes through a shared-memory segment (XShm via x11rb) rather than
 //! a plain `GetImage` for one reason: a full-screen frame is far too large to copy through the X
 //! protocol socket every tick, so XShm has the server write the pixels straight into memory this
 //! process already has mapped.
 //!
-//! [`run_capture`] splits the work across two threads because grabbing the next frame and encoding
+//! `run_capture` splits the work across two threads because grabbing the next frame and encoding
 //! the previous one have no reason to wait on each other: the caller's thread grabs frames and owns
 //! the x11rb connection and the pool of shm surfaces, while a spawned encode thread owns the
-//! [`X11Pipeline`] (and thus the encoder) and runs the delivery callback, so the two overlap for
-//! throughput. Frames hand off through a bounded [`FramePool`] that carries only a raw pointer and
+//! [`pipeline::X11Pipeline`] (and thus the encoder) and runs the delivery callback, so the two overlap for
+//! throughput. Frames hand off through a bounded `FramePool` that carries only a raw pointer and
 //! geometry — never an X object, none of which is safe to share — so nothing X-related ever crosses
 //! the thread boundary and the encoder never has to touch X. Multi-instance safety for the encoders
 //! is handled inside them (e.g. the libx264 open/close lock); each capture owns its own private xcb
@@ -39,7 +39,7 @@ use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
-/// @brief Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
+/// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
 /// payloads) the owning `ScreenCapture` pyclass flips from the Python thread and the capture thread
 /// reads at the top of each iteration.
 ///
@@ -74,7 +74,7 @@ pub struct Controls {
 }
 
 impl Controls {
-    /// @brief Seed the controls from the initial settings so the first loop iteration reads the
+    /// Seed the controls from the initial settings so the first loop iteration reads the
     /// configured bitrate / VBV / fps / region / cursor state rather than defaults.
     pub fn new(s: &RustCaptureSettings) -> Self {
         Self {
@@ -93,7 +93,7 @@ impl Controls {
     }
 }
 
-/// @brief A shared-memory image surface: a POSIX shm segment mapped into both this process and the
+/// A shared-memory image surface: a POSIX shm segment mapped into both this process and the
 /// X server, into which `shm_get_image` writes one BGRA frame.
 ///
 /// Both ends map the same physical pages, which is the whole point: a full-screen grab then costs no
@@ -111,7 +111,7 @@ struct ShmSurface {
 }
 
 impl ShmSurface {
-    /// @brief Allocate a shm segment of `width*height*4` bytes, attach it both locally and to the X
+    /// Allocate a shm segment of `width*height*4` bytes, attach it both locally and to the X
     /// server, and hand back a surface both ends can read.
     ///
     /// The segment is created with `shmget(IPC_PRIVATE)` and mapped locally via `shmat`, then
@@ -165,17 +165,17 @@ impl ShmSurface {
         }
     }
 
-    /// @brief Borrow the mapped segment as a mutable byte slice for the capture blit and overlays.
+    /// Borrow the mapped segment as a mutable byte slice for the capture blit and overlays.
     fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.addr, self.size) }
     }
 
-    /// @brief Borrow the mapped segment read-only, for the stability comparison.
+    /// Borrow the mapped segment read-only, for the stability comparison.
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.addr, self.size) }
     }
 
-    /// @brief Detach the segment from the X server and then locally, clearing the mapped pointer.
+    /// Detach the segment from the X server and then locally, clearing the mapped pointer.
     ///
     /// This is a manual method rather than a `Drop` impl because releasing the server-side
     /// attachment is an X protocol request that needs the live connection, which a `Drop` could not
@@ -192,7 +192,7 @@ impl ShmSurface {
     }
 }
 
-/// @brief Resolve the capture dimensions `shm_get_image` will read, bounded so the region can never
+/// Resolve the capture dimensions `shm_get_image` will read, bounded so the region can never
 /// run past the live root from the capture offset.
 ///
 /// The bound is the reason this function exists: a grab that ran off the root edge would fail the
@@ -227,7 +227,7 @@ fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16)
     (w as u16, h as u16)
 }
 
-/// @brief Grab one frame of the capture region into `surface` with a single XShm round-trip.
+/// Grab one frame of the capture region into `surface` with a single XShm round-trip.
 ///
 /// One `shm_get_image` request is atomic — the server never interleaves another client
 /// inside it — so the grab is a coherent snapshot of whatever the screen held at that
@@ -259,7 +259,7 @@ fn grab_frame(
     Ok(())
 }
 
-/// @brief Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
+/// Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
 ///
 /// Cursor and watermark pixels are overwhelmingly either fully opaque or fully transparent, and this
 /// runs per pixel per frame on the CPU, so the two extremes are special-cased to skip the blend
@@ -281,7 +281,7 @@ fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     }
 }
 
-/// @brief Frame-space top-left of the cursor image, given the XFixes hotspot position.
+/// Frame-space top-left of the cursor image, given the XFixes hotspot position.
 ///
 /// XFixes reports the cursor position at its HOTSPOT; X draws the image with its top-left at
 /// `(pos - hot)`, and the capture origin `(cap_x, cap_y)` is subtracted to move it into frame space.
@@ -292,7 +292,7 @@ fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: 
     (x as i32 - xhot as i32 - cap_x, y as i32 - yhot as i32 - cap_y)
 }
 
-/// @brief Composite the XFixes cursor (ARGB `u32` per pixel) onto the BGRA frame with its top-left
+/// Composite the XFixes cursor (ARGB `u32` per pixel) onto the BGRA frame with its top-left
 /// at `(img_x, img_y)`, blending each pixel through `blend_pixel` with per-pixel bounds clipping so
 /// an image straddling a frame edge writes only its in-frame portion.
 #[allow(clippy::too_many_arguments)]
@@ -328,7 +328,7 @@ fn overlay_cursor(
     }
 }
 
-/// @brief CPU watermark: the raw RGBA pixels (row-major, `w*h*4`) in host memory plus the
+/// CPU watermark: the raw RGBA pixels (row-major, `w*h*4`) in host memory plus the
 /// placement / animation state, blended directly into the captured BGRA frame.
 ///
 /// The blend is on the CPU because the frame is already sitting in host shm memory before it reaches
@@ -349,7 +349,7 @@ struct X11Watermark {
 }
 
 impl X11Watermark {
-    /// @brief Load the watermark image at `path` into host RGBA, or return an unloaded stub.
+    /// Load the watermark image at `path` into host RGBA, or return an unloaded stub.
     ///
     /// An empty path or any decode failure yields `loaded == false`, which every method treats as a
     /// no-op, so a missing or broken watermark simply disables the overlay. The bouncing-animation
@@ -380,7 +380,7 @@ impl X11Watermark {
         wm
     }
 
-    /// @brief Set the watermark's top-left placement for this frame from the location enum; a stub
+    /// Set the watermark's top-left placement for this frame from the location enum; a stub
     /// (unloaded) watermark returns immediately.
     ///
     /// The fixed corners and center are direct arithmetic. The animated mode advances a bouncing
@@ -437,7 +437,7 @@ impl X11Watermark {
         }
     }
 
-    /// @brief Alpha-blend the loaded watermark into the BGRA frame at its current position; a no-op
+    /// Alpha-blend the loaded watermark into the BGRA frame at its current position; a no-op
     /// when unloaded. Clips per pixel at the frame bounds because the animated position — or a
     /// watermark larger than the capture — can leave part of the image off-frame, and only the
     /// in-frame portion may be written.
@@ -469,7 +469,7 @@ impl X11Watermark {
     }
 }
 
-/// @brief A captured raw BGRA frame held in a pooled shm surface, ready to encode.
+/// A captured raw BGRA frame held in a pooled shm surface, ready to encode.
 ///
 /// It carries the surface pointer plus geometry so the encode thread reads the pixels directly (no
 /// copy) and can rebuild its pipeline when the capture size changed (auto-adjust). It also carries
@@ -484,12 +484,12 @@ struct RawFrame {
     stride: usize,
     generation: u64,
 }
-/// @brief `RawFrame` is `Send`: its raw pointer addresses a pooled shm surface that the pool
+/// `RawFrame` is `Send`: its raw pointer addresses a pooled shm surface that the pool
 /// guarantees is not reused until the encode thread recycles this frame, so the handle is safe to
 /// move across the capture -> encode thread boundary.
 unsafe impl Send for RawFrame {}
 
-/// @brief Mutex-guarded interior of [`FramePool`]: the free-surface index list and the single
+/// Mutex-guarded interior of `FramePool`: the free-surface index list and the single
 /// capture -> encode handoff slot, under one lock so moving a surface between them — acquire,
 /// publish, take, recycle — is always a single atomic step.
 struct PoolInner {
@@ -497,7 +497,7 @@ struct PoolInner {
     slot: Option<RawFrame>,
 }
 
-/// @brief Demand-driven capture -> encode handoff: a bounded single-slot channel over a fixed set of
+/// Demand-driven capture -> encode handoff: a bounded single-slot channel over a fixed set of
 /// pooled shm surfaces.
 ///
 /// The capture thread writes into a pooled surface and `publish`es it into the single `slot`; the
@@ -521,7 +521,7 @@ struct FramePool {
 }
 
 impl FramePool {
-    /// @brief Create a pool with `n` free surfaces, an empty handoff slot, and generation 0.
+    /// Create a pool with `n` free surfaces, an empty handoff slot, and generation 0.
     fn new(n: usize) -> Self {
         Self {
             inner: Mutex::new(PoolInner { free: (0..n).collect(), slot: None }),
@@ -531,19 +531,19 @@ impl FramePool {
         }
     }
 
-    /// @brief Capture: record that the surfaces were recreated by advancing the generation. Only
+    /// Capture: record that the surfaces were recreated by advancing the generation. Only
     /// called after `drain_for_resize` succeeded, so no frame from the previous generation is still
     /// in flight.
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// @brief Read the current surface generation, stamped onto each published frame.
+    /// Read the current surface generation, stamped onto each published frame.
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// @brief Capture: claim a free surface to write the next frame into, or `None` on stop.
+    /// Capture: claim a free surface to write the next frame into, or `None` on stop.
     ///
     /// Blocks (bounded, re-checking `stop` every 20ms) until a surface is free, which throttles
     /// capture to the encode rate so a full-resolution capture is never spent on a frame that would
@@ -562,7 +562,7 @@ impl FramePool {
         }
     }
 
-    /// @brief Capture: publish the just-captured frame into the single slot, or `false` (frame
+    /// Capture: publish the just-captured frame into the single slot, or `false` (frame
     /// discarded) on stop.
     ///
     /// Blocks (bounded, re-checking `stop` every 20ms) until the encode thread has taken the previous
@@ -584,7 +584,7 @@ impl FramePool {
         }
     }
 
-    /// @brief Encode: block until a frame is available (`Some`) or stop is signalled (`None`).
+    /// Encode: block until a frame is available (`Some`) or stop is signalled (`None`).
     ///
     /// The wait is bounded (re-checking `stop` every 20ms) as defense-in-depth against a lost wakeup,
     /// so a stop that races the park can never leave the encode thread blocked forever.
@@ -602,14 +602,14 @@ impl FramePool {
         }
     }
 
-    /// @brief Encode: return a surface to the free list after it has been encoded, waking any waiter
+    /// Encode: return a surface to the free list after it has been encoded, waking any waiter
     /// parked in `acquire` / `publish` / `drain_for_resize`.
     fn recycle(&self, idx: usize) {
         self.inner.lock().unwrap().free.push(idx);
         self.cv.notify_all();
     }
 
-    /// @brief Capture: before recreating surfaces (auto-adjust / region resize), reclaim the pending
+    /// Capture: before recreating surfaces (auto-adjust / region resize), reclaim the pending
     /// slot and wait until every surface is back in the free list, so no surface is destroyed while
     /// the encode thread is still reading it.
     ///
@@ -635,7 +635,7 @@ impl FramePool {
         true
     }
 
-    /// @brief Signal every waiter to stop and wake them, ending the encode thread's `take` loop.
+    /// Signal every waiter to stop and wake them, ending the encode thread's `take` loop.
     ///
     /// The inner mutex is acquired BEFORE storing `stop` and notifying, which closes the lost-wakeup
     /// window: with the lock held, `take` is either still before its `stop` check or already parked on
@@ -650,10 +650,10 @@ impl FramePool {
     }
 }
 
-/// @brief Encode thread body: consume captured frames from the pool, keep the [`X11Pipeline`] in
+/// Encode thread body: consume captured frames from the pool, keep the [`pipeline::X11Pipeline`] in
 /// step with the capture size and cross-thread controls, encode, recycle, and deliver.
 ///
-/// The loop runs until [`FramePool::take`] returns `None` (stop). For each frame:
+/// The loop runs until `FramePool::take` returns `None` (stop). For each frame:
 ///
 /// 1. **(Re)build the pipeline** when it is missing, the frame size changed, or the surface
 ///    generation changed. A generation change alone forces the rebuild path because recreated shm
@@ -790,11 +790,11 @@ where
     }
 }
 
-/// @brief Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
+/// Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
 /// threads that overlap for throughput.
 ///
 /// This (the caller's) thread performs setup and then the capture loop; a spawned encode thread runs
-/// [`encode_loop`] and invokes `on_frame(stripes)` once per encoded frame. The split lets capture and
+/// `encode_loop` and invokes `on_frame(stripes)` once per encoded frame. The split lets capture and
 /// encode overlap, and because frames are throttled/dropped as RAW frames before encode, the delivered
 /// H.264 stays a valid contiguous reference chain.
 ///
@@ -802,7 +802,7 @@ where
 ///    byte depth must be 4, which modern servers use for depth 24/32 — then negotiate XShm and
 ///    XFixes. XFixes is always negotiated (one round-trip) so the cursor overlay can be toggled on
 ///    live even when capture started without it. Initial dimensions and origin are resolved from the
-///    settings and the live root geometry, and a [`FramePool`] of `POOL_N` = 3 shm surfaces is
+///    settings and the live root geometry, and a `FramePool` of `POOL_N` = 3 shm surfaces is
 ///    allocated — the working set (one in-capture, one in-slot, one in-encode) that a one-frame-ahead
 ///    demand-driven capture needs, which also keeps the memory cost (`3 * W*H*4`, significant at 4K)
 ///    bounded.
@@ -1092,7 +1092,7 @@ mod pool_tests {
         }
     }
 
-    /// @brief A full acquire -> publish -> take -> recycle round-trip returns the same surface, and
+    /// A full acquire -> publish -> take -> recycle round-trip returns the same surface, and
     /// afterwards all three pool surfaces are acquirable again and distinct.
     #[test]
     fn roundtrip_then_recycle_returns_all_surfaces() {
@@ -1111,7 +1111,7 @@ mod pool_tests {
         assert!(x != y && y != z && x != z);
     }
 
-    /// @brief With every surface held and `stop` set, `acquire` returns `None` after its bounded wait
+    /// With every surface held and `stop` set, `acquire` returns `None` after its bounded wait
     /// rather than blocking forever.
     #[test]
     fn acquire_returns_none_when_exhausted_and_stopped() {
@@ -1123,7 +1123,7 @@ mod pool_tests {
         assert!(p.acquire(&stop).is_none());
     }
 
-    /// @brief With the handoff slot already occupied and `stop` set, `publish` returns `false` (frame
+    /// With the handoff slot already occupied and `stop` set, `publish` returns `false` (frame
     /// discarded) instead of blocking.
     #[test]
     fn publish_returns_false_when_slot_full_and_stopped() {
@@ -1136,7 +1136,7 @@ mod pool_tests {
         assert!(!p.publish(dummy(b), &stop));
     }
 
-    /// @brief `drain_for_resize` blocks until every held surface has been recycled (`free == n`), then
+    /// `drain_for_resize` blocks until every held surface has been recycled (`free == n`), then
     /// reports a full drain and leaves the pool whole; a helper thread recycles the three held surfaces
     /// shortly after the drain begins.
     #[test]
@@ -1160,7 +1160,7 @@ mod pool_tests {
         assert!(p.acquire(&stop).is_some());
     }
 
-    /// @brief A surface is held and never recycled (as a dead encode thread would leave it): setting
+    /// A surface is held and never recycled (as a dead encode thread would leave it): setting
     /// `stop` unblocks the bounded drain, which reports it did NOT fully drain instead of hanging.
     #[test]
     fn drain_for_resize_aborts_on_stop() {
@@ -1171,7 +1171,7 @@ mod pool_tests {
         assert!(!p.drain_for_resize(3, &stop));
     }
 
-    /// @brief A W1 -> W2 -> W1 resize flap where the encoder never takes the W2 frame:
+    /// A W1 -> W2 -> W1 resize flap where the encoder never takes the W2 frame:
     /// `drain_for_resize` reclaims the un-taken frame from the slot, the surfaces recreate twice, and
     /// the next taken frame lands back on the ORIGINAL dimensions — so the bumped generation is the
     /// only rebuild signal that invalidates encoder state keyed to the reused surface addresses.
@@ -1207,7 +1207,7 @@ mod pool_tests {
         assert_ne!(g.generation, last_gen, "generation is the only rebuild signal");
     }
 
-    /// @brief Recreating the surfaces bumps the generation, and frames published afterwards carry the
+    /// Recreating the surfaces bumps the generation, and frames published afterwards carry the
     /// new value — the signal the encode thread uses to trigger a rebuild at identical dimensions.
     #[test]
     fn generation_bumps_on_recreate_and_rides_published_frames() {
@@ -1230,7 +1230,7 @@ mod pool_tests {
 mod cursor_tests {
     use super::*;
 
-    /// @brief `cursor_image_origin` subtracts both the hotspot and the capture-region offset from the
+    /// `cursor_image_origin` subtracts both the hotspot and the capture-region offset from the
     /// reported pointer position, and goes negative when the hotspot sits near the frame origin (the
     /// result is clipped when drawn).
     #[test]
@@ -1240,7 +1240,7 @@ mod cursor_tests {
         assert_eq!(cursor_image_origin(1, 1, 8, 8, 0, 0), (-7, -7));
     }
 
-    /// @brief `overlay_cursor` blits at the hotspot-offset origin, not the raw pointer position: a
+    /// `overlay_cursor` blits at the hotspot-offset origin, not the raw pointer position: a
     /// 2x2 cursor with hotspot (1,1) at pointer (4,4) lands at (3,3)..(4,4), leaving the un-offset
     /// (hotspot) corner untouched.
     #[test]
@@ -1257,7 +1257,7 @@ mod cursor_tests {
         assert_eq!(px(5, 5), 0, "no pixel at the un-offset (hotspot) corner");
     }
 
-    /// @brief `overlay_cursor` clips a negative origin at the frame edge: with the origin at (-1,-1)
+    /// `overlay_cursor` clips a negative origin at the frame edge: with the origin at (-1,-1)
     /// only the in-frame quadrant is written, landing the cursor's bottom-right pixel at (0,0).
     #[test]
     fn overlay_clips_negative_origin_at_frame_edge() {

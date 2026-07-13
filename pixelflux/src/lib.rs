@@ -5,11 +5,47 @@
  */
 
 /*
-  ▘    ▜ ▐▘▜     
+  ▘    ▜ ▐▘▜
 ▛▌▌▚▘█▌▐ ▜▘▐ ▌▌▚▘
 ▙▌▌▞▖▙▖▐▖▐ ▐▖▙▌▞▖
-▌                
+▌
 */
+
+//! # pixelflux
+//!
+//! A high-performance screen capture and encoding pipeline exposed as a Python extension via
+//! PyO3. It supports two independent backends — **X11** (XShm + XFixes) and **Wayland**
+//! (a headless [Smithay](https://github.com/Smithay/smithay) compositor) — and a shared
+//! encoding layer that dispatches to software (x264/JPEG striping, OpenH264) or hardware
+//! (NVENC, VA-API) encoders based on the available GPU and operator settings.
+//!
+//! ## Crate structure
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`encoders`] | Encoder backends: software x264/JPEG, OpenH264, NVENC, VA-API, watermark overlay |
+//! | [`wayland`] | Headless Smithay compositor, cursor rendering |
+//! | [`x11`] | X11/XShm capture loop and stripe dispatch |
+//! | [`pipeline`] | Frame-processing policy shared by both backends (send/QP/keyframe decisions) |
+//! | [`recording_sink`] | Unix-socket H.264 fan-out for external recording |
+//! | [`computer_use`] | HTTP API for AI-agent desktop control (screenshots, input injection) |
+//! | [`nvgpufilter`] | Multi-GPU NVENC device filtering via ioctl |
+//!
+//! ## Data flow
+//!
+//! ```text
+//! Python  ──►  CaptureSettings  ──►  X11 / Wayland backend
+//!                                         │
+//!                                    frame pixels
+//!                                         │
+//!                                    ┌────┴────┐
+//!                                    │ Encoder │  (NVENC / VAAPI / x264 / OpenH264 / JPEG)
+//!                                    └────┬────┘
+//!                                         │
+//!                                   EncodedStripe(s)
+//!                                         │
+//!                                    Python callback
+//! ```
 
 #![allow(dead_code)]
 
@@ -91,19 +127,35 @@ use smithay::{
 };
 
 pub mod encoders {
+    /// NVIDIA NVENC hardware H.264 encoder loaded via runtime `libcuda` / `libnvidia-encode`.
     pub mod nvenc;
+    /// Cisco OpenH264 software H.264 encoder (BSD-licensed, full-frame, bitrate-controlled).
     pub mod oh264;
+    /// PNG watermark overlay composited onto frames before encoding.
     pub mod overlay;
+    /// CPU-based x264 / JPEG striped encoder with per-stripe change detection.
     pub mod software;
+    /// VA-API hardware H.264 encoder for Intel / AMD GPUs via FFmpeg.
     pub mod vaapi;
 
-    /// @brief Size the CBR VBV/HRD buffer so rate control has enough slack to hold quality steady
-    /// without letting end-to-end latency drift upward. The size is expressed as a MULTIPLE of one
-    /// frame's bit budget (bitrate / fps) rather than a fixed byte count precisely so a live bitrate
-    /// or framerate change rescales the buffer with it, preserving the same latency behavior at every
-    /// operating point. A `multiplier` <= 0 selects the policy default — 1.5 frames on an infinite
-    /// GOP, relaxed to 3 when scheduled keyframes are enabled, because each periodic IDR needs the
-    /// extra headroom or quality visibly dips at every interval.
+    /// Size the CBR VBV/HRD buffer so rate control has enough slack to hold quality steady
+    /// without letting end-to-end latency drift upward.
+    ///
+    /// The size is expressed as a multiple of one frame's bit budget (`bitrate_bps / fps`) rather
+    /// than a fixed byte count so a live bitrate or framerate change rescales the buffer with it,
+    /// preserving the same latency behavior at every operating point.
+    ///
+    /// # Arguments
+    ///
+    /// * `bitrate_bps` - Target bitrate in bits per second.
+    /// * `fps` - Target frames per second.
+    /// * `keyframe_interval_s` - Seconds between scheduled keyframes; `<= 0` for infinite GOP.
+    /// * `multiplier` - Explicit buffer multiplier; `<= 0` selects the policy default (1.5 on
+    ///   infinite GOP, 3 when keyframe interval is active).
+    ///
+    /// # Returns
+    ///
+    /// VBV buffer size in bits, clamped to `[1, u32::MAX]`.
     pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier: f64) -> u32 {
         let frame_bits = bitrate_bps as f64 / fps.max(1.0);
         let mult = if multiplier > 0.0 {
@@ -117,11 +169,17 @@ pub mod encoders {
     }
 }
 
+/// Headless Wayland compositor and cursor rendering.
 pub mod wayland;
+/// Unix-socket H.264 recording sink for external capture tools.
 pub mod recording_sink;
+/// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
+/// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
+/// X11/XShm capture loop, stripe dispatch, and per-stripe change detection.
 pub mod x11;
+/// Multi-GPU NVENC device filtering via kernel ioctl.
 pub mod nvgpufilter;
 
 pub use encoders::nvenc;
@@ -179,7 +237,7 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
 }
 
-/// @brief Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
+/// Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
 /// rendered into and encoded with no intervening copy — the linchpin of the zero-copy capture path.
 /// The returned dmabuf is the one handle the GLES renderer binds as its framebuffer AND a hardware
 /// encoder (NVENC through CUDA, or VAAPI) imports to read those pixels directly, which only works if
@@ -188,10 +246,10 @@ smithay::backend::renderer::element::render_elements! {
 /// that single-plane format.
 fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
-    let modifier = bo.modifier().expect("Failed to get modifier");
-    let stride = bo.stride().expect("Failed to get stride");
-    let width = bo.width().expect("Failed to get width");
-    let height = bo.height().expect("Failed to get height");
+    let modifier = bo.modifier();
+    let stride = bo.stride();
+    let width = bo.width();
+    let height = bo.height();
 
     let drm_modifier = Modifier::from(Into::<u64>::into(modifier));
 
@@ -206,7 +264,7 @@ fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     builder.build().expect("Failed to build Dmabuf from GBM BO")
 }
 
-/// @brief The full set of capture + encode parameters the Python layer hands to the Rust backend.
+/// The full set of capture + encode parameters the Python layer hands to the Rust backend.
 ///
 /// A single value configures a capture session end to end: capture geometry and frame rate, the
 /// output mode (striped JPEG/x264 vs full-frame H.264), the H.264 quality and rate-control knobs,
@@ -263,7 +321,7 @@ pub struct RustCaptureSettings {
     pub video_max_qp: i32,
 }
 
-/// @brief The per-frame decision/quality knobs every encoder re-reads from the settings on each
+/// The per-frame decision/quality knobs every encoder re-reads from the settings on each
 /// tick, so they retune a running capture with no encoder re-init: x264 reconfigures, NVENC
 /// CQP retargets, VAAPI re-opens only its codec ctx, JPEG is stateless. Applied on the
 /// thread that owns the settings copy. Structural switches (encoder, chroma, RC mode,
@@ -283,7 +341,7 @@ pub struct LiveTunables {
 }
 
 impl LiveTunables {
-    /// @brief Snapshot the live-tunable subset out of a full settings value.
+    /// Snapshot the live-tunable subset out of a full settings value.
     pub fn from_settings(s: &RustCaptureSettings) -> Self {
         Self {
             jpeg_quality: s.jpeg_quality,
@@ -299,7 +357,7 @@ impl LiveTunables {
         }
     }
 
-    /// @brief Write these live tunables back into a full settings value in place.
+    /// Write these live tunables back into a full settings value in place.
     pub fn apply_to(&self, s: &mut RustCaptureSettings) {
         s.jpeg_quality = self.jpeg_quality;
         s.paint_over_jpeg_quality = self.paint_over_jpeg_quality;
@@ -356,14 +414,23 @@ impl Default for RustCaptureSettings {
     }
 }
 
-/// @brief Marshal a Python settings object into the plain owned Rust value both capture backends run
-/// on, so the FFI boundary is crossed exactly once per start and every downstream thread reads a
-/// struct instead of ever touching Python. Fields are read by ATTRIBUTE NAME (getattr), not by
-/// position, which is what lets a caller pass any object exposing the `CaptureSettings` attributes —
-/// including a subclass carrying extras — and is why the names here must match the Python side
-/// exactly. The newer/optional fields fall back to a default when absent rather than erroring, so a
-/// caller built against an older schema still starts. Routing both the Wayland and X11 entry points
-/// through this one reader is what keeps them from ever drifting on which fields they honor.
+/// Marshal a Python settings object into the plain owned Rust value both capture backends run on.
+///
+/// Fields are read by attribute name (`getattr`), not by position, so a caller can pass any object
+/// exposing the `CaptureSettings` attributes — including a subclass carrying extras. Newer/optional
+/// fields fall back to a default when absent rather than erroring, so a caller built against an
+/// older schema still starts. Both the Wayland and X11 entry points route through this one reader
+/// to prevent drift.
+///
+/// # Arguments
+///
+/// * `settings` - A Python object exposing `CaptureSettings` attributes (`capture_width`,
+///   `capture_height`, `target_fps`, `jpeg_quality`, `video_crf`, etc.).
+///
+/// # Returns
+///
+/// An owned [`RustCaptureSettings`] on success, or a Python exception if a required field is
+/// missing or has the wrong type.
 pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCaptureSettings> {
     let watermark_path_obj = settings.getattr("watermark_path")?;
     let watermark_path = if let Ok(s) = watermark_path_obj.extract::<String>() {
@@ -451,7 +518,7 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
     })
 }
 
-/// @brief Control messages sent from the Python-facing methods to the capture thread.
+/// Control messages sent from the Python-facing methods to the capture thread.
 ///
 /// Every interaction with a running capture crosses the thread boundary as one of these variants
 /// over the command channel: starting and stopping, injecting keyboard / pointer input, swapping
@@ -495,11 +562,19 @@ pub enum ThreadCommand {
     CuGetInfo { resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
 }
 
-/// @brief Read the kernel driver bound to a render node — the cheap, authoritative signal that
-/// routes encoder selection (an `nvidia` driver picks NVENC, anything else VA-API) without opening
-/// the device or loading a userspace driver just to ask. The name is lowercased so callers can
-/// substring-match it case-insensitively, and is empty when the node has no driver link, which the
-/// selection logic treats as "no detectable GPU". Keyed off the node `/dev/dri/renderD<128+card_index>`.
+/// Read the kernel driver bound to a render node for encoder routing.
+///
+/// An `nvidia` driver name routes to NVENC; anything else routes to VA-API. The name is
+/// lowercased for case-insensitive substring matching, and is empty when the node has no driver
+/// link (treated as "no detectable GPU" by the selection logic).
+///
+/// # Arguments
+///
+/// * `card_index` - DRM card index (maps to `/sys/class/drm/renderD{128 + card_index}`).
+///
+/// # Returns
+///
+/// Lowercased driver name, or an empty string if the node has no driver link.
 pub(crate) fn get_gpu_driver(card_index: i32) -> String {
     let path = format!("/sys/class/drm/renderD{}/device/driver", 128 + card_index);
     match std::fs::read_link(&path) {
@@ -508,7 +583,7 @@ pub(crate) fn get_gpu_driver(card_index: i32) -> String {
     }
 }
 
-/// @brief A DRM card's identity as the kernel reports it, read from the device's
+/// A DRM card's identity as the kernel reports it, read from the device's
 /// sysfs `uevent` (DRIVER=, PCI_ID=, OF_COMPATIBLE_n=) with per-file fallbacks
 /// (`vendor`, `modalias`, the `driver` symlink). uevent is uniform across buses
 /// (PCI, platform/devicetree, USB) and readable in unprivileged containers.
@@ -518,7 +593,7 @@ struct CardIdentity {
     compatibles: Vec<String>,
 }
 
-/// @brief Read a DRM card's `CardIdentity` from sysfs.
+/// Read a DRM card's `CardIdentity` from sysfs.
 ///
 /// The device's `uevent` file is the primary source (`DRIVER=`, `PCI_ID=`, `OF_COMPATIBLE_n=`)
 /// because it is uniform across buses and readable in unprivileged containers. Each field has a
@@ -561,7 +636,7 @@ fn read_card_identity(device: &std::path::Path) -> CardIdentity {
     id
 }
 
-/// @brief Human vendor name -> PCI vendor IDs. The kernel has no such table (the
+/// Human vendor name -> PCI vendor IDs. The kernel has no such table (the
 /// grouping is conventional), and pci.ids/hwdata is often absent in containers,
 /// so this is the one mapping that must be embedded — kept to the names only.
 const VENDOR_PCI_IDS: &[(&str, &[u32])] = &[
@@ -580,7 +655,7 @@ const VENDOR_PCI_IDS: &[(&str, &[u32])] = &[
     ("virtio", &[0x1af4]),
 ];
 
-/// @brief Human name -> devicetree vendor prefix, only where they differ (a token
+/// Human name -> devicetree vendor prefix, only where they differ (a token
 /// equal to the prefix itself, e.g. "qcom" or "rockchip", matches directly).
 const OF_PREFIX_ALIASES: &[(&str, &str)] = &[
     ("mali", "arm"),
@@ -592,7 +667,7 @@ const OF_PREFIX_ALIASES: &[(&str, &str)] = &[
     ("powervr", "img"),
 ];
 
-/// @brief Does a card match the requested token? Accepted token forms, checked against
+/// Does a card match the requested token? Accepted token forms, checked against
 /// the identity the kernel itself reports: a kernel DRIVER name (exact, no
 /// table), a raw PCI vendor ID ("0x10de"/"10de"), a devicetree vendor prefix
 /// (literal first segment of any compatible), or a human vendor name resolved
@@ -625,7 +700,7 @@ fn card_matches_token(token: &str, id: &CardIdentity) -> bool {
     false
 }
 
-/// @brief Parse an auto-GPU request (the CaptureSettings `auto_gpu` field, which selkies
+/// Parse an auto-GPU request (the CaptureSettings `auto_gpu` field, which selkies
 /// fills from --auto-gpu / SELKIES_AUTO_GPU). `None` = disabled; `Some(None)` =
 /// pick the first GPU overall ("true"); `Some(Some(token))` = pick the first GPU
 /// whose kernel identity matches the case-insensitive token (vendor name, kernel
@@ -639,14 +714,22 @@ fn parse_auto_gpu(value: &str) -> Option<Option<String>> {
     }
 }
 
-/// @brief Resolve a usable `/dev/dri/renderD*` node, optionally matching a vendor/driver token.
+/// Resolve a usable `/dev/dri/renderD*` node, optionally matching a vendor/driver token.
 ///
-/// Cards under `/sys/class/drm` are walked in numeric order, which skips cards with no render node
-/// (e.g. an IPMI/VGA `card0`) and only returns a node actually present in this namespace, so it
-/// behaves correctly inside containers where `/dev/dri` is filtered. When `/sys/class/drm` is
-/// unreadable — a container that bind-mounts `/dev/dri` without `/sys` — the walk falls through to
-/// scanning `/dev/dri` directly for the lowest render node; that fallback has no device identity,
-/// so a vendor/driver `token` request cannot be satisfied there and yields `None`.
+/// Cards under `/sys/class/drm` are walked in numeric order, skipping cards with no render node
+/// (e.g. IPMI/VGA). When `/sys/class/drm` is unreadable (container without `/sys`), falls
+/// through to scanning `/dev/dri` directly — that fallback has no device identity so a `token`
+/// request cannot be satisfied there.
+///
+/// # Arguments
+///
+/// * `token` - Optional vendor/driver filter: a kernel driver name, PCI vendor ID (`"0x10de"`),
+///   devicetree vendor prefix, or human vendor name (`"nvidia"`, `"intel"`). `None` picks the
+///   first available node.
+///
+/// # Returns
+///
+/// A `/dev/dri/renderD*` path, or `None` if no matching node exists.
 fn auto_select_render_node(token: Option<&str>) -> Option<String> {
     let mut cards: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir("/sys/class/drm")
         .into_iter()
@@ -690,7 +773,7 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
 }
 
 
-/// @brief One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
+/// One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
 /// encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
 /// overlay animation); the IDR request travels separately via the controls atomic.
 pub struct WlFrame {
@@ -702,13 +785,13 @@ pub struct WlFrame {
     is_animated: bool,
 }
 
-/// @brief Interior state of `WlFramePool`: the free-buffer list plus the single publish slot.
+/// Interior state of `WlFramePool`: the free-buffer list plus the single publish slot.
 struct WlPoolInner {
     free: Vec<(usize, Vec<u8>)>,
     slot: Option<WlFrame>,
 }
 
-/// @brief Render->encode handoff for the Wayland readback paths, mirroring the X11 FramePool's
+/// Render->encode handoff for the Wayland readback paths, mirroring the X11 FramePool's
 /// single-slot non-dropping design with one deliberate difference: the calloop thread is also
 /// the compositor + input dispatcher, so it must NEVER block on the pool. `try_begin` hands
 /// out a buffer only while the publish slot is empty, so `publish` cannot block, and a
@@ -722,7 +805,7 @@ pub struct WlFramePool {
 }
 
 impl WlFramePool {
-    /// @brief Pre-allocate all `n` capture buffers up front (each `buf_len` bytes, all initially
+    /// Pre-allocate all `n` capture buffers up front (each `buf_len` bytes, all initially
     /// free) so the steady-state render/encode loop hands buffers around without ever allocating on
     /// the hot path.
     fn new(n: usize, buf_len: usize) -> Self {
@@ -736,7 +819,7 @@ impl WlFramePool {
         }
     }
 
-    /// @brief Calloop: reserve a buffer for the next render/readback, NON-blocking. None means the
+    /// Calloop: reserve a buffer for the next render/readback, NON-blocking. None means the
     /// encoder is still behind (slot full or every buffer in flight) -- skip this tick.
     /// Because the calloop is the only producer, a successful reservation guarantees the
     /// following `publish` finds the slot empty (the consumer only ever drains it).
@@ -748,7 +831,7 @@ impl WlFramePool {
         g.free.pop()
     }
 
-    /// @brief Calloop: hand the filled buffer to the encode thread. Never blocks (see `try_begin`).
+    /// Calloop: hand the filled buffer to the encode thread. Never blocks (see `try_begin`).
     fn publish(&self, frame: WlFrame) {
         let mut g = self.inner.lock().unwrap();
         debug_assert!(g.slot.is_none());
@@ -757,12 +840,12 @@ impl WlFramePool {
         self.cv.notify_all();
     }
 
-    /// @brief Calloop: return an unused reservation (render failed, readback skipped).
+    /// Calloop: return an unused reservation (render failed, readback skipped).
     fn cancel(&self, id: usize, buf: Vec<u8>) {
         self.inner.lock().unwrap().free.push((id, buf));
     }
 
-    /// @brief Encode: block until a frame is published (Some) or the pool shuts down (None). The
+    /// Encode: block until a frame is published (Some) or the pool shuts down (None). The
     /// wait is bounded, re-checking `stop` as defense-in-depth against a lost wakeup.
     fn take(&self) -> Option<WlFrame> {
         let mut g = self.inner.lock().unwrap();
@@ -778,13 +861,13 @@ impl WlFramePool {
         }
     }
 
-    /// @brief Encode: return an encoded frame's buffer so the calloop can capture into it again.
+    /// Encode: return an encoded frame's buffer so the calloop can capture into it again.
     /// No notify: the only waiter (take) waits on the slot, and try_begin never blocks.
     fn recycle(&self, id: usize, buf: Vec<u8>) {
         self.inner.lock().unwrap().free.push((id, buf));
     }
 
-    /// @brief Store stop under the lock so take() can't check stop==false and then park after the
+    /// Store stop under the lock so take() can't check stop==false and then park after the
     /// notify already fired (lost wakeup); notify after unlocking.
     fn shutdown(&self) {
         let g = self.inner.lock().unwrap();
@@ -794,7 +877,7 @@ impl WlFramePool {
     }
 }
 
-/// @brief Cross-thread controls for the Wayland encode thread, the X11 `Controls` scheme: the
+/// Cross-thread controls for the Wayland encode thread, the X11 `Controls` scheme: the
 /// UpdateRate handler stores the current values then flips `rate_dirty` with Release; the
 /// encode thread swaps it with Acquire and re-reads the payload, never seeing it half-applied.
 /// `force_idr` is swapped just before each encode, so an on-demand keyframe lands on the
@@ -825,11 +908,11 @@ impl WlEncodeControls {
     }
 }
 
-/// @brief Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
+/// Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
 /// publish slot, so a deeper pool would only add latency (staler frames), never overlap.
 const WL_POOL_SURFACES: usize = 2;
 
-/// @brief Shared capture stats: whichever thread owns the encoders counts frames/stripes and
+/// Shared capture stats: whichever thread owns the encoders counts frames/stripes and
 /// composes `desc` + `n_stripes` (the encoder half of the 1 s debug log line); the calloop
 /// log loads, prints and resets the counters.
 pub struct WlEncodeStats {
@@ -850,7 +933,7 @@ impl WlEncodeStats {
     }
 }
 
-/// @brief Everything the Wayland encode thread needs, fixed for the life of one capture (a
+/// Everything the Wayland encode thread needs, fixed for the life of one capture (a
 /// StartCapture reconfigure tears the thread down and spawns a fresh one). Rate changes
 /// flow through `controls`; damage and the IDR request arrive per-frame in `WlFrame`.
 struct WlEncodeConfig {
@@ -868,7 +951,7 @@ struct WlEncodeConfig {
     stats: Arc<WlEncodeStats>,
 }
 
-/// @brief Build the readback-mode encoder set on the thread that will own and drive it.
+/// Build the readback-mode encoder set on the thread that will own and drive it.
 ///
 /// The result is one of three shapes: a hardware `GpuEncoder` (NVENC or VAAPI) consuming host
 /// NV12/YUV444 via `encode_raw`, the OpenH264 full-frame encoder, or `(None, None)` for the
@@ -943,7 +1026,7 @@ fn build_readback_encoders(
     (None, None)
 }
 
-/// @brief Encode-thread body for the Wayland readback paths: drain published frames and run the
+/// Encode-thread body for the Wayland readback paths: drain published frames and run the
 /// full encode dispatch, owning the encoders for the life of the capture.
 ///
 /// Owning the encoders on this one thread (created, driven, and dropped here) is what lets the
@@ -1189,7 +1272,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     video_encoder
 }
 
-/// @brief Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
+/// Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
 /// whichever thread owns the encoders.
 fn encoder_desc(
     settings: &RustCaptureSettings,
@@ -1226,7 +1309,7 @@ fn encoder_desc(
     format!("H264 ({}) {} {} {} CRF:{}", backend, cs_str, range_str, frame_str, settings.video_crf)
 }
 
-/// @brief Decide how many horizontal stripes a frame is split into, which is really the choice of how
+/// Decide how many horizontal stripes a frame is split into, which is really the choice of how
 /// much encode parallelism to spend on it. A full-frame session (`fullframe_encoder`: a HW or
 /// OpenH264 encoder, or a forced `video_fullframe`) is one contiguous H.264 stream and so is always a
 /// SINGLE stripe; the striped CPU paths instead fan the frame out across cores — bounded by
@@ -1252,7 +1335,7 @@ fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool)
     }
 }
 
-/// @brief One-shot "Stream settings active" line, printed by the thread that owns the encoders
+/// One-shot "Stream settings active" line, printed by the thread that owns the encoders
 /// once the selection is final (calloop for zero-copy, encode thread for readback).
 fn log_stream_settings(
     settings: &RustCaptureSettings,
@@ -1330,7 +1413,7 @@ fn log_stream_settings(
     println!("{}", log_msg);
 }
 
-/// @brief The main execution loop of the Wayland backend.
+/// The main execution loop of the Wayland backend.
 ///
 /// This function is the central nervous system of the backend. It runs on its own thread and owns
 /// the entire lifecycle of the headless Wayland compositor:
@@ -2843,7 +2926,7 @@ fn run_wayland_thread(
     }).unwrap();
 }
 
-/// @brief Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
+/// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
 /// exposes it read-only via the buffer protocol, so `bytes(frame)` /
 /// `memoryview(frame)` alias the Rust buffer instead of copying. Carries the
 /// four stripe-metadata ints as Python attributes.
@@ -2861,7 +2944,7 @@ struct StripeFrame {
 }
 
 impl StripeFrame {
-    /// @brief Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
+    /// Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
     fn new_owned_meta(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
@@ -2871,7 +2954,7 @@ impl StripeFrame {
 
 #[pymethods]
 impl StripeFrame {
-    /// @brief Symmetry / testability constructor: copies the bytes-like into the owned `Vec`.
+    /// Symmetry / testability constructor: copies the bytes-like into the owned `Vec`.
     /// The hot path uses `new_owned_meta` (a move) instead.
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
@@ -2883,7 +2966,7 @@ impl StripeFrame {
         self.data.len()
     }
 
-    /// @brief Expose the owned bytes read-only through the Python buffer protocol.
+    /// Expose the owned bytes read-only through the Python buffer protocol.
     ///
     /// `PyBuffer_FillInfo` INCREFs `slf` into `view->obj`, pinning the `Vec` until every view is
     /// released, so memoryviews can outlive the Python `frame` handle.
@@ -2909,7 +2992,7 @@ impl StripeFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-/// @brief The Python handle to the one long-lived compositor thread. Because calloop, EGL/GBM, and
+/// The Python handle to the one long-lived compositor thread. Because calloop, EGL/GBM, and
 /// the Wayland display are all thread-affine and the compositor has to keep running to serve its
 /// clients even between captures, the backend cannot be a passive object that starts work on demand:
 /// constructing it spawns that thread and it stays up for the process lifetime. The struct itself is
@@ -2921,7 +3004,7 @@ struct WaylandBackend {
 
 #[pymethods]
 impl WaylandBackend {
-    /// @brief Construct the backend and spawn the long-lived compositor thread, handing it the
+    /// Construct the backend and spawn the long-lived compositor thread, handing it the
     /// strongest scheduling edge (nice -15) because it drives the calloop, input dispatch, the render
     /// loop, and — on the zero-copy path — the encode itself, all on this single thread, so any
     /// scheduling starvation here surfaces directly as dropped or late frames.
@@ -2943,7 +3026,7 @@ impl WaylandBackend {
         WaylandBackend { tx }
     }
 
-    /// @brief Begin a capture with the given frame callback and settings.
+    /// Begin a capture with the given frame callback and settings.
     ///
     /// Issuing the start also clears the interpreter-teardown gate: starting from Python proves the
     /// interpreter is live again after a manual atexit sweep.
@@ -2971,7 +3054,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
     fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::SetClipboardCallback(callback))
@@ -2979,7 +3062,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
     fn set_clipboard(&self, mime: String, data: Vec<u8>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::SetClipboard { mime, data })
@@ -2994,7 +3077,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
+    /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
     /// owns keysym-to-keycode policy: define keycodes here, then press them via
     /// `inject_key`. Ordered with key events on the one compositor channel.
     fn set_keymap_string(&self, text: String) -> PyResult<()> {
@@ -3004,7 +3087,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief Return the active xkb keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can
+    /// Return the active xkb keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a consumer can
     /// build a reverse keysym->keycode map from the identical keymap.
     ///
     /// The GIL is released while awaiting the reply, because the Wayland thread can call back into
@@ -3057,7 +3140,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief Forces an IDR/keyframe on the next captured frame so a (re)connecting client
+    /// Forces an IDR/keyframe on the next captured frame so a (re)connecting client
     /// or a decoder reset can resume immediately. With the default infinite GOP this
     /// is the only recovery path, so every consumer that can lose decoder state must
     /// call it. No-op cost on the JPEG/software path (keyframes are N/A).
@@ -3068,7 +3151,7 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// @brief Apply a live bitrate (kbps) / VBV (kb) / framerate change to the running capture.
+    /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the running capture.
     fn update_rate(&self, bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64>) -> PyResult<()> {
         self.tx
             .send(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps })
@@ -3091,7 +3174,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::encoders::software::EncodedStripe;
 
-/// @brief Let Python wrap already-encoded bytes back into a `StripeFrame`, for callers that produce or
+/// Let Python wrap already-encoded bytes back into a `StripeFrame`, for callers that produce or
 /// replay stripe data outside a live capture (tests, re-sends to a late joiner). It copies the
 /// buffer-like input (bytes/bytearray/memoryview) in because the frame owns its bytes; the capture
 /// hot path instead uses `new_owned_meta` to MOVE the encoder's buffer with no copy, so this
@@ -3108,7 +3191,7 @@ fn stripe_frame_from_buffer(
     StripeFrame::new_owned_meta(data, data_type, stripe_y_start, stripe_height, frame_id)
 }
 
-/// @brief Capture configuration read by `start_capture` (each field by attribute name via
+/// Capture configuration read by `start_capture` (each field by attribute name via
 /// `extract_settings`, so the field names must match exactly). Declared `dict` so callers
 /// can stash extra attributes not listed here.
 #[pyclass(dict)]
@@ -3189,29 +3272,29 @@ impl CaptureSettings {
     }
 }
 
-/// @brief Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
+/// Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
 static WAYLAND_BACKEND: OnceLock<Mutex<Option<Py<WaylandBackend>>>> = OnceLock::new();
-/// @brief Cursor callback registered before the backend exists (selkies registers it pre-start);
+/// Cursor callback registered before the backend exists (selkies registers it pre-start);
 /// applied when the backend is created, which is deferred to capture start so the real
 /// render node (not a placeholder) reaches the compositor.
 static PENDING_CURSOR_CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
-/// @brief Interpreter-teardown gate, set by the atexit sweep: the detached compositor and delivery
+/// Interpreter-teardown gate, set by the atexit sweep: the detached compositor and delivery
 /// threads must never attach to a finalizing interpreter (aborts the process pre-3.13).
 /// Cleared by a fresh capture start (only a live interpreter can start one).
 pub(crate) static PY_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// @brief ScreenCapture id that owns the active shared Wayland capture (0 = none). Only the owner may
+/// ScreenCapture id that owns the active shared Wayland capture (0 = none). Only the owner may
 /// stop it, so an input-only or stale instance can't tear down a live capture.
 static WAYLAND_OWNER: AtomicU64 = AtomicU64::new(0);
-/// @brief Real Wayland capture liveness (StartCapture -> true, StopCapture -> false), mirrored
+/// Real Wayland capture liveness (StartCapture -> true, StopCapture -> false), mirrored
 /// from AppState.is_capturing so the Python-facing is_capturing() reports whether the
 /// pipeline is actually running, not merely which ScreenCapture owns the backend.
 static WAYLAND_CAPTURE_ALIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// @brief Hands each `ScreenCapture` a unique, monotonic id — the token `WAYLAND_OWNER` compares to
+/// Hands each `ScreenCapture` a unique, monotonic id — the token `WAYLAND_OWNER` compares to
 /// decide which instance is allowed to stop the one shared compositor capture. Starts at 1 so 0 can
 /// mean "no owner".
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
-/// @brief Registry of every live X11 capture's `Controls`, so the atexit sweep can flag them all to
+/// Registry of every live X11 capture's `Controls`, so the atexit sweep can flag them all to
 /// stop before the interpreter finalizes even after the owning `ScreenCapture` Python handles have
 /// been dropped — without a central registry those captures would have no reachable stop switch.
 static LIVE_X11: OnceLock<Mutex<Vec<Arc<crate::x11::Controls>>>> = OnceLock::new();
@@ -3220,7 +3303,7 @@ fn live_x11() -> &'static Mutex<Vec<Arc<crate::x11::Controls>>> {
     LIVE_X11.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// @brief Best-effort nice boost for the calling capture/encode/delivery thread. These threads
+/// Best-effort nice boost for the calling capture/encode/delivery thread. These threads
 /// compete with the very workload being captured, so a scheduling edge keeps frame pacing
 /// steady under load. Requires CAP_SYS_NICE (or root); otherwise EPERM and silently a no-op.
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
@@ -3230,7 +3313,7 @@ pub(crate) fn boost_thread_priority(nice: libc::c_int) {
     }
 }
 
-/// @brief Forward a live rate change to the shared Wayland backend (no-op if none is running).
+/// Forward a live rate change to the shared Wayland backend (no-op if none is running).
 fn wayland_update_rate(
     py: Python<'_>,
     bitrate_kbps: Option<i32>,
@@ -3244,7 +3327,7 @@ fn wayland_update_rate(
     }
 }
 
-/// @brief Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
+/// Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
 fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
@@ -3253,7 +3336,7 @@ fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
     }
 }
 
-/// @brief Get-or-create the singleton Wayland backend (idempotent: the first dimensions and render
+/// Get-or-create the singleton Wayland backend (idempotent: the first dimensions and render
 /// node win, and a later capture just resizes).
 ///
 /// Called from capture start (which knows the operator's real node) and from the import-time
@@ -3304,7 +3387,7 @@ fn ensure_wayland_backend(
     Ok(g.as_ref().unwrap().clone_ref(py))
 }
 
-/// @brief The live Wayland backend, if any — never creates one. The pre-capture entry points
+/// The live Wayland backend, if any — never creates one. The pre-capture entry points
 /// (input injection, cursor/config setters) use this so they can't lock in a backend
 /// with a placeholder render node.
 fn wayland_backend_running(py: Python<'_>) -> Option<Py<WaylandBackend>> {
@@ -3313,7 +3396,7 @@ fn wayland_backend_running(py: Python<'_>) -> Option<Py<WaylandBackend>> {
     g.as_ref().map(|b| b.clone_ref(py))
 }
 
-/// @brief Backend choice: an explicit `use_wayland` bool in the settings wins (selkies
+/// Backend choice: an explicit `use_wayland` bool in the settings wins (selkies
 /// forwards --wayland / SELKIES_WAYLAND there); when left unset (None), capture
 /// goes through Wayland exactly when the session exposes a WAYLAND_DISPLAY.
 fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
@@ -3327,7 +3410,7 @@ fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
     std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// @brief Mutable per-capture state behind `ScreenCapture`'s mutex: the active backend, the live
+/// Mutable per-capture state behind `ScreenCapture`'s mutex: the active backend, the live
 /// X11 controls and thread handle, and the capture / encode thread ids used to detect a re-entrant
 /// stop.
 struct ScState {
@@ -3349,7 +3432,7 @@ struct ScState {
     encode_tid_rx: Option<std::sync::mpsc::Receiver<thread::ThreadId>>,
 }
 
-/// @brief Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
+/// Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
 /// shared Wayland backend, chosen at `start_capture` time. Exposes start_capture / stop_capture /
 /// request_idr_frame / update_* / is_capturing, plus the Wayland input-injection methods.
 #[pyclass]
@@ -3359,7 +3442,7 @@ struct ScreenCapture {
 }
 
 impl ScreenCapture {
-    /// @brief Stop this capture: signal the capture thread, drop the live controls, and join.
+    /// Stop this capture: signal the capture thread, drop the live controls, and join.
     ///
     /// The path forks on the backend. A **Wayland** capture only tells the shared compositor to
     /// stop when this instance still owns it — ownership is claimed-and-cleared atomically so a
@@ -3436,7 +3519,7 @@ impl ScreenCapture {
         }
     }
 
-    /// @brief Begin capture: `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
+    /// Begin capture: `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
     ///
     /// The backend is chosen from the settings (`want_wayland`). A **Wayland** start delegates to
     /// the shared backend, distinguishing the compositor RENDER node from the ENCODER node and
@@ -3635,7 +3718,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// @brief Apply a live target-bitrate (kbps) change to the running capture.
+    /// Apply a live target-bitrate (kbps) change to the running capture.
     ///
     /// On the X11 path the dirty flag is Release-published after the payload store, so the encode
     /// thread's Acquire read can never observe the flag set against a stale bitrate.
@@ -3675,7 +3758,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// @brief Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
+    /// Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
     fn update_vbv_multiplier(&self, py: Python<'_>, multiplier: f64) -> PyResult<()> {
         let (backend, controls) = {
             let st = self.inner.lock().unwrap();
@@ -3695,7 +3778,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// @brief Apply the live-tunable subset of `settings` (quality, paint-over, streaming mode,
+    /// Apply the live-tunable subset of `settings` (quality, paint-over, streaming mode,
     /// cursor overlay, keyframe interval) to the running capture -- no restart, no encoder
     /// re-init. Structural changes (encoder, chroma, RC mode, device) still need a restart.
     fn update_tunables(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -3719,7 +3802,7 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// @brief Move/resize the live X11 capture region (root-relative). The capture loop drains
+    /// Move/resize the live X11 capture region (root-relative). The capture loop drains
     /// in-flight frames, re-targets its surfaces, and the encoder follows in place where
     /// it can (NVENC reconfigure / stripe re-derive) -- no capture restart. `width`/
     /// `height` <= 0 mean "to the root edge". On Wayland the output IS the capture
@@ -3777,7 +3860,7 @@ impl ScreenCapture {
     fn set_cursor_rendering(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_cursor_rendering(enabled))
     }
-    /// @brief Register the client-copy cursor callback, or stash it until the backend exists.
+    /// Register the client-copy cursor callback, or stash it until the backend exists.
     ///
     /// The backend slot lock is held across the check so a concurrent backend creation cannot miss
     /// the stash; before the backend exists the callback is stored in `PENDING_CURSOR_CALLBACK` and
@@ -3797,7 +3880,7 @@ impl ScreenCapture {
         wayland_backend_running(py)
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))
     }
-    /// @brief cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
     fn set_clipboard_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard_callback(callback),
@@ -3806,7 +3889,7 @@ impl ScreenCapture {
             )),
         }
     }
-    /// @brief Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
+    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
     fn set_clipboard(&self, py: Python<'_>, mime: String, data: Vec<u8>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard(mime, data),
@@ -3817,7 +3900,7 @@ impl ScreenCapture {
     }
 }
 
-/// @brief Best-effort teardown: flag the capture thread to exit without joining.
+/// Best-effort teardown: flag the capture thread to exit without joining.
 ///
 /// Joining would need the GIL (the thread calls back into Python), which `Drop` cannot safely take,
 /// so this only sets the stop flag; the actual join is left to an explicit `stop_capture` or the
@@ -3832,7 +3915,7 @@ impl Drop for ScreenCapture {
     }
 }
 
-/// @brief Bring the Wayland compositor socket up before any capture so apps launched early can
+/// Bring the Wayland compositor socket up before any capture so apps launched early can
 /// connect (sets WAYLAND_DISPLAY for children of this process). Idempotent; the running
 /// backend keeps its node/dimensions on later calls. `render_node` is an explicit
 /// /dev/dri/renderD* path; `auto_gpu` is a truthy string or vendor/driver token; empty
@@ -3851,7 +3934,7 @@ fn ensure_wayland_display(
         .map(|_| ())
 }
 
-/// @brief Stop every live capture (registered with atexit) before interpreter finalization.
+/// Stop every live capture (registered with atexit) before interpreter finalization.
 ///
 /// The interpreter-teardown gate is set first so no detached thread may attach to a finalizing
 /// interpreter, and a never-applied cursor stash is dropped while the GIL is held. Every X11
@@ -3877,7 +3960,7 @@ fn _stop_all_captures(py: Python<'_>) {
     py.detach(|| std::thread::sleep(Duration::from_millis(50)));
 }
 
-/// @brief The `pixelflux` Python module: registers the exported classes and functions, and hooks
+/// The `pixelflux` Python module: registers the exported classes and functions, and hooks
 /// `_stop_all_captures` into `atexit` so every live capture is stopped before interpreter shutdown.
 #[pymodule]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {

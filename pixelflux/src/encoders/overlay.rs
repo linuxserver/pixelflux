@@ -4,6 +4,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! PNG watermark overlay composited onto captured frames before encoding.
+//!
+//! Supports static positioning (top-left, top-right, bottom-left, bottom-right, center) and an
+//! animated "DVD-screensaver" bounce mode. The watermark is rendered into the compositor frame on
+//! the GPU path (no readback) or blitted onto the host-ARGB buffer on the CPU path.
+
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -20,7 +26,7 @@ use smithay::{
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq)]
-/// @brief Watermark anchor: corners (TL/TR/BL/BR), middle (MI), or bouncing (AN).
+/// Watermark anchor: corners (TL/TR/BL/BR), middle (MI), or bouncing (AN).
 pub enum WatermarkLocation {
     None = 0,
     TL = 1,
@@ -45,7 +51,7 @@ impl From<i32> for WatermarkLocation {
     }
 }
 
-/// @brief The watermark's uploaded pixels plus its current placement and bounce state, kept across
+/// The watermark's uploaded pixels plus its current placement and bounce state, kept across
 /// frames so a moving (bouncing) watermark can be advanced and re-placed each tick without
 /// re-reading or re-uploading the image.
 pub struct OverlayState {
@@ -81,7 +87,7 @@ impl Default for OverlayState {
 }
 
 impl OverlayState {
-    /// @brief Load the watermark image from disk; `output_scale` is the output's fractional
+    /// Load the watermark image from disk; `output_scale` is the output's fractional
     /// scale, ceiled to the integer buffer scale of the upload. A failed load clears the overlay.
     pub fn load_watermark(&mut self, path: &str, output_scale: f64) {
         if let Ok(img) = image::open(Path::new(path)) {
@@ -105,17 +111,17 @@ impl OverlayState {
         }
     }
 
-    /// @brief True once a watermark image has been loaded.
+    /// True once a watermark image has been loaded.
     pub fn is_active(&self) -> bool {
         self.wm_loaded
     }
 
-    /// @brief True when the watermark moves and must be re-rendered every frame.
+    /// True when the watermark moves and must be re-rendered every frame.
     pub fn is_animated(&self) -> bool {
         self.is_animated
     }
 
-    /// @brief Place the watermark for the current frame size. Fixed anchors (corners / middle) are
+    /// Place the watermark for the current frame size. Fixed anchors (corners / middle) are
     /// pure geometry, but the `AN` anchor makes the watermark bounce, so each call also advances
     /// that animation one step and reflects it off the frame edges — which is precisely why an `AN`
     /// watermark has to be re-rendered every frame (see `is_animated`). `loc_enum` is the i32 form
@@ -179,7 +185,7 @@ impl OverlayState {
         }
     }
 
-    /// @brief Render element for the watermark; `None` when no watermark is loaded.
+    /// Render element for the watermark; `None` when no watermark is loaded.
     pub fn get_watermark_element<R>(
         &self,
         renderer: &mut R,
@@ -205,7 +211,7 @@ impl OverlayState {
         }
     }
 
-    /// @brief Render element for a software cursor `image` at `pos` (logical coords).
+    /// Render element for a software cursor `image` at `pos` (logical coords).
     pub fn get_cursor_element<R>(
         &self,
         renderer: &mut R,
