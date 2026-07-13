@@ -927,6 +927,10 @@ where
                 rsettings.capture_y = ny;
                 rsettings.width = nw;
                 rsettings.height = nh;
+                // An explicit live size pins the region: auto-adjust (from the start
+                // settings) would glue resolve_dims back to the ROOT size, undoing the
+                // re-target on the next geometry poll. w/h <= 0 keep following the root.
+                rsettings.auto_adjust_screen_capture_size = nw <= 0 || nh <= 0;
                 cap_x = nx.max(0) as i16;
                 cap_y = ny.max(0) as i16;
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {

@@ -2029,6 +2029,17 @@ fn run_wayland_thread(
                             encoder_desc(&settings, state.video_encoder.as_ref(), false, true);
                         log_stream_settings(&settings, 1, state.video_encoder.as_ref(), false);
                     }
+                    // Force the keyframe on the now-active path (as RequestIdr does),
+                    // unconditionally: the damage tracker and offscreen buffer stay
+                    // warm across StopCapture/StartCapture, so a restarted capture on
+                    // a static screen otherwise produces no damage, no first frame,
+                    // and no IDR in either the striped or the zero-copy path (a
+                    // stop+start encoder switch froze until the next screen damage).
+                    if state.encode_pool.is_some() {
+                        state.encode_controls.force_idr.store(true, Ordering::Relaxed);
+                    } else {
+                        state.pending_force_idr = true;
+                    }
                 }
                 CalloopEvent::Msg(ThreadCommand::StopCapture) => {
                     println!("[Wayland] Capture loop stopped.");
@@ -3419,8 +3430,8 @@ struct ScState {
     controls: Option<Arc<crate::x11::Controls>>,
     handle: Option<thread::JoinHandle<()>>,
     cap_thread_id: Option<thread::ThreadId>,
-    /// The internal encode+deliver thread's id, so a re-entrant stop from inside the delivery
-    /// callback (which runs on that thread) is detected and doesn't try to self-join.
+    /// The internal encode thread's id, so a re-entrant stop arriving on it is
+    /// detected and doesn't try to join a chain that includes itself.
     encode_thread_id: Option<thread::ThreadId>,
     /// Handshake receiver kept when the bounded start-time wait for the encode thread id
     /// lapsed (slow X11 setup precedes the encode-thread spawn): the id is late-resolved
@@ -3430,6 +3441,12 @@ struct ScState {
     /// caller), a deadlock cycle. The id send strictly precedes any callback running on
     /// that thread, so a `try_recv` at stop time cannot miss it.
     encode_tid_rx: Option<std::sync::mpsc::Receiver<thread::ThreadId>>,
+    /// Delivery thread: owns the GIL-bound Python callback so encode(N+1) never
+    /// serializes behind deliver(N). Joined on stop; a re-entrant stop from
+    /// inside the callback (which runs on this thread) must detach instead of
+    /// self-joining.
+    deliver_handle: Option<thread::JoinHandle<()>>,
+    deliver_thread_id: Option<thread::ThreadId>,
 }
 
 /// Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
@@ -3447,12 +3464,12 @@ impl ScreenCapture {
     /// The path forks on the backend. A **Wayland** capture only tells the shared compositor to
     /// stop when this instance still owns it — ownership is claimed-and-cleared atomically so a
     /// stale stop cannot tear down a capture another instance just started. An **X11** capture joins
-    /// its capture thread (which also joins the encode thread), releasing the GIL first because the
-    /// encode thread runs the Python callback and holding the GIL across the join would deadlock. A
-    /// re-entrant stop arriving on the capture or encode thread cannot join itself, so it detaches
-    /// and lets the threads exit on the stop flag.
+    /// its capture thread (which also joins the encode thread) and then its deliver thread,
+    /// releasing the GIL first because the deliver thread runs the Python callback and holding the
+    /// GIL across the joins would deadlock. A re-entrant stop arriving on the capture, encode, or
+    /// deliver thread cannot join itself, so it detaches and lets the threads exit on the stop flag.
     fn stop_internal(&self, py: Python<'_>) -> PyResult<()> {
-        let (handle, same_thread, backend, controls) = {
+        let (handle, deliver_handle, same_thread, backend, controls) = {
             let mut st = self.inner.lock().unwrap();
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
@@ -3465,15 +3482,19 @@ impl ScreenCapture {
                     }
                 }
             }
-            let same = st.cap_thread_id == cur || st.encode_thread_id == cur;
+            let same = st.cap_thread_id == cur
+                || st.encode_thread_id == cur
+                || st.deliver_thread_id == cur;
             let controls = st.controls.take();
             let handle = st.handle.take();
+            let deliver_handle = st.deliver_handle.take();
             let backend = st.backend;
             st.backend = 0;
             st.cap_thread_id = None;
             st.encode_thread_id = None;
             st.encode_tid_rx = None;
-            (handle, same, backend, controls)
+            st.deliver_thread_id = None;
+            (handle, deliver_handle, same, backend, controls)
         };
         if let Some(c) = &controls {
             live_x11().lock().unwrap().retain(|x| !Arc::ptr_eq(x, c));
@@ -3489,12 +3510,22 @@ impl ScreenCapture {
                     }
                 }
             }
-        } else if let Some(h) = handle {
+        } else {
             if same_thread {
-                drop(h);
+                // Detach: the threads exit on the stop flag once the callback returns.
+                drop(handle);
+                drop(deliver_handle);
             } else {
                 py.detach(|| {
-                    let _ = h.join();
+                    if let Some(h) = handle {
+                        let _ = h.join();
+                    }
+                    // The capture join above ends the encode thread, dropping the
+                    // delivery sender; the deliver thread then drains its one
+                    // queued frame and exits, so this join is bounded.
+                    if let Some(h) = deliver_handle {
+                        let _ = h.join();
+                    }
                 });
             }
         }
@@ -3515,6 +3546,8 @@ impl ScreenCapture {
                 cap_thread_id: None,
                 encode_thread_id: None,
                 encode_tid_rx: None,
+                deliver_handle: None,
+                deliver_thread_id: None,
             }),
         }
     }
@@ -3616,28 +3649,47 @@ impl ScreenCapture {
         let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let err_slot2 = err_slot.clone();
 
-        let on_frame = move |frame: Vec<EncodedStripe>| {
-            Python::attach(|py| {
-                for s in frame {
-                    match Py::new(
-                        py,
-                        StripeFrame::new_owned_meta(
-                            s.data,
-                            s.data_type,
-                            s.stripe_y_start,
-                            s.stripe_height,
-                            s.frame_id,
-                        ),
-                    ) {
-                        Ok(f) => {
-                            if let Err(e) = cb.call1(py, (f,)) {
-                                e.print(py);
-                            }
-                        }
-                        Err(e) => eprintln!("[x11] frame alloc error: {e:?}"),
-                    }
+        // The Python callback is GIL-bound: run it on its own thread (as the
+        // Wayland backend and pcmflux do) so encode(N+1) never serializes behind
+        // deliver(N). Bounded at one in-flight frame: a slower consumer
+        // backpressures the encoder by exactly one frame instead of growing a
+        // queue, and no frame is ever dropped.
+        let (deliver_tx, deliver_rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
+        let deliver_handle = thread::spawn(move || {
+            crate::boost_thread_priority(-10);
+            while let Ok(frame) = deliver_rx.recv() {
+                if PY_SHUTDOWN.load(Ordering::Relaxed) {
+                    continue;
                 }
-            });
+                Python::attach(|py| {
+                    for s in frame {
+                        match Py::new(
+                            py,
+                            StripeFrame::new_owned_meta(
+                                s.data,
+                                s.data_type,
+                                s.stripe_y_start,
+                                s.stripe_height,
+                                s.frame_id,
+                            ),
+                        ) {
+                            Ok(f) => {
+                                if let Err(e) = cb.call1(py, (f,)) {
+                                    e.print(py);
+                                }
+                            }
+                            Err(e) => eprintln!("[x11] frame alloc error: {e:?}"),
+                        }
+                    }
+                });
+            }
+        });
+        let deliver_thread_id = deliver_handle.thread().id();
+
+        let on_frame = move |frame: Vec<EncodedStripe>| {
+            // Blocks only when the single slot is still occupied (consumer more
+            // than one frame behind); a dropped receiver (stop) discards.
+            let _ = deliver_tx.send(frame);
         };
 
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
@@ -3688,6 +3740,8 @@ impl ScreenCapture {
         st.cap_thread_id = tid;
         st.encode_thread_id = etid;
         st.encode_tid_rx = late_etid_rx;
+        st.deliver_handle = Some(deliver_handle);
+        st.deliver_thread_id = Some(deliver_thread_id);
         Ok(())
     }
 
