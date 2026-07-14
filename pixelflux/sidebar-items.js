@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CompositionElements","ThreadCommand"],"mod":["computer_use","encoders","nvgpufilter","pipeline","recording_sink","wayland","x11"],"struct":["LiveTunables","RustCaptureSettings","WlEncodeControls","WlEncodeStats","WlFrame","WlFramePool"]};

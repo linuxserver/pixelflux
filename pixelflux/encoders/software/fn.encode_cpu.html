@@ -1,0 +1,96 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The software encoder’s per-frame entry point: split the frame into horizontal stripes, decide per stripe whether it needs sending, and encode only those as JPEG or x264 H.264 across the rayon pool."><title>encode_cpu in pixelflux::encoders::software - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="pixelflux" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">encode_cpu</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../pixelflux/index.html">pixelflux</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">encode_<wbr>cpu</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#arguments" title="Arguments">Arguments</a></li><li><a href="#returns" title="Returns">Returns</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In pixelflux::<wbr>encoders::<wbr>software</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">pixelflux</a>::<wbr><a href="../index.html">encoders</a>::<wbr><a href="index.html">software</a></div><h1>Function <span class="fn">encode_<wbr>cpu</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/pixelflux/encoders/software.rs.html#685-1008">Source</a> </span></div><pre class="rust item-decl"><code>pub fn encode_cpu(
+    stripes: &amp;mut <a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.StripeState.html" title="struct pixelflux::encoders::software::StripeState">StripeState</a>&gt;,
+    raw_pixels: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u8.html">u8</a>],
+    width: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.i32.html">i32</a>,
+    height: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.i32.html">i32</a>,
+    damage_rects: &amp;[Rectangle&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.i32.html">i32</a>, Physical&gt;],
+    settings: &amp;<a class="struct" href="../../struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">RustCaptureSettings</a>,
+    frame_counter: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u16.html">u16</a>,
+    use_gpu: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.bool.html">bool</a>,
+    hash_damage: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.bool.html">bool</a>,
+    recording_sink: <a class="enum" href="https://doc.rust-lang.org/1.97.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;<a class="struct" href="../../recording_sink/struct.RecordingSink.html" title="struct pixelflux::recording_sink::RecordingSink">RecordingSink</a>&gt;&gt;,
+    force_idr_all: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.bool.html">bool</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.EncodedStripe.html" title="struct pixelflux::encoders::software::EncodedStripe">EncodedStripe</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The software encoder’s per-frame entry point: split the frame into horizontal stripes,
+decide per stripe whether it needs sending, and encode only those as JPEG or x264 H.264
+across the rayon pool.</p>
+<p>Two pressures drive the design: CPU H.264/JPEG is expensive, so the frame is cut into
+parallel stripes; bandwidth is precious, so unchanged stripes are skipped. Each stripe is
+independently hashed against the previous frame for change detection, and only dirty stripes
+are encoded. The x264 path maintains per-stripe encoder state across frames for
+inter-prediction; the JPEG path is stateless. The recording sink is attached only in
+single-stripe mode because several independent sub-frame bitstreams cannot be muxed.</p>
+<h2 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h2>
+<ul>
+<li><code>stripes</code> - Persistent per-stripe state vector (resized as needed, encoder state preserved).</li>
+<li><code>raw_pixels</code> - Packed BGRA/RGBA pixel buffer (<code>width * height * 4</code> bytes).</li>
+<li><code>width</code> - Frame width in pixels.</li>
+<li><code>height</code> - Frame height in pixels.</li>
+<li><code>damage_rects</code> - Wayland damage rectangles (empty for X11 hash-based detection).</li>
+<li><code>settings</code> - Capture settings (quality, mode, rate control, etc.).</li>
+<li><code>frame_counter</code> - Current frame number (wrapping <code>u16</code>).</li>
+<li><code>use_gpu</code> - <code>true</code> when the source is RGBA (GLES readback); <code>false</code> for BGRA (X11 host).</li>
+<li><code>hash_damage</code> - <code>true</code> for X11 stripe-hash change detection; <code>false</code> when damage rects
+are provided.</li>
+<li><code>recording_sink</code> - Optional Unix-socket H.264 fan-out (only active in single-stripe mode).</li>
+<li><code>force_idr_all</code> - Force a keyframe on every stripe (client join / reset / periodic IDR).</li>
+</ul>
+<h2 id="returns"><a class="doc-anchor" href="#returns">§</a>Returns</h2>
+<p>Vec of <a href="struct.EncodedStripe.html" title="struct pixelflux::encoders::software::EncodedStripe"><code>EncodedStripe</code></a> — empty when nothing changed.
+repainting a stalled region at full quality, and letting a freshly-joined or reset client recover
+a clean picture. Persistent <code>StripeState</code> is what makes both affordable: encoders and buffers
+survive across frames instead of being rebuilt, and the motion/paint-over history the decision
+needs lives right beside them. The per-stripe decision mirrors <code>decide_hw_fullframe</code>’s policy for
+the hardware full-frame encoders; it is kept as separate code here because the striped path also
+chooses JPEG-vs-H.264 and derives its own damage.</p>
+<ol>
+<li><strong>Stripe count</strong>: defaults to the core count so the fan-out matches the hardware, but
+collapses to a single full-frame stripe when H.264 full-frame is requested or the frame is
+shorter than the 64-row minimum, and is otherwise capped so no stripe is thinner than 64 rows —
+below that the per-stripe encoder and thread overhead outweighs the parallelism and the tiny
+H.264 slices compress poorly. The persistent <code>stripes</code> vector is resized to match, preserving
+per-stripe state across frames.</li>
+<li><strong>Dirty map</strong>: with external compositor damage (<code>hash_damage == false</code>) each <code>damage_rects</code>
+rectangle marks every stripe whose row range it overlaps. With <code>hash_damage == true</code> (X11,
+which has no compositor damage) per-stripe content hashing drives dirtiness instead — except
+in streaming H.264, where every stripe is sent unconditionally so the hash is skipped.</li>
+<li><strong>Per-stripe decision</strong> (in <code>stripe_body</code>): a stripe is sent when it is dirty, when a
+paint-over / recovery burst is in flight, when streaming mode is on, or when <code>force_idr_all</code>
+is set. Quality is chosen per case — base JPEG quality / base CRF for live content, the
+paint-over quality/CRF after <code>paint_over_trigger_frames</code> static frames (once per still region,
+guarded by <code>paint_over_sent</code>), and <code>burst_crf</code> during a burst (the paint-over CRF when it is
+enabled and actually lower, else the base CRF, since a recovery burst still needs to stream so
+CBR can refine it). A newly dirty frame cancels any pending burst or paint-over and reverts to
+base quality.</li>
+<li><strong>Recovery IDR</strong> (<code>force_idr_all</code>): forces a send on every stripe even when static so a
+reconnecting client can resume. For H.264 it forces an IDR and arms a short streaming burst
+(unless one is already pending, so it cannot preempt an in-flight burst) because the keyframe
+is base-quality — worsened further by CBR — and a damage-gated static stream would otherwise
+never refine it; for JPEG, where every stripe is already intra, it resends a
+previously-painted-over stripe at the paint-over quality already on screen so a joining viewer
+does not see a downgrade.</li>
+<li><strong>Encoding</strong>:
+<ul>
+<li><strong>JPEG</strong> (<code>output_mode 0</code>): source byte order is RGBA on the GPU readback path and BGRA on
+X11; each worker thread reuses its thread-local TurboJPEG compressor. Header-less output
+hands the compressed buffer straight through; otherwise a 6-byte stripe header (<code>0x03</code> tag,
+a reserved byte, frame number, y-start) is prepended to match the H.264 path’s native
+framing so the transport can forward the buffer without re-framing.</li>
+<li><strong>H.264</strong> (<code>output_mode 1</code>): the stripe’s x264 encoder is reused unless the width, height,
+or chroma format changed, in which case it is rebuilt and an IDR forced; otherwise CRF and
+rate are reconfigured live. ARGB is converted to YUV (a conversion failure skips the stripe
+rather than encoding garbage), and an 8-byte fixed header (frame number, y-start, width,
+height) is emitted. The live CBR VBV budget is recomputed here from the bitrate/fps so it
+rescales with live changes.</li>
+</ul>
+</li>
+<li><strong>Dispatch</strong>: a single full-frame stripe runs inline (sequential — empirically faster than a
+one-element rayon job) with a single-band colour conversion and the same thread policy as the
+OpenH264 encoder — one fewer than the available cores, clamped to <code>[1, 4]</code>. The slice threads
+keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
+because <code>zerolatency</code> makes x264 slice-threaded and more than four slices trips decode
+glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread. Multiple stripes instead run across the
+rayon pool with a single x264 thread and one conversion band each, since the parallelism there
+already comes from encoding the stripes concurrently. The recording sink is attached only in single-stripe mode, because the several
+independent sub-frame bitstreams of striped mode cannot be muxed into one recording.</li>
+</ol>
+</div></details></section></div></main></body></html>

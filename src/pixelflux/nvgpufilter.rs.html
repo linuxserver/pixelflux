@@ -1,0 +1,708 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/nvgpufilter.rs`."><title>nvgpufilter.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="pixelflux" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">pixelflux/</div>nvgpufilter.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * This Source Code Form is subject to the terms of the Mozilla Public
+<a href=#3 id=3 data-nosnippet>3</a> * License, v. 2.0. If a copy of the MPL was not distributed with this
+<a href=#4 id=4 data-nosnippet>4</a> * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+<a href=#5 id=5 data-nosnippet>5</a> */
+<a href=#6 id=6 data-nosnippet>6</a>
+<a href=#7 id=7 data-nosnippet>7</a></span><span class="doccomment">//! Multi-GPU NVENC `GET_ATTACHED_IDS` / `GET_PROBED_IDS` ioctl filter — it exists so a container
+<a href=#8 id=8 data-nosnippet>8</a>//! handed only a subset of the host's GPUs can still open an NVENC session.
+<a href=#9 id=9 data-nosnippet>9</a>//!
+<a href=#10 id=10 data-nosnippet>10</a>//! The problem: on NVIDIA driver 570-595, `libnvidia-encode` / `libcuda` / `libnvcuvid` enumerate
+<a href=#11 id=11 data-nosnippet>11</a>//! every *host* GPU via the RM `GET_ATTACHED_IDS` ioctl and try to peer-init each one — including
+<a href=#12 id=12 data-nosnippet>12</a>//! GPUs the container never exposed. A GPU whose `/dev/nvidiaX` node is absent then makes
+<a href=#13 id=13 data-nosnippet>13</a>//! `nvEncOpenEncodeSessionEx` fail with UNSUPPORTED_DEVICE, so the session cannot open at all even
+<a href=#14 id=14 data-nosnippet>14</a>//! though a perfectly usable GPU is right there in the container.
+<a href=#15 id=15 data-nosnippet>15</a>//!
+<a href=#16 id=16 data-nosnippet>16</a>//! The fix is to strip the unreachable GPUs out of that enumeration response before the libraries
+<a href=#17 id=17 data-nosnippet>17</a>//! act on it. It GOT-patches `ioctl` in those NVIDIA libraries *only* — deliberately not an
+<a href=#18 id=18 data-nosnippet>18</a>//! LD_PRELOAD object, which would shadow every `ioctl` in the process and need its own recursion
+<a href=#19 id=19 data-nosnippet>19</a>//! guard. Because this crate's own GOT is left untouched, the wrapper's inner `ioctl` still resolves
+<a href=#20 id=20 data-nosnippet>20</a>//! to the real libc instead of re-entering itself.
+<a href=#21 id=21 data-nosnippet>21</a>//!
+<a href=#22 id=22 data-nosnippet>22</a>//! Everything hinges on at least one host GPU being hidden from the container, since that is the
+<a href=#23 id=23 data-nosnippet>23</a>//! only situation the bug arises in: on 565-or-before / 610-or-later drivers (enumeration already
+<a href=#24 id=24 data-nosnippet>24</a>//! correct) and whenever the container can see every host GPU, the strict-subset rule downstream
+<a href=#25 id=25 data-nosnippet>25</a>//! makes the whole filter a no-op.
+<a href=#26 id=26 data-nosnippet>26</a>
+<a href=#27 id=27 data-nosnippet>27</a></span><span class="kw">use </span>libc::{c_char, c_int, c_long, c_ulong, c_void};
+<a href=#28 id=28 data-nosnippet>28</a><span class="kw">use </span>std::ffi::CStr;
+<a href=#29 id=29 data-nosnippet>29</a><span class="kw">use </span>std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+<a href=#30 id=30 data-nosnippet>30</a><span class="kw">use </span>std::sync::Once;
+<a href=#31 id=31 data-nosnippet>31</a>
+<a href=#32 id=32 data-nosnippet>32</a><span class="doccomment">/// The ioctl command number (`_IOC_NR`, bits 0-7) that identifies the RM control escape —
+<a href=#33 id=33 data-nosnippet>33</a>/// the low byte the request gate keys on to recognize `NV_RM_CONTROL_REQUEST`. Kept as a named
+<a href=#34 id=34 data-nosnippet>34</a>/// constant only for documentation and the `ioc_nr_extracts_low_byte` unit test, hence
+<a href=#35 id=35 data-nosnippet>35</a>/// `#[allow(dead_code)]`.
+<a href=#36 id=36 data-nosnippet>36</a></span><span class="attr">#[allow(dead_code)]
+<a href=#37 id=37 data-nosnippet>37</a></span><span class="kw">const </span>NV_ESC_RM_CONTROL: c_ulong = <span class="number">0x2A</span>;
+<a href=#38 id=38 data-nosnippet>38</a><span class="doccomment">/// The RM control ioctl the gate recognizes: `_IOWR('F'=0x46, NR=0x2A,
+<a href=#39 id=39 data-nosnippet>39</a>/// sizeof(NVOS54_PARAMETERS)=32)`, encoding DIR=READ|WRITE, TYPE=0x46, NR=0x2A, SIZE=0x20.
+<a href=#40 id=40 data-nosnippet>40</a>///
+<a href=#41 id=41 data-nosnippet>41</a>/// Matching is by DIR|TYPE|NR with the encoded `_IOC_SIZE` deliberately masked off (via
+<a href=#42 id=42 data-nosnippet>42</a>/// `ioc_no_size`): a driver whose `NVOS54_PARAMETERS` has a different `sizeof` encodes a different
+<a href=#43 id=43 data-nosnippet>43</a>/// size and would slip past an exact-request compare, yet it is still the very same command.
+<a href=#44 id=44 data-nosnippet>44</a>/// Matching the NR alone would be too loose and pinning the exact encoded size too tight, so the
+<a href=#45 id=45 data-nosnippet>45</a>/// gate keys on DIR|TYPE|NR and validates the true per-command parameter layout separately via
+<a href=#46 id=46 data-nosnippet>46</a>/// `ctrl.params_size`. This is the deliberate middle ground.
+<a href=#47 id=47 data-nosnippet>47</a></span><span class="kw">const </span>NV_RM_CONTROL_REQUEST: c_ulong = <span class="number">0xC020_462A</span>;
+<a href=#48 id=48 data-nosnippet>48</a><span class="doccomment">/// Locates the `_IOC_SIZE` field so it can be cleared for size-agnostic request matching:
+<a href=#49 id=49 data-nosnippet>49</a>/// the 14-bit encoded parameter size lives at bit 16 of an ioctl request (`asm-generic/ioctl.h`).
+<a href=#50 id=50 data-nosnippet>50</a>/// Paired with `IOC_SIZEMASK` by `ioc_no_size`.
+<a href=#51 id=51 data-nosnippet>51</a></span><span class="kw">const </span>IOC_SIZESHIFT: u32 = <span class="number">16</span>;
+<a href=#52 id=52 data-nosnippet>52</a><span class="doccomment">/// 14-bit mask covering the `_IOC_SIZE` field (`(1 &lt;&lt; 14) - 1`); shifted by `IOC_SIZESHIFT`
+<a href=#53 id=53 data-nosnippet>53</a>/// and cleared from a request by `ioc_no_size` so the driver's param-struct size cannot affect the
+<a href=#54 id=54 data-nosnippet>54</a>/// match.
+<a href=#55 id=55 data-nosnippet>55</a></span><span class="kw">const </span>IOC_SIZEMASK: c_ulong = <span class="number">0x3FFF</span>;
+<a href=#56 id=56 data-nosnippet>56</a><span class="doccomment">/// Identifies the attached-GPU enumeration response the filter rewrites — RM control command
+<a href=#57 id=57 data-nosnippet>57</a>/// `NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS`, matched against `NvRmControlParams::cmd`.
+<a href=#58 id=58 data-nosnippet>58</a></span><span class="kw">const </span>GPU_GET_ATTACHED_IDS: u32 = <span class="number">0x0201</span>;
+<a href=#59 id=59 data-nosnippet>59</a><span class="doccomment">/// Identifies the probed-GPU enumeration response the filter rewrites — RM control command
+<a href=#60 id=60 data-nosnippet>60</a>/// `NV0000_CTRL_CMD_GPU_GET_PROBED_IDS`, matched against `NvRmControlParams::cmd`.
+<a href=#61 id=61 data-nosnippet>61</a></span><span class="kw">const </span>GPU_GET_PROBED_IDS: u32 = <span class="number">0x0214</span>;
+<a href=#62 id=62 data-nosnippet>62</a><span class="doccomment">/// The RM ABI caps attached GPUs at 32, so this is the fixed `gpuIds` array capacity in both
+<a href=#63 id=63 data-nosnippet>63</a>/// enumeration params structs — and the bound the filter's scans and scratch buffers are sized to.
+<a href=#64 id=64 data-nosnippet>64</a></span><span class="kw">const </span>MAX_ATTACHED_GPUS: usize = <span class="number">32</span>;
+<a href=#65 id=65 data-nosnippet>65</a><span class="doccomment">/// Marks the end of the live ids: the RM fills unused `gpuIds` slots with this sentinel, so
+<a href=#66 id=66 data-nosnippet>66</a>/// the first `INVALID_GPU_ID` terminates the populated prefix the filter scans and rewrites.
+<a href=#67 id=67 data-nosnippet>67</a></span><span class="kw">const </span>INVALID_GPU_ID: u32 = <span class="number">0xFFFF_FFFF</span>;
+<a href=#68 id=68 data-nosnippet>68</a><span class="doccomment">/// The `params_size` that marks an ATTACHED response and tells it apart from PROBED: both
+<a href=#69 id=69 data-nosnippet>69</a>/// structs open with the same `gpuIds[32]`, so only the exact total size (here `gpuIds[32]` =
+<a href=#70 id=70 data-nosnippet>70</a>/// `4 * MAX_ATTACHED_GPUS`) disambiguates them before the shared leading array is rewritten.
+<a href=#71 id=71 data-nosnippet>71</a></span><span class="kw">const </span>ATTACHED_PARAMS_SIZE: usize = <span class="number">4 </span>* MAX_ATTACHED_GPUS;
+<a href=#72 id=72 data-nosnippet>72</a><span class="doccomment">/// The `params_size` that marks a PROBED response and tells it apart from ATTACHED: this
+<a href=#73 id=73 data-nosnippet>73</a>/// struct is `gpuIds[32]` followed by `excludedGpuIds[32]` (`4 * MAX_ATTACHED_GPUS * 2`). Only the
+<a href=#74 id=74 data-nosnippet>74</a>/// shared leading `gpuIds[32]` is rewritten; the trailing `excludedGpuIds[32]` lists GPUs to
+<a href=#75 id=75 data-nosnippet>75</a>/// exclude, not to use, so it is deliberately left untouched.
+<a href=#76 id=76 data-nosnippet>76</a></span><span class="kw">const </span>PROBED_PARAMS_SIZE: usize = <span class="number">4 </span>* MAX_ATTACHED_GPUS * <span class="number">2</span>;
+<a href=#77 id=77 data-nosnippet>77</a>
+<a href=#78 id=78 data-nosnippet>78</a><span class="doccomment">/// The param block the RM control ioctl hands back (`NVOS54_PARAMETERS`, 32 bytes, pointed at
+<a href=#79 id=79 data-nosnippet>79</a>/// by `arg`) — modeled here so the filter can identify and validate an enumeration call before it
+<a href=#80 id=80 data-nosnippet>80</a>/// touches the GPU-id array it carries.
+<a href=#81 id=81 data-nosnippet>81</a>///
+<a href=#82 id=82 data-nosnippet>82</a>/// The rewrite reads `cmd` to identify the enumeration API, `status` and `params` to confirm the
+<a href=#83 id=83 data-nosnippet>83</a>/// call succeeded and carries a payload, and `params_size` to validate the exact payload layout
+<a href=#84 id=84 data-nosnippet>84</a>/// before dereferencing `params` (a `u64` user pointer to the command-specific struct).
+<a href=#85 id=85 data-nosnippet>85</a></span><span class="attr">#[repr(C)]
+<a href=#86 id=86 data-nosnippet>86</a></span><span class="kw">struct </span>NvRmControlParams {
+<a href=#87 id=87 data-nosnippet>87</a>    h_client: u32,
+<a href=#88 id=88 data-nosnippet>88</a>    h_object: u32,
+<a href=#89 id=89 data-nosnippet>89</a>    cmd: u32,
+<a href=#90 id=90 data-nosnippet>90</a>    flags: u32,
+<a href=#91 id=91 data-nosnippet>91</a>    params: u64,
+<a href=#92 id=92 data-nosnippet>92</a>    params_size: u32,
+<a href=#93 id=93 data-nosnippet>93</a>    status: u32,
+<a href=#94 id=94 data-nosnippet>94</a>}
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a><span class="doccomment">/// The `DT_*` `.dynamic` tags the GOT patch needs to locate a library's symbol, string, and
+<a href=#97 id=97 data-nosnippet>97</a>/// relocation tables — spelled out here because libc exposes `PT_DYNAMIC` but not these individual
+<a href=#98 id=98 data-nosnippet>98</a>/// values. `DT_NULL` (0) terminates the array.
+<a href=#99 id=99 data-nosnippet>99</a></span><span class="kw">const </span>DT_NULL: i64 = <span class="number">0</span>;
+<a href=#100 id=100 data-nosnippet>100</a><span class="doccomment">/// ELF `.dynamic` tag `DT_PLTRELSZ` (2): total byte size of the PLT relocation table.
+<a href=#101 id=101 data-nosnippet>101</a></span><span class="kw">const </span>DT_PLTRELSZ: i64 = <span class="number">2</span>;
+<a href=#102 id=102 data-nosnippet>102</a><span class="doccomment">/// ELF `.dynamic` tag `DT_RELA` (7): address of the general relocation table (`.rela.dyn`).
+<a href=#103 id=103 data-nosnippet>103</a></span><span class="kw">const </span>DT_RELA: i64 = <span class="number">7</span>;
+<a href=#104 id=104 data-nosnippet>104</a><span class="doccomment">/// ELF `.dynamic` tag `DT_RELASZ` (8): total byte size of the `.rela.dyn` relocation table.
+<a href=#105 id=105 data-nosnippet>105</a></span><span class="kw">const </span>DT_RELASZ: i64 = <span class="number">8</span>;
+<a href=#106 id=106 data-nosnippet>106</a><span class="doccomment">/// ELF `.dynamic` tag `DT_STRTAB` (5): address of the dynamic string table (symbol names).
+<a href=#107 id=107 data-nosnippet>107</a></span><span class="kw">const </span>DT_STRTAB: i64 = <span class="number">5</span>;
+<a href=#108 id=108 data-nosnippet>108</a><span class="doccomment">/// ELF `.dynamic` tag `DT_SYMTAB` (6): address of the dynamic symbol table.
+<a href=#109 id=109 data-nosnippet>109</a></span><span class="kw">const </span>DT_SYMTAB: i64 = <span class="number">6</span>;
+<a href=#110 id=110 data-nosnippet>110</a><span class="doccomment">/// ELF `.dynamic` tag `DT_JMPREL` (23): address of the PLT relocation table (`.rela.plt`).
+<a href=#111 id=111 data-nosnippet>111</a></span><span class="kw">const </span>DT_JMPREL: i64 = <span class="number">23</span>;
+<a href=#112 id=112 data-nosnippet>112</a>
+<a href=#113 id=113 data-nosnippet>113</a><span class="doccomment">/// Why the filter also handles eager GOT binds: `R_X86_64_GLOB_DAT` (6) names a GOT slot
+<a href=#114 id=114 data-nosnippet>114</a>/// bound eagerly, the form `-fno-plt` builds use — and NVIDIA libraries route `ioctl` through such a
+<a href=#115 id=115 data-nosnippet>115</a>/// slot in `.rela.dyn`. Alongside `R_X86_64_JUMP_SLOT`, it names a GOT entry holding a function
+<a href=#116 id=116 data-nosnippet>116</a>/// pointer the filter repoints.
+<a href=#117 id=117 data-nosnippet>117</a></span><span class="kw">const </span>R_X86_64_GLOB_DAT: u32 = <span class="number">6</span>;
+<a href=#118 id=118 data-nosnippet>118</a><span class="doccomment">/// The classic lazily-bound PLT GOT slot the filter repoints: `R_X86_64_JUMP_SLOT` (7), found
+<a href=#119 id=119 data-nosnippet>119</a>/// in `.rela.plt`, names a GOT entry holding a function pointer — the common case, paired with
+<a href=#120 id=120 data-nosnippet>120</a>/// `R_X86_64_GLOB_DAT` for the `-fno-plt` case.
+<a href=#121 id=121 data-nosnippet>121</a></span><span class="kw">const </span>R_X86_64_JUMP_SLOT: u32 = <span class="number">7</span>;
+<a href=#122 id=122 data-nosnippet>122</a>
+<a href=#123 id=123 data-nosnippet>123</a><span class="doccomment">/// Identity of the RM control device, cached so the hook only rewrites responses that truly
+<a href=#124 id=124 data-nosnippet>124</a>/// came from it: the `rdev` of `/dev/nvidiactl`, resolved once at `install()`. A value of 0 means it
+<a href=#125 id=125 data-nosnippet>125</a>/// was never resolved, in which case the fd-identity gate is skipped and matching falls back to the
+<a href=#126 id=126 data-nosnippet>126</a>/// request/size checks alone.
+<a href=#127 id=127 data-nosnippet>127</a></span><span class="kw">static </span>NVIDIACTL_RDEV: AtomicU64 = AtomicU64::new(<span class="number">0</span>);
+<a href=#128 id=128 data-nosnippet>128</a>
+<a href=#129 id=129 data-nosnippet>129</a><span class="doccomment">/// One `Elf64_Dyn` entry, modeled so the GOT patch can iterate a library's `.dynamic` array:
+<a href=#130 id=130 data-nosnippet>130</a>/// a `d_tag` (`DT_*`) paired with `d_un`, the 64-bit `d_val`/`d_ptr` union interpreted per tag.
+<a href=#131 id=131 data-nosnippet>131</a></span><span class="attr">#[repr(C)]
+<a href=#132 id=132 data-nosnippet>132</a></span><span class="kw">struct </span>Elf64Dyn {
+<a href=#133 id=133 data-nosnippet>133</a>    d_tag: i64,
+<a href=#134 id=134 data-nosnippet>134</a>    d_un: u64,
+<a href=#135 id=135 data-nosnippet>135</a>}
+<a href=#136 id=136 data-nosnippet>136</a>
+<a href=#137 id=137 data-nosnippet>137</a><span class="doccomment">/// One `Elf64_Rela` relocation entry, modeled so the patch can find each GOT slot and the
+<a href=#138 id=138 data-nosnippet>138</a>/// symbol it binds: `r_offset` (the target GOT slot, base-relative), `r_info` (packed symbol index +
+<a href=#139 id=139 data-nosnippet>139</a>/// relocation type, split by `elf64_r_sym`/`elf64_r_type`), and the unused `r_addend`.
+<a href=#140 id=140 data-nosnippet>140</a></span><span class="attr">#[repr(C)]
+<a href=#141 id=141 data-nosnippet>141</a></span><span class="kw">struct </span>Elf64Rela {
+<a href=#142 id=142 data-nosnippet>142</a>    r_offset: u64,
+<a href=#143 id=143 data-nosnippet>143</a>    r_info: u64,
+<a href=#144 id=144 data-nosnippet>144</a>    r_addend: i64,
+<a href=#145 id=145 data-nosnippet>145</a>}
+<a href=#146 id=146 data-nosnippet>146</a>
+<a href=#147 id=147 data-nosnippet>147</a><span class="doccomment">/// Extract the symbol-table index from an `Elf64_Rela` `r_info` field (its high 32 bits) —
+<a href=#148 id=148 data-nosnippet>148</a>/// how the patch learns which symbol a relocation binds, so it can check for `ioctl`.
+<a href=#149 id=149 data-nosnippet>149</a></span><span class="attr">#[inline]
+<a href=#150 id=150 data-nosnippet>150</a></span><span class="kw">fn </span>elf64_r_sym(info: u64) -&gt; u64 {
+<a href=#151 id=151 data-nosnippet>151</a>    info &gt;&gt; <span class="number">32
+<a href=#152 id=152 data-nosnippet>152</a></span>}
+<a href=#153 id=153 data-nosnippet>153</a>
+<a href=#154 id=154 data-nosnippet>154</a><span class="doccomment">/// Extract the relocation type from an `Elf64_Rela` `r_info` field (its low 32 bits) — how
+<a href=#155 id=155 data-nosnippet>155</a>/// the patch tells a `JUMP_SLOT`/`GLOB_DAT` GOT entry from relocations it must ignore.
+<a href=#156 id=156 data-nosnippet>156</a></span><span class="attr">#[inline]
+<a href=#157 id=157 data-nosnippet>157</a></span><span class="kw">fn </span>elf64_r_type(info: u64) -&gt; u32 {
+<a href=#158 id=158 data-nosnippet>158</a>    (info &amp; <span class="number">0xffff_ffff</span>) <span class="kw">as </span>u32
+<a href=#159 id=159 data-nosnippet>159</a>}
+<a href=#160 id=160 data-nosnippet>160</a>
+<a href=#161 id=161 data-nosnippet>161</a><span class="doccomment">/// Extract the `_IOC_NR` command byte (bits 0-7) of an ioctl request — the field that names
+<a href=#162 id=162 data-nosnippet>162</a>/// the command. Used only by documentation and the `ioc_nr_extracts_low_byte` unit test, hence
+<a href=#163 id=163 data-nosnippet>163</a>/// `#[allow(dead_code)]`.
+<a href=#164 id=164 data-nosnippet>164</a></span><span class="attr">#[allow(dead_code)]
+<a href=#165 id=165 data-nosnippet>165</a>#[inline]
+<a href=#166 id=166 data-nosnippet>166</a></span><span class="kw">fn </span>ioc_nr(req: c_ulong) -&gt; c_ulong {
+<a href=#167 id=167 data-nosnippet>167</a>    req &amp; <span class="number">0xFF
+<a href=#168 id=168 data-nosnippet>168</a></span>}
+<a href=#169 id=169 data-nosnippet>169</a>
+<a href=#170 id=170 data-nosnippet>170</a><span class="doccomment">/// Strip the `_IOC_SIZE` field from a request (leaving DIR|TYPE|NR) so the gate stays bound
+<a href=#171 id=171 data-nosnippet>171</a>/// to the exact RM control command without coupling to any one driver's param-struct size — a driver
+<a href=#172 id=172 data-nosnippet>172</a>/// that changes `sizeof(NVOS54_PARAMETERS)` must still match.
+<a href=#173 id=173 data-nosnippet>173</a></span><span class="attr">#[inline]
+<a href=#174 id=174 data-nosnippet>174</a></span><span class="kw">fn </span>ioc_no_size(req: c_ulong) -&gt; c_ulong {
+<a href=#175 id=175 data-nosnippet>175</a>    req &amp; !(IOC_SIZEMASK &lt;&lt; IOC_SIZESHIFT)
+<a href=#176 id=176 data-nosnippet>176</a>}
+<a href=#177 id=177 data-nosnippet>177</a>
+<a href=#178 id=178 data-nosnippet>178</a><span class="doccomment">/// The reachability test the whole filter turns on: a GPU id is kept only if its
+<a href=#179 id=179 data-nosnippet>179</a>/// `/dev/nvidia{minor}` node is actually present in the container, checked here via `access(F_OK)` on
+<a href=#180 id=180 data-nosnippet>180</a>/// a NUL-terminated path.
+<a href=#181 id=181 data-nosnippet>181</a></span><span class="kw">fn </span>node_present(minor: u32) -&gt; bool {
+<a href=#182 id=182 data-nosnippet>182</a>    <span class="kw">let </span>path = <span class="macro">format!</span>(<span class="string">"/dev/nvidia{}\0"</span>, minor);
+<a href=#183 id=183 data-nosnippet>183</a>    <span class="kw">unsafe </span>{ libc::access(path.as_ptr() <span class="kw">as </span><span class="kw-2">*const </span>c_char, libc::F_OK) == <span class="number">0 </span>}
+<a href=#184 id=184 data-nosnippet>184</a>}
+<a href=#185 id=185 data-nosnippet>185</a>
+<a href=#186 id=186 data-nosnippet>186</a><span class="doccomment">/// Map an RM `gpuId` to the `/dev/nvidia` minor that `node_present` needs: the id only
+<a href=#187 id=187 data-nosnippet>187</a>/// carries a PCI address, not a device minor, so this bridges the two by scanning
+<a href=#188 id=188 data-nosnippet>188</a>/// `/proc/driver/nvidia/gpus`, returning -1 when no match is found.
+<a href=#189 id=189 data-nosnippet>189</a>///
+<a href=#190 id=190 data-nosnippet>190</a>/// 1. **Extract the PCI address from the id**: the PCI address is encoded in `gpuId &gt;&gt; 8`, so
+<a href=#191 id=191 data-nosnippet>191</a>///    `want_bus` is the low bus byte `(gpuId &gt;&gt; 8) &amp; 0xFF` and `want_full` is the full
+<a href=#192 id=192 data-nosnippet>192</a>///    `gpuId &gt;&gt; 8` (domain folded in for larger ids).
+<a href=#193 id=193 data-nosnippet>193</a>/// 2. **Match a /proc entry**: each subdirectory is named by its PCI address
+<a href=#194 id=194 data-nosnippet>194</a>///    `domain:bus:slot.func` in hex; split on `:` and `.` (expecting four fields) and parse the
+<a href=#195 id=195 data-nosnippet>195</a>///    domain and bus. An entry matches when its bus equals `want_bus` **or** its combined
+<a href=#196 id=196 data-nosnippet>196</a>///    `(domain &lt;&lt; 8) | bus` equals `want_full` — the dual test covers ids that fold the domain in.
+<a href=#197 id=197 data-nosnippet>197</a>/// 3. **Read the minor**: from the matched entry's `information` file, parse the `Device Minor: N`
+<a href=#198 id=198 data-nosnippet>198</a>///    line and return `N`. The scan processes only the first matching directory (it `break`s
+<a href=#199 id=199 data-nosnippet>199</a>///    afterward) and returns -1 if no minor line is present.
+<a href=#200 id=200 data-nosnippet>200</a></span><span class="kw">fn </span>gpuid_to_minor(gpu_id: u32) -&gt; i32 {
+<a href=#201 id=201 data-nosnippet>201</a>    <span class="kw">let </span>want_bus = (gpu_id &gt;&gt; <span class="number">8</span>) &amp; <span class="number">0xFF</span>;
+<a href=#202 id=202 data-nosnippet>202</a>    <span class="kw">let </span>want_full = gpu_id &gt;&gt; <span class="number">8</span>;
+<a href=#203 id=203 data-nosnippet>203</a>    <span class="kw">let </span>dir = <span class="kw">match </span>std::fs::read_dir(<span class="string">"/proc/driver/nvidia/gpus"</span>) {
+<a href=#204 id=204 data-nosnippet>204</a>        <span class="prelude-val">Ok</span>(d) =&gt; d,
+<a href=#205 id=205 data-nosnippet>205</a>        <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; <span class="kw">return </span>-<span class="number">1</span>,
+<a href=#206 id=206 data-nosnippet>206</a>    };
+<a href=#207 id=207 data-nosnippet>207</a>    <span class="kw">for </span>ent <span class="kw">in </span>dir.flatten() {
+<a href=#208 id=208 data-nosnippet>208</a>        <span class="kw">let </span>name = ent.file_name();
+<a href=#209 id=209 data-nosnippet>209</a>        <span class="kw">let </span>name = <span class="kw">match </span>name.to_str() {
+<a href=#210 id=210 data-nosnippet>210</a>            <span class="prelude-val">Some</span>(s) =&gt; s,
+<a href=#211 id=211 data-nosnippet>211</a>            <span class="prelude-val">None </span>=&gt; <span class="kw">continue</span>,
+<a href=#212 id=212 data-nosnippet>212</a>        };
+<a href=#213 id=213 data-nosnippet>213</a>        <span class="kw">let </span>parts: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = name.split([<span class="string">':'</span>, <span class="string">'.'</span>]).collect();
+<a href=#214 id=214 data-nosnippet>214</a>        <span class="kw">if </span>parts.len() != <span class="number">4 </span>{
+<a href=#215 id=215 data-nosnippet>215</a>            <span class="kw">continue</span>;
+<a href=#216 id=216 data-nosnippet>216</a>        }
+<a href=#217 id=217 data-nosnippet>217</a>        <span class="kw">let </span>dom = u32::from_str_radix(parts[<span class="number">0</span>], <span class="number">16</span>);
+<a href=#218 id=218 data-nosnippet>218</a>        <span class="kw">let </span>bus = u32::from_str_radix(parts[<span class="number">1</span>], <span class="number">16</span>);
+<a href=#219 id=219 data-nosnippet>219</a>        <span class="kw">let </span>(dom, bus) = <span class="kw">match </span>(dom, bus) {
+<a href=#220 id=220 data-nosnippet>220</a>            (<span class="prelude-val">Ok</span>(d), <span class="prelude-val">Ok</span>(b)) =&gt; (d, b),
+<a href=#221 id=221 data-nosnippet>221</a>            <span class="kw">_ </span>=&gt; <span class="kw">continue</span>,
+<a href=#222 id=222 data-nosnippet>222</a>        };
+<a href=#223 id=223 data-nosnippet>223</a>        <span class="kw">if </span>bus != want_bus &amp;&amp; ((dom &lt;&lt; <span class="number">8</span>) | bus) != want_full {
+<a href=#224 id=224 data-nosnippet>224</a>            <span class="kw">continue</span>;
+<a href=#225 id=225 data-nosnippet>225</a>        }
+<a href=#226 id=226 data-nosnippet>226</a>        <span class="kw">let </span>info = <span class="macro">format!</span>(<span class="string">"/proc/driver/nvidia/gpus/{}/information"</span>, name);
+<a href=#227 id=227 data-nosnippet>227</a>        <span class="kw">if let </span><span class="prelude-val">Ok</span>(text) = std::fs::read_to_string(<span class="kw-2">&amp;</span>info) {
+<a href=#228 id=228 data-nosnippet>228</a>            <span class="kw">for </span>line <span class="kw">in </span>text.lines() {
+<a href=#229 id=229 data-nosnippet>229</a>                <span class="kw">if let </span><span class="prelude-val">Some</span>(rest) = line.strip_prefix(<span class="string">"Device Minor:"</span>) {
+<a href=#230 id=230 data-nosnippet>230</a>                    <span class="kw">if let </span><span class="prelude-val">Ok</span>(m) = rest.trim().parse::&lt;i32&gt;() {
+<a href=#231 id=231 data-nosnippet>231</a>                        <span class="kw">return </span>m;
+<a href=#232 id=232 data-nosnippet>232</a>                    }
+<a href=#233 id=233 data-nosnippet>233</a>                }
+<a href=#234 id=234 data-nosnippet>234</a>            }
+<a href=#235 id=235 data-nosnippet>235</a>        }
+<a href=#236 id=236 data-nosnippet>236</a>        <span class="kw">break</span>;
+<a href=#237 id=237 data-nosnippet>237</a>    }
+<a href=#238 id=238 data-nosnippet>238</a>    -<span class="number">1
+<a href=#239 id=239 data-nosnippet>239</a></span>}
+<a href=#240 id=240 data-nosnippet>240</a>
+<a href=#241 id=241 data-nosnippet>241</a><span class="doccomment">/// Drop the hidden GPUs from a `gpuIds[]` array in place — but only ever a strict subset, so
+<a href=#242 id=242 data-nosnippet>242</a>/// the filter can never accidentally blank out every GPU and strand the container with none. Ids
+<a href=#243 id=243 data-nosnippet>243</a>/// that pass `keep` are compacted to the front and the rest back-filled with `INVALID_GPU_ID`.
+<a href=#244 id=244 data-nosnippet>244</a>///
+<a href=#245 id=245 data-nosnippet>245</a>/// 1. **Scan the populated prefix**: iterate until the first `INVALID_GPU_ID`, counting `total`
+<a href=#246 id=246 data-nosnippet>246</a>///    live ids and collecting the kept ones into a scratch array (`nkept`).
+<a href=#247 id=247 data-nosnippet>247</a>/// 2. **Commit only a strict subset** (`0 &lt; nkept &lt; total`): copy the kept prefix back over `ids`
+<a href=#248 id=248 data-nosnippet>248</a>///    and set every trailing slot to `INVALID_GPU_ID`.
+<a href=#249 id=249 data-nosnippet>249</a>/// 3. **Fail-safe**: if none survive or all survive, leave the array untouched — never blank out
+<a href=#250 id=250 data-nosnippet>250</a>///    every GPU, and never do redundant work when nothing was dropped.
+<a href=#251 id=251 data-nosnippet>251</a>///
+<a href=#252 id=252 data-nosnippet>252</a>/// The `keep` predicate is injected so this stays free of `/proc` and `/dev` access and is
+<a href=#253 id=253 data-nosnippet>253</a>/// unit-testable in isolation.
+<a href=#254 id=254 data-nosnippet>254</a></span><span class="kw">fn </span>filter_ids(ids: <span class="kw-2">&amp;mut </span>[u32; MAX_ATTACHED_GPUS], keep: <span class="kw">impl </span>Fn(u32) -&gt; bool) {
+<a href=#255 id=255 data-nosnippet>255</a>    <span class="kw">let </span><span class="kw-2">mut </span>kept = [<span class="number">0u32</span>; MAX_ATTACHED_GPUS];
+<a href=#256 id=256 data-nosnippet>256</a>    <span class="kw">let </span>(<span class="kw-2">mut </span>total, <span class="kw-2">mut </span>nkept) = (<span class="number">0usize</span>, <span class="number">0usize</span>);
+<a href=#257 id=257 data-nosnippet>257</a>    <span class="kw">for </span><span class="kw-2">&amp;</span>id <span class="kw">in </span>ids.iter() {
+<a href=#258 id=258 data-nosnippet>258</a>        <span class="kw">if </span>id == INVALID_GPU_ID {
+<a href=#259 id=259 data-nosnippet>259</a>            <span class="kw">break</span>;
+<a href=#260 id=260 data-nosnippet>260</a>        }
+<a href=#261 id=261 data-nosnippet>261</a>        total += <span class="number">1</span>;
+<a href=#262 id=262 data-nosnippet>262</a>        <span class="kw">if </span>keep(id) {
+<a href=#263 id=263 data-nosnippet>263</a>            kept[nkept] = id;
+<a href=#264 id=264 data-nosnippet>264</a>            nkept += <span class="number">1</span>;
+<a href=#265 id=265 data-nosnippet>265</a>        }
+<a href=#266 id=266 data-nosnippet>266</a>    }
+<a href=#267 id=267 data-nosnippet>267</a>    <span class="kw">if </span>nkept &gt; <span class="number">0 </span>&amp;&amp; nkept &lt; total {
+<a href=#268 id=268 data-nosnippet>268</a>        ids[..nkept].copy_from_slice(<span class="kw-2">&amp;</span>kept[..nkept]);
+<a href=#269 id=269 data-nosnippet>269</a>        <span class="kw">for </span>slot <span class="kw">in </span>ids[nkept..].iter_mut() {
+<a href=#270 id=270 data-nosnippet>270</a>            <span class="kw-2">*</span>slot = INVALID_GPU_ID;
+<a href=#271 id=271 data-nosnippet>271</a>        }
+<a href=#272 id=272 data-nosnippet>272</a>    }
+<a href=#273 id=273 data-nosnippet>273</a>}
+<a href=#274 id=274 data-nosnippet>274</a>
+<a href=#275 id=275 data-nosnippet>275</a><span class="doccomment">/// The seam where a hidden GPU gets scrubbed out: the `ioctl` wrapper installed into the
+<a href=#276 id=276 data-nosnippet>276</a>/// NVIDIA libraries' GOT slots, which forwards to the real `libc::ioctl` and then post-processes the
+<a href=#277 id=277 data-nosnippet>277</a>/// response. The three steps below exist only to make interposing on `ioctl` safe:
+<a href=#278 id=278 data-nosnippet>278</a>///
+<a href=#279 id=279 data-nosnippet>279</a>/// 1. **Call through**: invoke the genuine `libc::ioctl`. Only this crate's own GOT is left
+<a href=#280 id=280 data-nosnippet>280</a>///    unpatched, so this inner call resolves to libc rather than back into this wrapper (no
+<a href=#281 id=281 data-nosnippet>281</a>///    recursion).
+<a href=#282 id=282 data-nosnippet>282</a>/// 2. **Filter the result** under `catch_unwind`: `rewrite_attached_ids` may drop hidden GPUs from
+<a href=#283 id=283 data-nosnippet>283</a>///    the response. A panic must never unwind across this `extern "C"` boundary — the compiler
+<a href=#284 id=284 data-nosnippet>284</a>///    guard would abort the whole process — so any panic is caught and the unmodified real result
+<a href=#285 id=285 data-nosnippet>285</a>///    is returned instead.
+<a href=#286 id=286 data-nosnippet>286</a>/// 3. **Preserve `errno`**: the real syscall's `errno` is saved before the `/proc` + `/dev` lookups
+<a href=#287 id=287 data-nosnippet>287</a>///    inside the filter and restored afterward, so a caller reading `errno` sees the syscall's value.
+<a href=#288 id=288 data-nosnippet>288</a></span><span class="kw">unsafe extern </span><span class="string">"C" </span><span class="kw">fn </span>filtered_ioctl(fd: c_int, req: c_ulong, arg: <span class="kw-2">*mut </span>c_void) -&gt; c_int {
+<a href=#289 id=289 data-nosnippet>289</a>    <span class="kw">let </span>rc = libc::ioctl(fd, req <span class="kw">as _</span>, arg);
+<a href=#290 id=290 data-nosnippet>290</a>    <span class="kw">let </span>saved_errno = <span class="kw-2">*</span>libc::__errno_location();
+<a href=#291 id=291 data-nosnippet>291</a>    <span class="kw">let _ </span>= std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+<a href=#292 id=292 data-nosnippet>292</a>        rewrite_attached_ids(fd, rc, req, arg);
+<a href=#293 id=293 data-nosnippet>293</a>    }));
+<a href=#294 id=294 data-nosnippet>294</a>    <span class="kw-2">*</span>libc::__errno_location() = saved_errno;
+<a href=#295 id=295 data-nosnippet>295</a>    rc
+<a href=#296 id=296 data-nosnippet>296</a>}
+<a href=#297 id=297 data-nosnippet>297</a>
+<a href=#298 id=298 data-nosnippet>298</a><span class="doccomment">/// Scrub the hidden GPUs out of a successful `GET_ATTACHED_IDS` / `GET_PROBED_IDS` response so
+<a href=#299 id=299 data-nosnippet>299</a>/// the NVIDIA libraries never try to peer-init a GPU the container cannot reach: it drops every id
+<a href=#300 id=300 data-nosnippet>300</a>/// whose `/dev/nvidia` node is absent. Split from `filtered_ioctl` so the whole thing runs under
+<a href=#301 id=301 data-nosnippet>301</a>/// `catch_unwind`.
+<a href=#302 id=302 data-nosnippet>302</a>///
+<a href=#303 id=303 data-nosnippet>303</a>/// The guards run cheap-to-expensive and each returns early — leaving the response untouched — the
+<a href=#304 id=304 data-nosnippet>304</a>/// moment one fails, so the overwhelmingly common non-enumeration ioctl pays almost nothing:
+<a href=#305 id=305 data-nosnippet>305</a>///
+<a href=#306 id=306 data-nosnippet>306</a>/// 1. **Request gate**: the syscall succeeded (`rc == 0`), `arg` is non-null, and the request is
+<a href=#307 id=307 data-nosnippet>307</a>///    the RM_CONTROL ioctl matched by DIR|TYPE|NR (size-agnostic, via `ioc_no_size`).
+<a href=#308 id=308 data-nosnippet>308</a>/// 2. **fd identity gate**: when `NVIDIACTL_RDEV` was resolved at install, `fstat` the fd and
+<a href=#309 id=309 data-nosnippet>309</a>///    require a character device whose `rdev` equals `/dev/nvidiactl`'s — so only that char
+<a href=#310 id=310 data-nosnippet>310</a>///    device's responses are rewritten. An `fstat` failure passes through untouched; if the rdev
+<a href=#311 id=311 data-nosnippet>311</a>///    was never resolved the gate is skipped and matching relies on the request/size checks alone.
+<a href=#312 id=312 data-nosnippet>312</a>/// 3. **Payload gate**: the RM call itself reports success (`ctrl.status == 0`) and carries a
+<a href=#313 id=313 data-nosnippet>313</a>///    parameter pointer (`ctrl.params != 0`).
+<a href=#314 id=314 data-nosnippet>314</a>/// 4. **Command + exact-size dispatch**: `cmd` selects ATTACHED or PROBED, and `params_size` must
+<a href=#315 id=315 data-nosnippet>315</a>///    equal that command's exact struct size. Requiring the exact size both disambiguates the two
+<a href=#316 id=316 data-nosnippet>316</a>///    (their layouts share a leading array) and stops a lying size from steering a rewrite under a
+<a href=#317 id=317 data-nosnippet>317</a>///    different layout. Both APIs are filtered so behavior is uniform across driver versions —
+<a href=#318 id=318 data-nosnippet>318</a>///    buggy 570-595 where it actually drops GPUs, and correct drivers where the strict-subset rule
+<a href=#319 id=319 data-nosnippet>319</a>///    makes it a no-op.
+<a href=#320 id=320 data-nosnippet>320</a>/// 5. **Filter the leading `gpuIds[32]`**: `filter_ids` keeps an id only when `gpuid_to_minor`
+<a href=#321 id=321 data-nosnippet>321</a>///    resolves it and the corresponding `/dev/nvidia` node is present. For PROBED the trailing
+<a href=#322 id=322 data-nosnippet>322</a>///    `excludedGpuIds[]` is deliberately left untouched (it lists GPUs to exclude, not to use).
+<a href=#323 id=323 data-nosnippet>323</a>///
+<a href=#324 id=324 data-nosnippet>324</a>/// When `PIXELFLUX_GPU_FILTER_DEBUG` is set, the before/after live-id counts are logged.
+<a href=#325 id=325 data-nosnippet>325</a></span><span class="kw">unsafe fn </span>rewrite_attached_ids(fd: c_int, rc: c_int, req: c_ulong, arg: <span class="kw-2">*mut </span>c_void) {
+<a href=#326 id=326 data-nosnippet>326</a>    <span class="kw">if </span>rc != <span class="number">0 </span>|| ioc_no_size(req) != ioc_no_size(NV_RM_CONTROL_REQUEST) || arg.is_null() {
+<a href=#327 id=327 data-nosnippet>327</a>        <span class="kw">return</span>;
+<a href=#328 id=328 data-nosnippet>328</a>    }
+<a href=#329 id=329 data-nosnippet>329</a>    <span class="kw">let </span>cached = NVIDIACTL_RDEV.load(Ordering::Relaxed);
+<a href=#330 id=330 data-nosnippet>330</a>    <span class="kw">if </span>cached != <span class="number">0 </span>{
+<a href=#331 id=331 data-nosnippet>331</a>        <span class="kw">let </span><span class="kw-2">mut </span>st: libc::stat = std::mem::zeroed();
+<a href=#332 id=332 data-nosnippet>332</a>        <span class="kw">if </span>libc::fstat(fd, <span class="kw-2">&amp;mut </span>st) != <span class="number">0 </span>{
+<a href=#333 id=333 data-nosnippet>333</a>            <span class="kw">return</span>;
+<a href=#334 id=334 data-nosnippet>334</a>        }
+<a href=#335 id=335 data-nosnippet>335</a>        <span class="kw">if </span>(st.st_mode &amp; libc::S_IFMT) != libc::S_IFCHR || st.st_rdev <span class="kw">as </span>u64 != cached {
+<a href=#336 id=336 data-nosnippet>336</a>            <span class="kw">return</span>;
+<a href=#337 id=337 data-nosnippet>337</a>        }
+<a href=#338 id=338 data-nosnippet>338</a>    }
+<a href=#339 id=339 data-nosnippet>339</a>    <span class="kw">let </span>ctrl = <span class="kw-2">&amp;mut *</span>(arg <span class="kw">as </span><span class="kw-2">*mut </span>NvRmControlParams);
+<a href=#340 id=340 data-nosnippet>340</a>    <span class="kw">if </span>ctrl.status != <span class="number">0 </span>|| ctrl.params == <span class="number">0 </span>{
+<a href=#341 id=341 data-nosnippet>341</a>        <span class="kw">return</span>;
+<a href=#342 id=342 data-nosnippet>342</a>    }
+<a href=#343 id=343 data-nosnippet>343</a>    <span class="kw">let </span>which = <span class="kw">match </span>ctrl.cmd {
+<a href=#344 id=344 data-nosnippet>344</a>        GPU_GET_ATTACHED_IDS <span class="kw">if </span>ctrl.params_size <span class="kw">as </span>usize == ATTACHED_PARAMS_SIZE =&gt; <span class="string">"ATTACHED"</span>,
+<a href=#345 id=345 data-nosnippet>345</a>        GPU_GET_PROBED_IDS <span class="kw">if </span>ctrl.params_size <span class="kw">as </span>usize == PROBED_PARAMS_SIZE =&gt; <span class="string">"PROBED"</span>,
+<a href=#346 id=346 data-nosnippet>346</a>        <span class="kw">_ </span>=&gt; <span class="kw">return</span>,
+<a href=#347 id=347 data-nosnippet>347</a>    };
+<a href=#348 id=348 data-nosnippet>348</a>    <span class="kw">let </span>ids = <span class="kw-2">&amp;mut *</span>(ctrl.params <span class="kw">as </span><span class="kw-2">*mut </span>[u32; MAX_ATTACHED_GPUS]);
+<a href=#349 id=349 data-nosnippet>349</a>    <span class="kw">let </span>debug = std::env::var_os(<span class="string">"PIXELFLUX_GPU_FILTER_DEBUG"</span>).is_some();
+<a href=#350 id=350 data-nosnippet>350</a>    <span class="kw">let </span>before = ids.iter().take_while(|&amp;&amp;id| id != INVALID_GPU_ID).count();
+<a href=#351 id=351 data-nosnippet>351</a>    filter_ids(ids, |id| {
+<a href=#352 id=352 data-nosnippet>352</a>        <span class="kw">let </span>minor = gpuid_to_minor(id);
+<a href=#353 id=353 data-nosnippet>353</a>        minor &gt;= <span class="number">0 </span>&amp;&amp; node_present(minor <span class="kw">as </span>u32)
+<a href=#354 id=354 data-nosnippet>354</a>    });
+<a href=#355 id=355 data-nosnippet>355</a>    <span class="kw">if </span>debug {
+<a href=#356 id=356 data-nosnippet>356</a>        <span class="kw">let </span>after = ids.iter().take_while(|&amp;&amp;id| id != INVALID_GPU_ID).count();
+<a href=#357 id=357 data-nosnippet>357</a>        <span class="macro">eprintln!</span>(<span class="string">"[pixelflux] GET_{which}_IDS intercepted: {before} host GPU(s) -&gt; {after} kept"</span>);
+<a href=#358 id=358 data-nosnippet>358</a>    }
+<a href=#359 id=359 data-nosnippet>359</a>}
+<a href=#360 id=360 data-nosnippet>360</a>
+<a href=#361 id=361 data-nosnippet>361</a><span class="doccomment">/// Reports the current `PROT_*` protection of the page holding `addr` (from
+<a href=#362 id=362 data-nosnippet>362</a>/// `/proc/self/maps`, or -1 when the address is not found or maps is unreadable) for two reasons the
+<a href=#363 id=363 data-nosnippet>363</a>/// GOT patch depends on: so it can refuse to dereference an address that a wrong relative/absolute
+<a href=#364 id=364 data-nosnippet>364</a>/// guess landed in an unreadable page, and so it can restore a patched GOT page to its true original
+<a href=#365 id=365 data-nosnippet>365</a>/// protection rather than a hardcoded read-only.
+<a href=#366 id=366 data-nosnippet>366</a>///
+<a href=#367 id=367 data-nosnippet>367</a>/// Each maps line begins `lo-hi perms ...`; the address range and the `rwxp` permission string are
+<a href=#368 id=368 data-nosnippet>368</a>/// the first two whitespace fields. For the line whose `[lo, hi)` range contains `addr`, the `r`,
+<a href=#369 id=369 data-nosnippet>369</a>/// `w`, and `x` characters are translated into `PROT_READ`/`PROT_WRITE`/`PROT_EXEC`.
+<a href=#370 id=370 data-nosnippet>370</a></span><span class="kw">fn </span>page_prot(addr: usize) -&gt; i32 {
+<a href=#371 id=371 data-nosnippet>371</a>    <span class="kw">let </span>text = <span class="kw">match </span>std::fs::read_to_string(<span class="string">"/proc/self/maps"</span>) {
+<a href=#372 id=372 data-nosnippet>372</a>        <span class="prelude-val">Ok</span>(t) =&gt; t,
+<a href=#373 id=373 data-nosnippet>373</a>        <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; <span class="kw">return </span>-<span class="number">1</span>,
+<a href=#374 id=374 data-nosnippet>374</a>    };
+<a href=#375 id=375 data-nosnippet>375</a>    <span class="kw">for </span>line <span class="kw">in </span>text.lines() {
+<a href=#376 id=376 data-nosnippet>376</a>        <span class="kw">let </span><span class="kw-2">mut </span>it = line.split_whitespace();
+<a href=#377 id=377 data-nosnippet>377</a>        <span class="kw">let </span>range = <span class="kw">match </span>it.next() {
+<a href=#378 id=378 data-nosnippet>378</a>            <span class="prelude-val">Some</span>(r) =&gt; r,
+<a href=#379 id=379 data-nosnippet>379</a>            <span class="prelude-val">None </span>=&gt; <span class="kw">continue</span>,
+<a href=#380 id=380 data-nosnippet>380</a>        };
+<a href=#381 id=381 data-nosnippet>381</a>        <span class="kw">let </span>perms = <span class="kw">match </span>it.next() {
+<a href=#382 id=382 data-nosnippet>382</a>            <span class="prelude-val">Some</span>(p) =&gt; p,
+<a href=#383 id=383 data-nosnippet>383</a>            <span class="prelude-val">None </span>=&gt; <span class="kw">continue</span>,
+<a href=#384 id=384 data-nosnippet>384</a>        };
+<a href=#385 id=385 data-nosnippet>385</a>        <span class="kw">let </span><span class="kw-2">mut </span>rr = range.split(<span class="string">'-'</span>);
+<a href=#386 id=386 data-nosnippet>386</a>        <span class="kw">let </span>lo = rr.next().and_then(|s| usize::from_str_radix(s, <span class="number">16</span>).ok());
+<a href=#387 id=387 data-nosnippet>387</a>        <span class="kw">let </span>hi = rr.next().and_then(|s| usize::from_str_radix(s, <span class="number">16</span>).ok());
+<a href=#388 id=388 data-nosnippet>388</a>        <span class="kw">if let </span>(<span class="prelude-val">Some</span>(lo), <span class="prelude-val">Some</span>(hi)) = (lo, hi) {
+<a href=#389 id=389 data-nosnippet>389</a>            <span class="kw">if </span>addr &gt;= lo &amp;&amp; addr &lt; hi {
+<a href=#390 id=390 data-nosnippet>390</a>                <span class="kw">let </span>b = perms.as_bytes();
+<a href=#391 id=391 data-nosnippet>391</a>                <span class="kw">let </span><span class="kw-2">mut </span>prot = <span class="number">0</span>;
+<a href=#392 id=392 data-nosnippet>392</a>                <span class="kw">if </span>b.first() == <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="string">b'r'</span>) {
+<a href=#393 id=393 data-nosnippet>393</a>                    prot |= libc::PROT_READ;
+<a href=#394 id=394 data-nosnippet>394</a>                }
+<a href=#395 id=395 data-nosnippet>395</a>                <span class="kw">if </span>b.get(<span class="number">1</span>) == <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="string">b'w'</span>) {
+<a href=#396 id=396 data-nosnippet>396</a>                    prot |= libc::PROT_WRITE;
+<a href=#397 id=397 data-nosnippet>397</a>                }
+<a href=#398 id=398 data-nosnippet>398</a>                <span class="kw">if </span>b.get(<span class="number">2</span>) == <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="string">b'x'</span>) {
+<a href=#399 id=399 data-nosnippet>399</a>                    prot |= libc::PROT_EXEC;
+<a href=#400 id=400 data-nosnippet>400</a>                }
+<a href=#401 id=401 data-nosnippet>401</a>                <span class="kw">return </span>prot;
+<a href=#402 id=402 data-nosnippet>402</a>            }
+<a href=#403 id=403 data-nosnippet>403</a>        }
+<a href=#404 id=404 data-nosnippet>404</a>    }
+<a href=#405 id=405 data-nosnippet>405</a>    -<span class="number">1
+<a href=#406 id=406 data-nosnippet>406</a></span>}
+<a href=#407 id=407 data-nosnippet>407</a>
+<a href=#408 id=408 data-nosnippet>408</a><span class="doccomment">/// Turn a `DT_*` `d_ptr` into an absolute address across libc implementations that disagree
+<a href=#409 id=409 data-nosnippet>409</a>/// on what it holds: glibc pre-relocates these pointers to absolute, while musl leaves them
+<a href=#410 id=410 data-nosnippet>410</a>/// file-relative, so the patch cannot assume either. The heuristic treats a value below the load
+<a href=#411 id=411 data-nosnippet>411</a>/// `base` as a relative offset to add to `base`, and a value at or above `base` as already absolute.
+<a href=#412 id=412 data-nosnippet>412</a></span><span class="attr">#[inline]
+<a href=#413 id=413 data-nosnippet>413</a></span><span class="kw">fn </span>dyn_addr(base: usize, v: u64) -&gt; usize {
+<a href=#414 id=414 data-nosnippet>414</a>    <span class="kw">let </span>v = v <span class="kw">as </span>usize;
+<a href=#415 id=415 data-nosnippet>415</a>    <span class="kw">if </span>v &lt; base {
+<a href=#416 id=416 data-nosnippet>416</a>        base + v
+<a href=#417 id=417 data-nosnippet>417</a>    } <span class="kw">else </span>{
+<a href=#418 id=418 data-nosnippet>418</a>        v
+<a href=#419 id=419 data-nosnippet>419</a>    }
+<a href=#420 id=420 data-nosnippet>420</a>}
+<a href=#421 id=421 data-nosnippet>421</a>
+<a href=#422 id=422 data-nosnippet>422</a><span class="doccomment">/// Repoint every `ioctl` GOT slot in one loaded library to `filtered_ioctl` by walking its
+<a href=#423 id=423 data-nosnippet>423</a>/// `PT_DYNAMIC` array — the only way to interpose without an LD_PRELOAD object — and it must cover
+<a href=#424 id=424 data-nosnippet>424</a>/// both the lazy-PLT and `-fno-plt` relocation forms because NVIDIA ships the latter.
+<a href=#425 id=425 data-nosnippet>425</a>///
+<a href=#426 id=426 data-nosnippet>426</a>/// 1. **Parse `.dynamic`**: iterate the `Elf64Dyn` entries until `DT_NULL`, recording the dynamic
+<a href=#427 id=427 data-nosnippet>427</a>///    symbol table, string table, PLT relocation table (`DT_JMPREL`/`DT_PLTRELSZ`) and general
+<a href=#428 id=428 data-nosnippet>428</a>///    relocation table (`DT_RELA`/`DT_RELASZ`). Table addresses are resolved through `dyn_addr` to
+<a href=#429 id=429 data-nosnippet>429</a>///    handle the glibc-absolute vs musl-relative pointer conventions.
+<a href=#430 id=430 data-nosnippet>430</a>/// 2. **Sanity-gate the tables**: bail if the symbol or string table is missing, and — via the
+<a href=#431 id=431 data-nosnippet>431</a>///    `readable` closure over `page_prot` — bail if a table's mapping is known but lacks read
+<a href=#432 id=432 data-nosnippet>432</a>///    permission (an address whose mapping cannot be determined is presumed readable), so a wrong
+<a href=#433 id=433 data-nosnippet>433</a>///    relative/absolute guess from `dyn_addr` cannot fault on first dereference. Also bail if the
+<a href=#434 id=434 data-nosnippet>434</a>///    page size is unavailable.
+<a href=#435 id=435 data-nosnippet>435</a>/// 3. **Patch both relocation tables**: hand each present, adequately-sized, readable table to
+<a href=#436 id=436 data-nosnippet>436</a>///    `patch_reloc_table`. The PLT table (`.rela.plt`) carries the classic lazily-bound `JUMP_SLOT`
+<a href=#437 id=437 data-nosnippet>437</a>///    entries; the general table (`.rela.dyn`) carries the `GLOB_DAT` slot that `-fno-plt` NVIDIA
+<a href=#438 id=438 data-nosnippet>438</a>///    builds use to bind `ioctl`.
+<a href=#439 id=439 data-nosnippet>439</a></span><span class="kw">unsafe fn </span>patch_ioctl_got(base: usize, dynp: <span class="kw-2">*const </span>Elf64Dyn) {
+<a href=#440 id=440 data-nosnippet>440</a>    <span class="kw">let </span><span class="kw-2">mut </span>symtab: <span class="kw-2">*const </span>libc::Elf64_Sym = std::ptr::null();
+<a href=#441 id=441 data-nosnippet>441</a>    <span class="kw">let </span><span class="kw-2">mut </span>strtab: <span class="kw-2">*const </span>c_char = std::ptr::null();
+<a href=#442 id=442 data-nosnippet>442</a>    <span class="kw">let </span><span class="kw-2">mut </span>jmprel: <span class="kw-2">*const </span>Elf64Rela = std::ptr::null();
+<a href=#443 id=443 data-nosnippet>443</a>    <span class="kw">let </span><span class="kw-2">mut </span>pltrelsz: usize = <span class="number">0</span>;
+<a href=#444 id=444 data-nosnippet>444</a>    <span class="kw">let </span><span class="kw-2">mut </span>rela: <span class="kw-2">*const </span>Elf64Rela = std::ptr::null();
+<a href=#445 id=445 data-nosnippet>445</a>    <span class="kw">let </span><span class="kw-2">mut </span>relasz: usize = <span class="number">0</span>;
+<a href=#446 id=446 data-nosnippet>446</a>
+<a href=#447 id=447 data-nosnippet>447</a>    <span class="kw">let </span><span class="kw-2">mut </span>d = dynp;
+<a href=#448 id=448 data-nosnippet>448</a>    <span class="kw">while </span>(<span class="kw-2">*</span>d).d_tag != DT_NULL {
+<a href=#449 id=449 data-nosnippet>449</a>        <span class="kw">match </span>(<span class="kw-2">*</span>d).d_tag {
+<a href=#450 id=450 data-nosnippet>450</a>            DT_SYMTAB =&gt; symtab = dyn_addr(base, (<span class="kw-2">*</span>d).d_un) <span class="kw">as </span><span class="kw-2">*const </span>libc::Elf64_Sym,
+<a href=#451 id=451 data-nosnippet>451</a>            DT_STRTAB =&gt; strtab = dyn_addr(base, (<span class="kw-2">*</span>d).d_un) <span class="kw">as </span><span class="kw-2">*const </span>c_char,
+<a href=#452 id=452 data-nosnippet>452</a>            DT_JMPREL =&gt; jmprel = dyn_addr(base, (<span class="kw-2">*</span>d).d_un) <span class="kw">as </span><span class="kw-2">*const </span>Elf64Rela,
+<a href=#453 id=453 data-nosnippet>453</a>            DT_PLTRELSZ =&gt; pltrelsz = (<span class="kw-2">*</span>d).d_un <span class="kw">as </span>usize,
+<a href=#454 id=454 data-nosnippet>454</a>            DT_RELA =&gt; rela = dyn_addr(base, (<span class="kw-2">*</span>d).d_un) <span class="kw">as </span><span class="kw-2">*const </span>Elf64Rela,
+<a href=#455 id=455 data-nosnippet>455</a>            DT_RELASZ =&gt; relasz = (<span class="kw-2">*</span>d).d_un <span class="kw">as </span>usize,
+<a href=#456 id=456 data-nosnippet>456</a>            <span class="kw">_ </span>=&gt; {}
+<a href=#457 id=457 data-nosnippet>457</a>        }
+<a href=#458 id=458 data-nosnippet>458</a>        d = d.add(<span class="number">1</span>);
+<a href=#459 id=459 data-nosnippet>459</a>    }
+<a href=#460 id=460 data-nosnippet>460</a>    <span class="kw">if </span>symtab.is_null() || strtab.is_null() {
+<a href=#461 id=461 data-nosnippet>461</a>        <span class="kw">return</span>;
+<a href=#462 id=462 data-nosnippet>462</a>    }
+<a href=#463 id=463 data-nosnippet>463</a>    <span class="kw">let </span>readable = |p: usize| {
+<a href=#464 id=464 data-nosnippet>464</a>        <span class="kw">let </span>prot = page_prot(p);
+<a href=#465 id=465 data-nosnippet>465</a>        prot &lt; <span class="number">0 </span>|| (prot &amp; libc::PROT_READ) != <span class="number">0
+<a href=#466 id=466 data-nosnippet>466</a>    </span>};
+<a href=#467 id=467 data-nosnippet>467</a>    <span class="kw">if </span>!readable(symtab <span class="kw">as </span>usize) || !readable(strtab <span class="kw">as </span>usize) {
+<a href=#468 id=468 data-nosnippet>468</a>        <span class="kw">return</span>;
+<a href=#469 id=469 data-nosnippet>469</a>    }
+<a href=#470 id=470 data-nosnippet>470</a>
+<a href=#471 id=471 data-nosnippet>471</a>    <span class="kw">let </span>page = <span class="kw">unsafe </span>{ libc::sysconf(libc::_SC_PAGESIZE) } <span class="kw">as </span>c_long;
+<a href=#472 id=472 data-nosnippet>472</a>    <span class="kw">if </span>page &lt;= <span class="number">0 </span>{
+<a href=#473 id=473 data-nosnippet>473</a>        <span class="kw">return</span>;
+<a href=#474 id=474 data-nosnippet>474</a>    }
+<a href=#475 id=475 data-nosnippet>475</a>    <span class="kw">let </span>page = page <span class="kw">as </span>usize;
+<a href=#476 id=476 data-nosnippet>476</a>    <span class="kw">let </span>ent = std::mem::size_of::&lt;Elf64Rela&gt;();
+<a href=#477 id=477 data-nosnippet>477</a>    <span class="kw">if </span>!jmprel.is_null() &amp;&amp; pltrelsz &gt;= ent &amp;&amp; readable(jmprel <span class="kw">as </span>usize) {
+<a href=#478 id=478 data-nosnippet>478</a>        patch_reloc_table(base, symtab, strtab, jmprel, pltrelsz / ent, page);
+<a href=#479 id=479 data-nosnippet>479</a>    }
+<a href=#480 id=480 data-nosnippet>480</a>    <span class="kw">if </span>!rela.is_null() &amp;&amp; relasz &gt;= ent &amp;&amp; readable(rela <span class="kw">as </span>usize) {
+<a href=#481 id=481 data-nosnippet>481</a>        patch_reloc_table(base, symtab, strtab, rela, relasz / ent, page);
+<a href=#482 id=482 data-nosnippet>482</a>    }
+<a href=#483 id=483 data-nosnippet>483</a>}
+<a href=#484 id=484 data-nosnippet>484</a>
+<a href=#485 id=485 data-nosnippet>485</a><span class="doccomment">/// Repoint exactly the `ioctl` GOT slots in one relocation table to `filtered_ioctl` and
+<a href=#486 id=486 data-nosnippet>486</a>/// nothing else — every candidate entry is name-checked so no other symbol the library imports is
+<a href=#487 id=487 data-nosnippet>487</a>/// disturbed. It handles both the `JUMP_SLOT` and `GLOB_DAT` entry forms.
+<a href=#488 id=488 data-nosnippet>488</a>///
+<a href=#489 id=489 data-nosnippet>489</a>/// For each entry: skip it unless the relocation type is `R_X86_64_JUMP_SLOT` or
+<a href=#490 id=490 data-nosnippet>490</a>/// `R_X86_64_GLOB_DAT` with a nonzero symbol index, then resolve the symbol name through
+<a href=#491 id=491 data-nosnippet>491</a>/// `symtab`/`strtab` and skip unless it is exactly `ioctl`. For a match:
+<a href=#492 id=492 data-nosnippet>492</a>///
+<a href=#493 id=493 data-nosnippet>493</a>/// 1. **Locate the slot**: the GOT entry lives at `base + r_offset`; `pg` is its page-aligned base.
+<a href=#494 id=494 data-nosnippet>494</a>/// 2. **Make the page writable**: read the slot's current protection via `page_prot` (defaulting to
+<a href=#495 id=495 data-nosnippet>495</a>///    read/write when maps is unreadable) and `mprotect` the page to `PROT_READ | PROT_WRITE`.
+<a href=#496 id=496 data-nosnippet>496</a>/// 3. **Publish the new pointer atomically**: store `filtered_ioctl` into the slot with an
+<a href=#497 id=497 data-nosnippet>497</a>///    `AtomicPtr` `Release` store, since another thread may be dispatching through this GOT slot
+<a href=#498 id=498 data-nosnippet>498</a>///    concurrently and the write must not tear.
+<a href=#499 id=499 data-nosnippet>499</a>/// 4. **Restore protection**: return the page to its original protection rather than a hardcoded
+<a href=#500 id=500 data-nosnippet>500</a>///    read-only — under partial RELRO these libraries lazily bind through this page, so leaving it
+<a href=#501 id=501 data-nosnippet>501</a>///    read-only would fault the next symbol resolve.
+<a href=#502 id=502 data-nosnippet>502</a></span><span class="kw">unsafe fn </span>patch_reloc_table(
+<a href=#503 id=503 data-nosnippet>503</a>    base: usize,
+<a href=#504 id=504 data-nosnippet>504</a>    symtab: <span class="kw-2">*const </span>libc::Elf64_Sym,
+<a href=#505 id=505 data-nosnippet>505</a>    strtab: <span class="kw-2">*const </span>c_char,
+<a href=#506 id=506 data-nosnippet>506</a>    rela: <span class="kw-2">*const </span>Elf64Rela,
+<a href=#507 id=507 data-nosnippet>507</a>    count: usize,
+<a href=#508 id=508 data-nosnippet>508</a>    page: usize,
+<a href=#509 id=509 data-nosnippet>509</a>) {
+<a href=#510 id=510 data-nosnippet>510</a>    <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..count {
+<a href=#511 id=511 data-nosnippet>511</a>        <span class="kw">let </span>r = rela.add(i);
+<a href=#512 id=512 data-nosnippet>512</a>        <span class="kw">let </span>rtype = elf64_r_type((<span class="kw-2">*</span>r).r_info);
+<a href=#513 id=513 data-nosnippet>513</a>        <span class="kw">if </span>rtype != R_X86_64_JUMP_SLOT &amp;&amp; rtype != R_X86_64_GLOB_DAT {
+<a href=#514 id=514 data-nosnippet>514</a>            <span class="kw">continue</span>;
+<a href=#515 id=515 data-nosnippet>515</a>        }
+<a href=#516 id=516 data-nosnippet>516</a>        <span class="kw">let </span>sym_idx = elf64_r_sym((<span class="kw-2">*</span>r).r_info) <span class="kw">as </span>usize;
+<a href=#517 id=517 data-nosnippet>517</a>        <span class="kw">if </span>sym_idx == <span class="number">0 </span>{
+<a href=#518 id=518 data-nosnippet>518</a>            <span class="kw">continue</span>;
+<a href=#519 id=519 data-nosnippet>519</a>        }
+<a href=#520 id=520 data-nosnippet>520</a>        <span class="kw">let </span>name_off = (<span class="kw-2">*</span>symtab.add(sym_idx)).st_name <span class="kw">as </span>usize;
+<a href=#521 id=521 data-nosnippet>521</a>        <span class="kw">let </span>name = CStr::from_ptr(strtab.add(name_off));
+<a href=#522 id=522 data-nosnippet>522</a>        <span class="kw">if </span>name.to_bytes() != <span class="string">b"ioctl" </span>{
+<a href=#523 id=523 data-nosnippet>523</a>            <span class="kw">continue</span>;
+<a href=#524 id=524 data-nosnippet>524</a>        }
+<a href=#525 id=525 data-nosnippet>525</a>        <span class="kw">let </span>slot = (base + (<span class="kw-2">*</span>r).r_offset <span class="kw">as </span>usize) <span class="kw">as </span><span class="kw-2">*mut *mut </span>c_void;
+<a href=#526 id=526 data-nosnippet>526</a>        <span class="kw">let </span>pg = (slot <span class="kw">as </span>usize &amp; !(page - <span class="number">1</span>)) <span class="kw">as </span><span class="kw-2">*mut </span>c_void;
+<a href=#527 id=527 data-nosnippet>527</a>        <span class="kw">let </span><span class="kw-2">mut </span>orig = page_prot(slot <span class="kw">as </span>usize);
+<a href=#528 id=528 data-nosnippet>528</a>        <span class="kw">if </span>orig &lt; <span class="number">0 </span>{
+<a href=#529 id=529 data-nosnippet>529</a>            orig = libc::PROT_READ | libc::PROT_WRITE;
+<a href=#530 id=530 data-nosnippet>530</a>        }
+<a href=#531 id=531 data-nosnippet>531</a>        <span class="kw">if </span>libc::mprotect(pg, page, libc::PROT_READ | libc::PROT_WRITE) == <span class="number">0 </span>{
+<a href=#532 id=532 data-nosnippet>532</a>            <span class="kw">let </span>ap = <span class="kw-2">&amp;*</span>(slot <span class="kw">as </span><span class="kw-2">*const </span>AtomicPtr&lt;c_void&gt;);
+<a href=#533 id=533 data-nosnippet>533</a>            ap.store(filtered_ioctl <span class="kw">as </span><span class="kw-2">*mut </span>c_void, Ordering::Release);
+<a href=#534 id=534 data-nosnippet>534</a>            libc::mprotect(pg, page, orig);
+<a href=#535 id=535 data-nosnippet>535</a>        }
+<a href=#536 id=536 data-nosnippet>536</a>    }
+<a href=#537 id=537 data-nosnippet>537</a>}
+<a href=#538 id=538 data-nosnippet>538</a>
+<a href=#539 id=539 data-nosnippet>539</a><span class="doccomment">/// `dl_iterate_phdr` callback: for each loaded object matching a targeted NVIDIA library,
+<a href=#540 id=540 data-nosnippet>540</a>/// find its `PT_DYNAMIC` segment and hand it to `patch_ioctl_got`. Returns 0 to keep iterating.
+<a href=#541 id=541 data-nosnippet>541</a>///
+<a href=#542 id=542 data-nosnippet>542</a>/// 1. **Panic firewall**: the whole body runs under `catch_unwind` because a panic must not unwind
+<a href=#543 id=543 data-nosnippet>543</a>///    across this `extern "C"` boundary into the C `dl_iterate_phdr` — that would abort the
+<a href=#544 id=544 data-nosnippet>544</a>///    process; a caught panic just ends this object's processing and iteration continues.
+<a href=#545 id=545 data-nosnippet>545</a>/// 2. **Tight library match**: only `libnvcuvid`, `libnvidia-encode`, and `libcuda.so` are patched
+<a href=#546 id=546 data-nosnippet>546</a>///    — the libraries that issue the enumeration ioctl (`libnvidia-encode` calls through
+<a href=#547 id=547 data-nosnippet>547</a>///    `libnvcuvid`). Unrelated modules (`libcudart`, `libnvidia-ml`, `libnvidia-glcore`, …) and
+<a href=#548 id=548 data-nosnippet>548</a>///    objects with no name are skipped so their `ioctl` bindings are left untouched.
+<a href=#549 id=549 data-nosnippet>549</a>/// 3. **Patch each `PT_DYNAMIC`**: for a matched object, walk its program headers and call
+<a href=#550 id=550 data-nosnippet>550</a>///    `patch_ioctl_got` on every dynamic segment, using the object's load address as the base.
+<a href=#551 id=551 data-nosnippet>551</a></span><span class="kw">unsafe extern </span><span class="string">"C" </span><span class="kw">fn </span>patch_phdr_cb(
+<a href=#552 id=552 data-nosnippet>552</a>    info: <span class="kw-2">*mut </span>libc::dl_phdr_info,
+<a href=#553 id=553 data-nosnippet>553</a>    _size: libc::size_t,
+<a href=#554 id=554 data-nosnippet>554</a>    _data: <span class="kw-2">*mut </span>c_void,
+<a href=#555 id=555 data-nosnippet>555</a>) -&gt; c_int {
+<a href=#556 id=556 data-nosnippet>556</a>    <span class="kw">let _ </span>= std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+<a href=#557 id=557 data-nosnippet>557</a>        <span class="kw">let </span>info = <span class="kw-2">&amp;*</span>info;
+<a href=#558 id=558 data-nosnippet>558</a>        <span class="kw">if </span>info.dlpi_name.is_null() || <span class="kw-2">*</span>info.dlpi_name == <span class="number">0 </span>{
+<a href=#559 id=559 data-nosnippet>559</a>            <span class="kw">return</span>;
+<a href=#560 id=560 data-nosnippet>560</a>        }
+<a href=#561 id=561 data-nosnippet>561</a>        <span class="kw">let </span>name = CStr::from_ptr(info.dlpi_name).to_string_lossy();
+<a href=#562 id=562 data-nosnippet>562</a>        <span class="kw">if </span>!name.contains(<span class="string">"libnvcuvid"</span>)
+<a href=#563 id=563 data-nosnippet>563</a>            &amp;&amp; !name.contains(<span class="string">"libnvidia-encode"</span>)
+<a href=#564 id=564 data-nosnippet>564</a>            &amp;&amp; !name.contains(<span class="string">"libcuda.so"</span>)
+<a href=#565 id=565 data-nosnippet>565</a>        {
+<a href=#566 id=566 data-nosnippet>566</a>            <span class="kw">return</span>;
+<a href=#567 id=567 data-nosnippet>567</a>        }
+<a href=#568 id=568 data-nosnippet>568</a>        <span class="kw">let </span>base = info.dlpi_addr <span class="kw">as </span>usize;
+<a href=#569 id=569 data-nosnippet>569</a>        <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..info.dlpi_phnum <span class="kw">as </span>isize {
+<a href=#570 id=570 data-nosnippet>570</a>            <span class="kw">let </span>ph = <span class="kw-2">&amp;*</span>info.dlpi_phdr.offset(i);
+<a href=#571 id=571 data-nosnippet>571</a>            <span class="kw">if </span>ph.p_type == libc::PT_DYNAMIC {
+<a href=#572 id=572 data-nosnippet>572</a>                patch_ioctl_got(base, (base + ph.p_vaddr <span class="kw">as </span>usize) <span class="kw">as </span><span class="kw-2">*const </span>Elf64Dyn);
+<a href=#573 id=573 data-nosnippet>573</a>            }
+<a href=#574 id=574 data-nosnippet>574</a>        }
+<a href=#575 id=575 data-nosnippet>575</a>    }));
+<a href=#576 id=576 data-nosnippet>576</a>    <span class="number">0
+<a href=#577 id=577 data-nosnippet>577</a></span>}
+<a href=#578 id=578 data-nosnippet>578</a>
+<a href=#579 id=579 data-nosnippet>579</a><span class="doccomment">/// True when at least one host GPU is hidden from the container — the only situation that
+<a href=#580 id=580 data-nosnippet>580</a>/// can trigger the peer-init bug, so it gates whether the filter installs at all.
+<a href=#581 id=581 data-nosnippet>581</a>///
+<a href=#582 id=582 data-nosnippet>582</a>/// Compares two counts: `host` is the number of GPUs the kernel driver knows, from the non-dot
+<a href=#583 id=583 data-nosnippet>583</a>/// entries of `/proc/driver/nvidia/gpus`; `visible` is the number of `/dev/nvidia{0..31}` nodes
+<a href=#584 id=584 data-nosnippet>584</a>/// actually present in the container. GPUs are hidden when `host &gt; visible`, and the `visible &gt; 0`
+<a href=#585 id=585 data-nosnippet>585</a>/// clause ensures there is still a usable GPU (a container with no GPUs at all is not this case).
+<a href=#586 id=586 data-nosnippet>586</a></span><span class="kw">fn </span>has_hidden_gpus() -&gt; bool {
+<a href=#587 id=587 data-nosnippet>587</a>    <span class="kw">let </span>host = std::fs::read_dir(<span class="string">"/proc/driver/nvidia/gpus"</span>)
+<a href=#588 id=588 data-nosnippet>588</a>        .map(|d| d.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with(<span class="string">'.'</span>)).count())
+<a href=#589 id=589 data-nosnippet>589</a>        .unwrap_or(<span class="number">0</span>);
+<a href=#590 id=590 data-nosnippet>590</a>    <span class="kw">let </span>visible = (<span class="number">0</span>..MAX_ATTACHED_GPUS <span class="kw">as </span>u32).filter(|<span class="kw-2">&amp;</span>m| node_present(m)).count();
+<a href=#591 id=591 data-nosnippet>591</a>    host &gt; visible &amp;&amp; visible &gt; <span class="number">0
+<a href=#592 id=592 data-nosnippet>592</a></span>}
+<a href=#593 id=593 data-nosnippet>593</a>
+<a href=#594 id=594 data-nosnippet>594</a><span class="doccomment">/// Install the `GET_ATTACHED_IDS`/`GET_PROBED_IDS` GOT filter, at most once and only when a
+<a href=#595 id=595 data-nosnippet>595</a>/// host GPU is hidden from the container. Idempotent and safe to call before every NVENC session
+<a href=#596 id=596 data-nosnippet>596</a>/// open (guarded by a `Once`).
+<a href=#597 id=597 data-nosnippet>597</a>///
+<a href=#598 id=598 data-nosnippet>598</a>/// 1. **Escape hatch**: if `PIXELFLUX_DISABLE_GPU_FILTER` is set, log and return without patching
+<a href=#599 id=599 data-nosnippet>599</a>///    (also useful for A/B testing the filter).
+<a href=#600 id=600 data-nosnippet>600</a>/// 2. **Cache the nvidiactl identity**: `stat` `/dev/nvidiactl` and store its `rdev` in
+<a href=#601 id=601 data-nosnippet>601</a>///    `NVIDIACTL_RDEV` so the ioctl hook can later verify an fd's identity before rewriting. If the
+<a href=#602 id=602 data-nosnippet>602</a>///    `stat` fails the value stays 0, which makes the hook skip that identity gate.
+<a href=#603 id=603 data-nosnippet>603</a>/// 3. **Patch only when needed**: if `has_hidden_gpus()` reports GPUs hidden from the container,
+<a href=#604 id=604 data-nosnippet>604</a>///    run `dl_iterate_phdr` over `patch_phdr_cb` to repoint the `ioctl` GOT slots in the targeted
+<a href=#605 id=605 data-nosnippet>605</a>///    NVIDIA libraries. Otherwise nothing is patched — the filter is a strict no-op.
+<a href=#606 id=606 data-nosnippet>606</a></span><span class="kw">pub fn </span>install() {
+<a href=#607 id=607 data-nosnippet>607</a>    <span class="kw">static </span>ONCE: Once = Once::new();
+<a href=#608 id=608 data-nosnippet>608</a>    ONCE.call_once(|| {
+<a href=#609 id=609 data-nosnippet>609</a>        <span class="kw">if </span>std::env::var_os(<span class="string">"PIXELFLUX_DISABLE_GPU_FILTER"</span>).is_some() {
+<a href=#610 id=610 data-nosnippet>610</a>            <span class="macro">eprintln!</span>(<span class="string">"[pixelflux] multi-GPU NVENC filter disabled via PIXELFLUX_DISABLE_GPU_FILTER"</span>);
+<a href=#611 id=611 data-nosnippet>611</a>            <span class="kw">return</span>;
+<a href=#612 id=612 data-nosnippet>612</a>        }
+<a href=#613 id=613 data-nosnippet>613</a>        <span class="kw">unsafe </span>{
+<a href=#614 id=614 data-nosnippet>614</a>            <span class="kw">let </span><span class="kw-2">mut </span>st: libc::stat = std::mem::zeroed();
+<a href=#615 id=615 data-nosnippet>615</a>            <span class="kw">if </span>libc::stat(<span class="string">c"/dev/nvidiactl"</span>.as_ptr(), <span class="kw-2">&amp;mut </span>st) == <span class="number">0 </span>{
+<a href=#616 id=616 data-nosnippet>616</a>                NVIDIACTL_RDEV.store(st.st_rdev <span class="kw">as </span>u64, Ordering::Relaxed);
+<a href=#617 id=617 data-nosnippet>617</a>            }
+<a href=#618 id=618 data-nosnippet>618</a>        }
+<a href=#619 id=619 data-nosnippet>619</a>        <span class="kw">if </span>has_hidden_gpus() {
+<a href=#620 id=620 data-nosnippet>620</a>            <span class="kw">unsafe </span>{
+<a href=#621 id=621 data-nosnippet>621</a>                libc::dl_iterate_phdr(<span class="prelude-val">Some</span>(patch_phdr_cb), std::ptr::null_mut());
+<a href=#622 id=622 data-nosnippet>622</a>            }
+<a href=#623 id=623 data-nosnippet>623</a>            <span class="macro">eprintln!</span>(<span class="string">"[pixelflux] multi-GPU NVENC ioctl filter installed (GET_ATTACHED_IDS/GET_PROBED_IDS)"</span>);
+<a href=#624 id=624 data-nosnippet>624</a>        }
+<a href=#625 id=625 data-nosnippet>625</a>    });
+<a href=#626 id=626 data-nosnippet>626</a>}
+<a href=#627 id=627 data-nosnippet>627</a>
+<a href=#628 id=628 data-nosnippet>628</a><span class="attr">#[cfg(test)]
+<a href=#629 id=629 data-nosnippet>629</a></span><span class="kw">mod </span>tests {
+<a href=#630 id=630 data-nosnippet>630</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#631 id=631 data-nosnippet>631</a>
+<a href=#632 id=632 data-nosnippet>632</a>    <span class="doccomment">/// Dropping a strict subset compacts the survivors and back-fills the rest: of three
+<a href=#633 id=633 data-nosnippet>633</a>    /// live ids, keeping two (0x100, 0x300) rewrites the array so the survivors move to the front
+<a href=#634 id=634 data-nosnippet>634</a>    /// and every trailing slot becomes `INVALID_GPU_ID`.
+<a href=#635 id=635 data-nosnippet>635</a>    </span><span class="attr">#[test]
+<a href=#636 id=636 data-nosnippet>636</a>    </span><span class="kw">fn </span>filter_keeps_strict_subset_and_invalidates_rest() {
+<a href=#637 id=637 data-nosnippet>637</a>        <span class="kw">let </span><span class="kw-2">mut </span>ids = [INVALID_GPU_ID; MAX_ATTACHED_GPUS];
+<a href=#638 id=638 data-nosnippet>638</a>        ids[<span class="number">0</span>] = <span class="number">0x100</span>;
+<a href=#639 id=639 data-nosnippet>639</a>        ids[<span class="number">1</span>] = <span class="number">0x200</span>;
+<a href=#640 id=640 data-nosnippet>640</a>        ids[<span class="number">2</span>] = <span class="number">0x300</span>;
+<a href=#641 id=641 data-nosnippet>641</a>        filter_ids(<span class="kw-2">&amp;mut </span>ids, |id| id == <span class="number">0x100 </span>|| id == <span class="number">0x300</span>);
+<a href=#642 id=642 data-nosnippet>642</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">0</span>], <span class="number">0x100</span>);
+<a href=#643 id=643 data-nosnippet>643</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">1</span>], <span class="number">0x300</span>);
+<a href=#644 id=644 data-nosnippet>644</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">2</span>], INVALID_GPU_ID);
+<a href=#645 id=645 data-nosnippet>645</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">3</span>], INVALID_GPU_ID);
+<a href=#646 id=646 data-nosnippet>646</a>    }
+<a href=#647 id=647 data-nosnippet>647</a>
+<a href=#648 id=648 data-nosnippet>648</a>    <span class="doccomment">/// Fail-safe when every id is kept: `nkept == total`, so the array is left exactly as-is
+<a href=#649 id=649 data-nosnippet>649</a>    /// rather than needlessly rewritten.
+<a href=#650 id=650 data-nosnippet>650</a>    </span><span class="attr">#[test]
+<a href=#651 id=651 data-nosnippet>651</a>    </span><span class="kw">fn </span>filter_noop_when_all_kept() {
+<a href=#652 id=652 data-nosnippet>652</a>        <span class="kw">let </span><span class="kw-2">mut </span>ids = [INVALID_GPU_ID; MAX_ATTACHED_GPUS];
+<a href=#653 id=653 data-nosnippet>653</a>        ids[<span class="number">0</span>] = <span class="number">0xAA</span>;
+<a href=#654 id=654 data-nosnippet>654</a>        ids[<span class="number">1</span>] = <span class="number">0xBB</span>;
+<a href=#655 id=655 data-nosnippet>655</a>        filter_ids(<span class="kw-2">&amp;mut </span>ids, |<span class="kw">_</span>| <span class="bool-val">true</span>);
+<a href=#656 id=656 data-nosnippet>656</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">0</span>], <span class="number">0xAA</span>);
+<a href=#657 id=657 data-nosnippet>657</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">1</span>], <span class="number">0xBB</span>);
+<a href=#658 id=658 data-nosnippet>658</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">2</span>], INVALID_GPU_ID);
+<a href=#659 id=659 data-nosnippet>659</a>    }
+<a href=#660 id=660 data-nosnippet>660</a>
+<a href=#661 id=661 data-nosnippet>661</a>    <span class="doccomment">/// Fail-safe when no id is kept: `nkept == 0` never blanks the array, so the ids survive
+<a href=#662 id=662 data-nosnippet>662</a>    /// untouched instead of leaving zero usable GPUs.
+<a href=#663 id=663 data-nosnippet>663</a>    </span><span class="attr">#[test]
+<a href=#664 id=664 data-nosnippet>664</a>    </span><span class="kw">fn </span>filter_noop_when_none_kept() {
+<a href=#665 id=665 data-nosnippet>665</a>        <span class="kw">let </span><span class="kw-2">mut </span>ids = [INVALID_GPU_ID; MAX_ATTACHED_GPUS];
+<a href=#666 id=666 data-nosnippet>666</a>        ids[<span class="number">0</span>] = <span class="number">0xAA</span>;
+<a href=#667 id=667 data-nosnippet>667</a>        ids[<span class="number">1</span>] = <span class="number">0xBB</span>;
+<a href=#668 id=668 data-nosnippet>668</a>        filter_ids(<span class="kw-2">&amp;mut </span>ids, |<span class="kw">_</span>| <span class="bool-val">false</span>);
+<a href=#669 id=669 data-nosnippet>669</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">0</span>], <span class="number">0xAA</span>);
+<a href=#670 id=670 data-nosnippet>670</a>        <span class="macro">assert_eq!</span>(ids[<span class="number">1</span>], <span class="number">0xBB</span>);
+<a href=#671 id=671 data-nosnippet>671</a>    }
+<a href=#672 id=672 data-nosnippet>672</a>
+<a href=#673 id=673 data-nosnippet>673</a>    <span class="doccomment">/// `ioc_nr` extracts the low NR byte: the full request `0xC020462A` yields
+<a href=#674 id=674 data-nosnippet>674</a>    /// `NV_ESC_RM_CONTROL` (0x2A).
+<a href=#675 id=675 data-nosnippet>675</a>    </span><span class="attr">#[test]
+<a href=#676 id=676 data-nosnippet>676</a>    </span><span class="kw">fn </span>ioc_nr_extracts_low_byte() {
+<a href=#677 id=677 data-nosnippet>677</a>        <span class="macro">assert_eq!</span>(ioc_nr(<span class="number">0xC020462A</span>), NV_ESC_RM_CONTROL);
+<a href=#678 id=678 data-nosnippet>678</a>    }
+<a href=#679 id=679 data-nosnippet>679</a>
+<a href=#680 id=680 data-nosnippet>680</a>    <span class="doccomment">/// Proves the property the whole gate rests on — matching stays size-agnostic yet
+<a href=#681 id=681 data-nosnippet>681</a>    /// NR-precise — so a future driver revision cannot silently defeat it. A request that shares
+<a href=#682 id=682 data-nosnippet>682</a>    /// DIR|TYPE|NR but encodes a different `_IOC_SIZE` (here 0x30, versus the canonical 0x20 =
+<a href=#683 id=683 data-nosnippet>683</a>    /// `sizeof(NVOS54_PARAMETERS)`) still matches once the size is masked off, so a driver whose
+<a href=#684 id=684 data-nosnippet>684</a>    /// `NVOS54_PARAMETERS` differs in size is not rejected by the request gate; a request carrying a
+<a href=#685 id=685 data-nosnippet>685</a>    /// different NR (0x2B) does not match, confirming NR precision is retained.
+<a href=#686 id=686 data-nosnippet>686</a>    </span><span class="attr">#[test]
+<a href=#687 id=687 data-nosnippet>687</a>    </span><span class="kw">fn </span>request_match_ignores_param_size() {
+<a href=#688 id=688 data-nosnippet>688</a>        <span class="kw">let </span>base = ioc_no_size(NV_RM_CONTROL_REQUEST);
+<a href=#689 id=689 data-nosnippet>689</a>        <span class="kw">let </span>other_size = base | (<span class="number">0x30 </span>&lt;&lt; IOC_SIZESHIFT);
+<a href=#690 id=690 data-nosnippet>690</a>        <span class="macro">assert_ne!</span>(other_size, NV_RM_CONTROL_REQUEST);
+<a href=#691 id=691 data-nosnippet>691</a>        <span class="macro">assert_eq!</span>(ioc_no_size(other_size), base);
+<a href=#692 id=692 data-nosnippet>692</a>        <span class="kw">let </span>other_nr = (NV_RM_CONTROL_REQUEST &amp; !<span class="number">0xFF</span>) | <span class="number">0x2B</span>;
+<a href=#693 id=693 data-nosnippet>693</a>        <span class="macro">assert_ne!</span>(ioc_no_size(other_nr), base);
+<a href=#694 id=694 data-nosnippet>694</a>    }
+<a href=#695 id=695 data-nosnippet>695</a>
+<a href=#696 id=696 data-nosnippet>696</a>    <span class="doccomment">/// Guards against silent NVIDIA ABI drift by pinning the on-wire layout the size dispatch
+<a href=#697 id=697 data-nosnippet>697</a>    /// relies on: ATTACHED params are `gpuIds[32]` (128 bytes) and PROBED params are
+<a href=#698 id=698 data-nosnippet>698</a>    /// `gpuIds[32] + excludedGpuIds[32]` (256 bytes). Because both lead with the same `gpuIds[32]`,
+<a href=#699 id=699 data-nosnippet>699</a>    /// these exact sizes are what let the exact-size guards disambiguate the two commands;
+<a href=#700 id=700 data-nosnippet>700</a>    /// `NvRmControlParams` is 32 bytes.
+<a href=#701 id=701 data-nosnippet>701</a>    </span><span class="attr">#[test]
+<a href=#702 id=702 data-nosnippet>702</a>    </span><span class="kw">fn </span>param_struct_sizes_match_nvidia_layout() {
+<a href=#703 id=703 data-nosnippet>703</a>        <span class="macro">assert_eq!</span>(ATTACHED_PARAMS_SIZE, <span class="number">128</span>);
+<a href=#704 id=704 data-nosnippet>704</a>        <span class="macro">assert_eq!</span>(PROBED_PARAMS_SIZE, <span class="number">256</span>);
+<a href=#705 id=705 data-nosnippet>705</a>        <span class="macro">assert_eq!</span>(std::mem::size_of::&lt;NvRmControlParams&gt;(), <span class="number">32</span>);
+<a href=#706 id=706 data-nosnippet>706</a>    }
+<a href=#707 id=707 data-nosnippet>707</a>}
+</code></pre></div></section></main></body></html>

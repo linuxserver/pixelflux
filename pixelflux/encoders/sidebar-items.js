@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["vbv_bits"],"mod":["nvenc","oh264","overlay","software","vaapi"]};

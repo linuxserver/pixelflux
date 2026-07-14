@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["decide_hw_fullframe","periodic_idr_due"],"struct":["HwFrameDecision","X11Pipeline"]};

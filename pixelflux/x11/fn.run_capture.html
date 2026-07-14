@@ -1,0 +1,49 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two threads that overlap for throughput."><title>run_capture in pixelflux::x11 - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="pixelflux" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">run_capture</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../pixelflux/index.html">pixelflux</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In pixelflux::<wbr>x11</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">pixelflux</a>::<wbr><a href="index.html">x11</a></div><h1>Function <span class="fn">run_<wbr>capture</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/pixelflux/x11/mod.rs.html#833-1081">Source</a> </span></div><pre class="rust item-decl"><code>pub fn run_capture&lt;F&gt;(
+    settings: <a class="struct" href="../struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">RustCaptureSettings</a>,
+    controls: <a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;<a class="struct" href="struct.Controls.html" title="struct pixelflux::x11::Controls">Controls</a>&gt;,
+    encode_tid_tx: <a class="struct" href="https://doc.rust-lang.org/1.97.0/std/sync/mpsc/struct.Sender.html" title="struct std::sync::mpsc::Sender">Sender</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.0/std/thread/id/struct.ThreadId.html" title="struct std::thread::id::ThreadId">ThreadId</a>&gt;,
+    on_frame: F,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.0/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.unit.html">()</a>, <a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;<div class="where">where
+    F: <a class="trait" href="https://doc.rust-lang.org/1.97.0/core/ops/function/trait.FnMut.html" title="trait core::ops::function::FnMut">FnMut</a>(<a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="../encoders/software/struct.EncodedStripe.html" title="struct pixelflux::encoders::software::EncodedStripe">EncodedStripe</a>&gt;) + <a class="trait" href="https://doc.rust-lang.org/1.97.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'static,</div></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Run the X11 capture pipeline until <code>stop</code> is set, splitting capture and encode across two
+threads that overlap for throughput.</p>
+<p>This (the caller’s) thread performs setup and then the capture loop; a spawned encode thread runs
+<code>encode_loop</code> and invokes <code>on_frame(stripes)</code> once per encoded frame. The split lets capture and
+encode overlap, and because frames are throttled/dropped as RAW frames before encode, the delivered
+H.264 stays a valid contiguous reference chain.</p>
+<ol>
+<li><strong>Setup</strong>: connect to X (a private connection) and require a 32-bpp BGRA root — the Z-pixmap
+byte depth must be 4, which modern servers use for depth 24/32 — then negotiate XShm and
+XFixes. XFixes is always negotiated (one round-trip) so the cursor overlay can be toggled on
+live even when capture started without it. Initial dimensions and origin are resolved from the
+settings and the live root geometry, and a <code>FramePool</code> of <code>POOL_N</code> = 3 shm surfaces is
+allocated — the working set (one in-capture, one in-slot, one in-encode) that a one-frame-ahead
+demand-driven capture needs, which also keeps the memory cost (<code>3 * W*H*4</code>, significant at 4K)
+bounded.</li>
+<li><strong>Encode thread</strong>: spawned with a raised scheduling priority; it reports its thread id back
+through <code>encode_tid_tx</code> so the caller can detect a re-entrant stop issued from inside the
+delivery callback.</li>
+<li><strong>Capture loop</strong> (until <code>stop</code>): fps is re-read each iteration for live pacing — sleep to the
+next frame deadline, or <code>yield_now</code> when already behind instead of busy-spinning.
+<ul>
+<li><strong>Live region change</strong> (<code>region_dirty</code>): re-target the grab origin immediately (an x/y pan
+needs no surface work); a size change reuses the drain/recreate path below.</li>
+<li><strong>Auto-adjust</strong>: on a root geometry change, drain in-flight frames then recreate the surfaces
+and bump the generation (which the encode thread turns into a reshape or rebuild). The geometry
+is re-resolved AFTER the drain, because a slow drain can outlast another geometry change (a
+fast flap) and recreating at a stale size would make the next <code>shm_get_image</code> exceed the root;
+a fully-reverted flap keeps its surfaces as-is. A stop that races the drain breaks out to
+teardown.</li>
+<li><strong>Grab</strong>: acquire a pooled surface (blocks until the encoder frees one), then <code>shm_get_image</code>
+the region into it synchronously (<code>reply()</code> waits).</li>
+<li><strong>Overlays</strong>: composite the XFixes cursor (drawn at its hotspot-offset origin; live-toggleable)
+and the watermark onto the BGRA pixels on the CPU.</li>
+<li><strong>Publish</strong>: hand the finished frame to the encode thread (blocks until the slot is free;
+never drops). A stop observed while waiting in acquire/publish exits the loop.</li>
+</ul>
+</li>
+<li><strong>Teardown</strong>: stop and JOIN the encode thread BEFORE destroying the shm surfaces it may still be
+reading, preserving the resize-safety guarantee.</li>
+</ol>
+<p>Blocking; intended to run on a dedicated thread. The X connection and shm surfaces live on this
+thread and the encoder lives on the encode thread — nothing X-related crosses the boundary.</p>
+</div></details></section></div></main></body></html>

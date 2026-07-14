@@ -1,0 +1,68 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="pixelflux"><title>pixelflux - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="pixelflux" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate pixelflux</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../pixelflux/index.html">pixelflux</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#pixelflux" title="pixelflux">pixelflux</a><ul><li><a href="#crate-structure" title="Crate structure">Crate structure</a></li><li><a href="#data-flow" title="Data flow">Data flow</a></li></ul></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>pixelflux</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/pixelflux/lib.rs.html#14-4176">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="pixelflux"><a class="doc-anchor" href="#pixelflux">§</a>pixelflux</h2>
+<p>A high-performance screen capture and encoding pipeline exposed as a Python extension via
+PyO3. It supports two independent backends — <strong>X11</strong> (XShm + XFixes) and <strong>Wayland</strong>
+(a headless <a href="https://github.com/Smithay/smithay">Smithay</a> compositor) — and a shared
+encoding layer that dispatches to software (x264/JPEG striping, OpenH264) or hardware
+(NVENC, VA-API) encoders based on the available GPU and operator settings.</p>
+<h3 id="crate-structure"><a class="doc-anchor" href="#crate-structure">§</a>Crate structure</h3><div><table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><a href="encoders/index.html" title="mod pixelflux::encoders"><code>encoders</code></a></td><td>Encoder backends: software x264/JPEG, OpenH264, NVENC, VA-API, watermark overlay</td></tr>
+<tr><td><a href="wayland/index.html" title="mod pixelflux::wayland"><code>wayland</code></a></td><td>Headless Smithay compositor, cursor rendering</td></tr>
+<tr><td><a href="x11/index.html" title="mod pixelflux::x11"><code>x11</code></a></td><td>X11/XShm capture loop and stripe dispatch</td></tr>
+<tr><td><a href="pipeline/index.html" title="mod pixelflux::pipeline"><code>pipeline</code></a></td><td>Frame-processing policy shared by both backends (send/QP/keyframe decisions)</td></tr>
+<tr><td><a href="recording_sink/index.html" title="mod pixelflux::recording_sink"><code>recording_sink</code></a></td><td>Unix-socket H.264 fan-out for external recording</td></tr>
+<tr><td><a href="computer_use/index.html" title="mod pixelflux::computer_use"><code>computer_use</code></a></td><td>HTTP API for AI-agent desktop control (screenshots, input injection)</td></tr>
+<tr><td><a href="nvgpufilter/index.html" title="mod pixelflux::nvgpufilter"><code>nvgpufilter</code></a></td><td>Multi-GPU NVENC device filtering via ioctl</td></tr>
+</tbody></table>
+</div><h3 id="data-flow"><a class="doc-anchor" href="#data-flow">§</a>Data flow</h3><div class="example-wrap"><pre class="language-text"><code>Python  ──►  CaptureSettings  ──►  X11 / Wayland backend
+                                        │
+                                   frame pixels
+                                        │
+                                   ┌────┴────┐
+                                   │ Encoder │  (NVENC / VAAPI / x264 / OpenH264 / JPEG)
+                                   └────┬────┘
+                                        │
+                                  EncodedStripe(s)
+                                        │
+                                   Python callback</code></pre></div></div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.nvenc"><code>pub use encoders::<a class="mod" href="encoders/nvenc/index.html" title="mod pixelflux::encoders::nvenc">nvenc</a>;</code></dt><dt id="reexport.StripeState"><code>pub use encoders::software::<a class="struct" href="encoders/software/struct.StripeState.html" title="struct pixelflux::encoders::software::StripeState">StripeState</a>;</code></dt><dt id="reexport.vaapi"><code>pub use encoders::<a class="mod" href="encoders/vaapi/index.html" title="mod pixelflux::encoders::vaapi">vaapi</a>;</code></dt></dl><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="computer_use/index.html" title="mod pixelflux::computer_use">computer_<wbr>use</a></dt><dd>HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
+HTTP server implementing the <a href="https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo">Anthropic Computer Use</a> specification.</dd><dt><a class="mod" href="encoders/index.html" title="mod pixelflux::encoders">encoders</a></dt><dt><a class="mod" href="nvgpufilter/index.html" title="mod pixelflux::nvgpufilter">nvgpufilter</a></dt><dd>Multi-GPU NVENC device filtering via kernel ioctl.
+Multi-GPU NVENC <code>GET_ATTACHED_IDS</code> / <code>GET_PROBED_IDS</code> ioctl filter — it exists so a container
+handed only a subset of the host’s GPUs can still open an NVENC session.</dd><dt><a class="mod" href="pipeline/index.html" title="mod pixelflux::pipeline">pipeline</a></dt><dd>Frame-processing policy shared by the X11 and Wayland backends.
+Frame-processing policy shared by the two capture backends. It lives in its own module for one
+reason: the Wayland path (dmabuf, compositor damage) and the X11 path (host-ARGB, stripe-hash
+damage) capture pixels in completely different ways, but a viewer must never be able to tell
+which one produced a frame — a paint-over refresh or a recovery keyframe has to behave
+identically either way. Keeping the decision logic here, source-agnostic, is what guarantees it.</dd><dt><a class="mod" href="recording_sink/index.html" title="mod pixelflux::recording_sink">recording_<wbr>sink</a></dt><dd>Unix-socket H.264 recording sink for external capture tools.
+Out-of-band H.264 recording sink. Its reason to exist is separation: a
+recorder needs the exact encoded stream the viewers see, but neither side
+should be able to disturb the other — so this fans the encoder’s raw Annex-B
+elementary stream to clients on a private Unix domain socket, entirely apart
+from the live viewer transport (WebSocket / WebRTC). A recorder attaching,
+stalling, or detaching cannot perturb what viewers receive, and recording
+works even with no viewer connected at all. Recording is also strictly
+optional: with no socket path configured, <code>RecordingSink::try_bind</code> returns
+<code>None</code> and there is no sink for the caller to write frames to.</dd><dt><a class="mod" href="wayland/index.html" title="mod pixelflux::wayland">wayland</a></dt><dd>Headless Wayland compositor and cursor rendering.
+Wayland backend: a headless Smithay compositor that stands in for a real display server.</dd><dt><a class="mod" href="x11/index.html" title="mod pixelflux::x11">x11</a></dt><dd>X11/XShm capture loop, stripe dispatch, and per-stripe change detection.
+X11 host capture: grab the root window into host memory as BGRA, composite the XFixes hardware
+cursor and the watermark on the CPU, and feed each frame to <a href="pipeline/struct.X11Pipeline.html" title="struct pixelflux::pipeline::X11Pipeline"><code>pipeline::X11Pipeline</code></a>, which owns
+damage/stripe/encode. The grab goes through a shared-memory segment (XShm via x11rb) rather than
+a plain <code>GetImage</code> for one reason: a full-screen frame is far too large to copy through the X
+protocol socket every tick, so XShm has the server write the pixels straight into memory this
+process already has mapped.</dd></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.LiveTunables.html" title="struct pixelflux::LiveTunables">Live<wbr>Tunables</a></dt><dd>The per-frame decision/quality knobs every encoder re-reads from the settings on each
+tick, so they retune a running capture with no encoder re-init: x264 reconfigures, NVENC
+CQP retargets, VAAPI re-opens only its codec ctx, JPEG is stateless. Applied on the
+thread that owns the settings copy. Structural switches (encoder, chroma, RC mode,
+device) still need a capture restart.</dd><dt><a class="struct" href="struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">Rust<wbr>Capture<wbr>Settings</a></dt><dd>The full set of capture + encode parameters the Python layer hands to the Rust backend.</dd><dt><a class="struct" href="struct.WlEncodeControls.html" title="struct pixelflux::WlEncodeControls">WlEncode<wbr>Controls</a></dt><dd>Cross-thread controls for the Wayland encode thread, the X11 <code>Controls</code> scheme: the
+UpdateRate handler stores the current values then flips <code>rate_dirty</code> with Release; the
+encode thread swaps it with Acquire and re-reads the payload, never seeing it half-applied.
+<code>force_idr</code> is swapped just before each encode, so an on-demand keyframe lands on the
+frame ALREADY in flight instead of waiting one pipeline stage for the next publish.</dd><dt><a class="struct" href="struct.WlEncodeStats.html" title="struct pixelflux::WlEncodeStats">WlEncode<wbr>Stats</a></dt><dd>Shared capture stats: whichever thread owns the encoders counts frames/stripes and
+composes <code>desc</code> + <code>n_stripes</code> (the encoder half of the 1 s debug log line); the calloop
+log loads, prints and resets the counters.</dd><dt><a class="struct" href="struct.WlFrame.html" title="struct pixelflux::WlFrame">WlFrame</a></dt><dd>One captured host-pixel frame in flight from the calloop (render/readback) to the Wayland
+encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
+overlay animation); the IDR request travels separately via the controls atomic.</dd><dt><a class="struct" href="struct.WlFramePool.html" title="struct pixelflux::WlFramePool">WlFrame<wbr>Pool</a></dt><dd>Render-&gt;encode handoff for the Wayland readback paths, mirroring the X11 FramePool’s
+single-slot non-dropping design with one deliberate difference: the calloop thread is also
+the compositor + input dispatcher, so it must NEVER block on the pool. <code>try_begin</code> hands
+out a buffer only while the publish slot is empty, so <code>publish</code> cannot block, and a
+saturated encoder throttles capture by SKIPPING ticks (compositor damage accumulates via
+buffer age, so nothing is lost). Every published frame is encoded, in order: the H.264
+reference chain stays contiguous exactly as on X11.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.CompositionElements.html" title="enum pixelflux::CompositionElements">Composition<wbr>Elements</a></dt><dt><a class="enum" href="enum.ThreadCommand.html" title="enum pixelflux::ThreadCommand">Thread<wbr>Command</a></dt><dd>Control messages sent from the Python-facing methods to the capture thread.</dd></dl></section></div></main></body></html>
