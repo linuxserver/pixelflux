@@ -4,8 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
-manylinux-x86_64-image = "manylinux_2_34"
-manylinux-aarch64-image = "manylinux_2_34"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*t-* pp*"
 
 [tool.cibuildwheel.environment]
 LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"
@@ -16,19 +18,22 @@ before-all = """
     set -euxo pipefail
     
     # --- MANYLINUX (RPM-based) ---
+    # x264 is built from source for x264-sys (manylinux has no usable package);
+    # ffmpeg n8.1 is built plain LGPL (no --enable-libx264/--enable-gpl: only
+    # avcodec/avfilter/avutil are consumed, for h264_vaapi) — any FFmpeg
+    # 6.0..8.1 satisfies the crate, so distro packages work where they exist.
+    # libjpeg-turbo is NOT built: turbojpeg-sys vendors + statically links its
+    # own copy by default (cmake + nasm above are what it needs).
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-9.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-$(rpm -E %rhel).noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm && \
         dnf install -y \
             curl \
             clang \
             pixman-devel \
             libX11-devel \
             libXext-devel \
-            libXcursor-devel \
-            libev-devel \
-            libXcomposite-devel \
             libva-devel \
             libdrm-devel \
             libinput-devel \
@@ -41,8 +46,9 @@ before-all = """
             gcc \
             nasm \
             cmake \
-            gcc-c++ \
-            rust-toolset && \
+            gcc-c++ && \
+        \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
         \
         (cd /tmp && \
             git clone --branch stable --depth 1 https://code.videolan.org/videolan/x264.git && \
@@ -51,44 +57,24 @@ before-all = """
             make -j$(nproc) && \
             make install) && \
         \
-        if [ "$(uname -m)" = "aarch64" ]; then \
-            dnf install -y libyuv-devel; \
-        else \
-            (cd /tmp && \
-                git clone --branch stable --depth 1 https://chromium.googlesource.com/libyuv/libyuv && \
-                cd libyuv && \
-                mkdir build && cd build && \
-                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
-                make -j$(nproc) && \
-                make install); \
-        fi && \
-        \
         (cd /tmp && \
-            git clone --branch 3.1.1 --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git && \
-            cd libjpeg-turbo && \
-            mkdir build && cd build && \
-            cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release && \
-            make -j$(nproc) && \
-            make install) && \
-        \
-        (cd /tmp && \
-            git clone --branch n8.0 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
+            git clone --branch n8.1 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
             cd ffmpeg && \
             ./configure \
                 --prefix=/usr/local \
                 --enable-shared \
                 --disable-static \
-                --disable-programs \
-                --enable-gpl \
-                --enable-libx264 \
-                --extra-cflags="-I/usr/local/include" \
-                --extra-ldflags="-L/usr/local/lib" && \
+                --disable-programs && \
             make -j$(nproc) && \
             make install) && \
         \
         ldconfig
 
     # --- ALPINE (APK-based) ---
+    # NOTE: ffmpeg-dev must be 6.0..8.1 (ffmpeg-sys-next probes the system
+    # FFmpeg and supports up to the release the crate version is named after;
+    # bump the crate before targeting a newer FFmpeg). libjpeg-turbo is NOT a
+    # system dep: turbojpeg-sys builds its vendored copy (needs cmake + nasm).
     elif command -v apk; then
         apk add --no-cache \
             build-base \
@@ -96,17 +82,13 @@ before-all = """
             rust \
             cargo \
             clang20-libclang \
+            cmake \
+            nasm \
             pixman-dev \
             libx11-dev \
             libxext-dev \
-            libxcursor-dev \
             libxfixes-dev \
-            jpeg-dev \
-            libev-dev \
             x264-dev \
-            libyuv \
-            libyuv-dev \
-            libxcomposite-dev \
             libva-dev \
             libdrm-dev \
             libinput-dev \
@@ -115,7 +97,7 @@ before-all = """
             wayland-dev \
             eudev-dev \
             musl-dev \
-            ffmpeg-dev 
+            ffmpeg-dev
     else
         echo "Unsupported package manager"
         exit 1
@@ -136,7 +118,6 @@ repair-wheel-command = """
     --exclude libffi.so.6 \
     --exclude libffi.so.7 \
     --exclude libffi.so.8 \
-    --exclude libwayland-server.so.0 \
     --exclude libxkbcommon.so.0 \
     --exclude libpixman-1.so.0 \
     --exclude liblzma.so.5 \

@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 """
 A multi-client WebSocket and HTTP server for streaming screen captures.
 
@@ -16,7 +20,7 @@ import websockets.asyncio.server as ws_async
 import threading
 
 # Third-party library imports
-from pixelflux import CaptureSettings, ScreenCapture, StripeCallback
+from pixelflux import CaptureSettings, ScreenCapture, ensure_wayland_display
 
 # ==============================================================================
 # --- BASE CONFIGURATION SETTINGS ---
@@ -47,28 +51,36 @@ base_capture_settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
 base_capture_settings.use_cpu = False
 
+# --- Zero-copy frames ---
+# The native callback delivers a StripeFrame (buffer-protocol object owning the C
+# buffer). Every mode now emits its wire header natively (0x03 JPEG / 0x04 H.264),
+# so memoryview(frame) is sent with no copy or re-frame on any mode. The buffer
+# protocol pins the buffer alive across every Python version (no PEP 688).
+ZERO_COPY = True
+base_capture_settings.deferred_free = True  # ignored by the C-API; kept for parity
+
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
 # Good values are typically 18-28.
-base_capture_settings.h264_crf = 25
-# CRF for H.264 paintover on static content. Used if lower (better) than h264_crf.
-base_capture_settings.h264_paintover_crf = 18
+base_capture_settings.video_crf = 25
+# CRF for H.264 paintover on static content. Used if lower (better) than video_crf.
+base_capture_settings.video_paintover_crf = 18
 # Number of high-quality H.264 frames to send in a burst when a paintover is triggered.
-base_capture_settings.h264_paintover_burst_frames = 5
+base_capture_settings.video_paintover_burst_frames = 5
 # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
-base_capture_settings.h264_fullcolor = False
+base_capture_settings.video_fullcolor = False
 # Encode full frames instead of just changed stripes.
-base_capture_settings.h264_fullframe = False
+base_capture_settings.video_fullframe = False
 # Flag the stream to be in streaming mode to bypass all vnc logic
-base_capture_settings.h264_streaming_mode = False
-# Pass a vaapi node index 0 = renderD128, -1 to disable
-base_capture_settings.vaapi_render_node_index = -1
-# Switches to CBR mode and ignores CRF value. Used in conjunction with h264_bitrate_kbps.
-base_capture_settings.h264_cbr_mode = False
-# Target bitrate in kbps for CBR mode. Required when h264_cbr_mode is enabled.
-base_capture_settings.h264_bitrate_kbps = 4000
+base_capture_settings.video_streaming_mode = False
+# Encoder device index: -2 = auto-detect (lets AUTO_GPU pick), -1 = software encoding, 0+ = specific GPU.
+base_capture_settings.encode_node_index = -2
+# Switches to CBR mode and ignores CRF value. Used in conjunction with video_bitrate_kbps.
+base_capture_settings.video_cbr_mode = False
+# Target bitrate in kbps for CBR mode. Required when video_cbr_mode is enabled.
+base_capture_settings.video_bitrate_kbps = 4000
 # Optional VBV buffer size in kilobits for custom buffer size.
-base_capture_settings.h264_vbv_buffer_size_kb = 400
+base_capture_settings.video_vbv_multiplier = 1.5     # VBV as a multiple of one frame's bit budget (0 = auto policy).
 # Allow pixelflux to adjust its capture width and height. Overrides provided width and height when enabled.
 base_capture_settings.auto_adjust_screen_capture_size = True
 #
@@ -105,6 +117,57 @@ base_capture_settings.watermark_location_enum = 0
 base_capture_settings.recording_socket = None
 
 # ==============================================================================
+# --- ENVIRONMENT OVERRIDES (the same variables selkies accepts) ---
+# The library reads no SELKIES_* environment itself — every knob is a
+# CaptureSettings field — so this template ingests the variables explicitly,
+# with the same precedence selkies uses (SELKIES_* first, then the legacy alias).
+# ==============================================================================
+
+def _env(name, legacy=None):
+    value = os.environ.get(name)
+    if value is None and legacy:
+        value = os.environ.get(legacy)
+    return value or ""
+
+# Backend: force Wayland/X11; left unset, pixelflux follows WAYLAND_DISPLAY.
+_wayland = _env("SELKIES_WAYLAND", "PIXELFLUX_WAYLAND").lower()
+if _wayland:
+    base_capture_settings.use_wayland = _wayland in ("1", "true", "yes", "on")
+# Compositor render node: an explicit path wins over auto-GPU selection.
+_render_dri = _env("SELKIES_RENDER_DRI", "DRINODE")
+if _render_dri:
+    base_capture_settings.render_node_path = _render_dri.encode("utf-8")
+# "true" (the default) = first GPU; any other token = first GPU matching a vendor
+# name, kernel driver name, devicetree prefix, or raw PCI vendor id; "false" disables.
+base_capture_settings.auto_gpu = _env("SELKIES_AUTO_GPU", "AUTO_GPU") or "true"
+# Encoder node (VA-API/NVENC device), distinct from the render node.
+_encode_dri = _env("SELKIES_ENCODE_DRI", "DRI_NODE")
+if _encode_dri:
+    base_capture_settings.encode_node_path = _encode_dri.encode("utf-8")
+    _idx = _encode_dri.rsplit("renderD", 1)[-1]
+    if _idx.isdigit():
+        base_capture_settings.encode_node_index = int(_idx) - 128
+_recording = _env("SELKIES_RECORDING_SOCKET", "PIXELFLUX_RECORDING_SOCKET")
+if _recording:
+    base_capture_settings.recording_socket = _recording
+# Compositor cursor-theme size in pixels (Wayland backend).
+_cursor_size = _env("SELKIES_CURSOR_SIZE", "XCURSOR_SIZE")
+if _cursor_size.isdigit():
+    base_capture_settings.cursor_size = int(_cursor_size)
+
+# Wayland: bring the compositor socket up now, before the capture starts, so apps
+# launched alongside this script can already connect to WAYLAND_DISPLAY.
+if getattr(base_capture_settings, "use_wayland", False):
+    _dim = lambda name: int(os.environ.get(name) or 0) if str(os.environ.get(name) or "").isdigit() else 0
+    ensure_wayland_display(
+        width=_dim("SELKIES_MANUAL_WIDTH"),
+        height=_dim("SELKIES_MANUAL_HEIGHT"),
+        render_node=_render_dri,
+        auto_gpu=base_capture_settings.auto_gpu,
+        cursor_size=int(_cursor_size) if _cursor_size.isdigit() else -1,
+    )
+
+# ==============================================================================
 # --- Multi-Client State Management ---
 # ==============================================================================
 g_loop = None  # The main asyncio event loop.
@@ -125,9 +188,14 @@ async def send_stripes_task(websocket, queue):
         # This loop will run until the connection is closed,
         # which will raise a ConnectionClosed exception.
         while True:
-            data_to_send = await queue.get()
-            await websocket.send(data_to_send)
-            queue.task_done()
+            item = await queue.get()
+            try:
+                # item == {'data': <memoryview|bytes>, 'owner': <StripeFrame|None>}. Keeping
+                # `item` (hence the StripeFrame) referenced for the whole send keeps the C
+                # buffer alive until the send releases the view, so zero-copy is safe.
+                await websocket.send(item['data'])
+            finally:
+                queue.task_done()
 
     except websockets.exceptions.ConnectionClosed:
         # This is the expected, clean way to exit the loop when a client disconnects.
@@ -154,8 +222,8 @@ async def websocket_handler(websocket):
 
     client_module = None
     send_task = None
-    # Keep a reference to the callback object to prevent it from being garbage collected
-    c_callback = None
+    # Keep a reference to the callback to prevent it from being garbage collected
+    on_stripe = None
 
     try:
         # --- 1. Configure Capture for this Specific Client ---
@@ -175,23 +243,23 @@ async def websocket_handler(websocket):
         # --- 3. Create a unique callback (closure) for this client ---
         # This function "closes over" client_queue and g_loop, giving it access
         # without needing global lookups or user_data.
-        def client_specific_callback(result_ptr, user_data_ptr):
-            """Callback invoked by pixelflux when a new video stripe is ready."""
-            if result_ptr:
-                result = result_ptr.contents
-                if result.size > 0 and g_loop and not g_loop.is_closed():
-                    raw_data_from_cpp = bytes(result.data[:result.size])
-                    final_payload = raw_data_from_cpp
-                    
-                    if client_settings.output_mode == 0:
-                        final_payload = b"\x03\x00" + raw_data_from_cpp
-                    
-                    asyncio.run_coroutine_threadsafe(
-                        client_queue.put(final_payload), g_loop
-                    )
-        
-        # Convert the Python closure into a C-compatible function pointer
-        c_callback = StripeCallback(client_specific_callback)
+        def on_stripe(frame):
+            """Callback invoked by pixelflux with a StripeFrame per video stripe."""
+            if not (len(frame) > 0 and g_loop and not g_loop.is_closed()):
+                return
+
+            if ZERO_COPY:
+                # Zero-copy: memoryview aliases the C buffer and pins the StripeFrame
+                # alive. The queued item holds both, so the frame (hence its buffer)
+                # outlives the send until the view is released.
+                item_to_queue = {'data': memoryview(frame), 'owner': frame}
+            else:
+                # Copy fallback: the frame already carries its native wire header.
+                item_to_queue = {'data': bytes(frame), 'owner': None}
+
+            asyncio.run_coroutine_threadsafe(
+                client_queue.put(item_to_queue), g_loop
+            )
 
         # --- 4. Register and Start Resources for this Client ---
         send_task = asyncio.create_task(send_stripes_task(websocket, client_queue))
@@ -199,13 +267,13 @@ async def websocket_handler(websocket):
             "module": client_module,
             "queue": client_queue,
             "task": send_task,
-            "callback": c_callback # Store reference to prevent GC
+            "callback": on_stripe # Store reference to prevent GC
         }
 
-        # --- 5. Start the Capture with the correct 3 arguments ---
+        # --- 5. Start the Capture with the settings and callback ---
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, client_module.start_capture, client_settings, c_callback
+            None, client_module.start_capture, client_settings, on_stripe
         )
         print(f"Capture started for client {client_id}.")
 

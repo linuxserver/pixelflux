@@ -1,7 +1,7 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
 // README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
-  "name": "c++",
+  "name": "pixelflux (rust)",
   // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
   "features": {
@@ -13,11 +13,8 @@
       "vncPort": "5901"
     }
   },
-  
-  "runArgs": ["--env-file", ".devcontainer/devcontainer.env"],
 
-  // Features to add to the dev container. More info: https://containers.dev/features.
-  // "features": {},
+  "runArgs": ["--env-file", ".devcontainer/devcontainer.env"],
 
   // Use 'forwardPorts' to make a list of ports inside the container available locally.
   "forwardPorts": [6080, 5901],
@@ -29,10 +26,9 @@
   "customizations": {
     "vscode": {
       "extensions": [
-        // C++
-        "ms-vscode.cpptools",
-        "ms-vscode.cpptools-extension-pack",
-        "ms-vscode.cpptools-themes"
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
       ]
     }
   }

@@ -1,0 +1,15 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+//! Wayland backend: a headless Smithay compositor that stands in for a real display server.
+//!
+//! `frontend` owns the compositor state machine, protocol handlers, and input routing.
+//! `cursor` resolves Wayland cursor shapes to PNG images for the Python callback.
+
+/// Headless Smithay compositor, protocol handlers, and input routing.
+pub mod frontend;
+/// Wayland cursor shape to PNG resolution.
+pub mod cursor;
