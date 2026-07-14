@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.23
+        uses: pypa/cibuildwheel@v4.1.0
         env:
           CIBW_BUILD: ${{ matrix.build }}
 
