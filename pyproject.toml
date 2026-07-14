@@ -79,8 +79,6 @@ before-all = """
         apk add --no-cache \
             build-base \
             clang \
-            rust \
-            cargo \
             clang20-libclang \
             cmake \
             nasm \
@@ -97,7 +95,9 @@ before-all = """
             wayland-dev \
             eudev-dev \
             musl-dev \
-            ffmpeg-dev
+            ffmpeg-dev && \
+        \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     else
         echo "Unsupported package manager"
         exit 1
