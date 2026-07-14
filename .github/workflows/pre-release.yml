@@ -1,0 +1,90 @@
+name: Pre-Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            platform: manylinux
+            build: >-
+              cp39-manylinux_x86_64
+              cp310-manylinux_x86_64
+              cp311-manylinux_x86_64
+              cp312-manylinux_x86_64
+              cp313-manylinux_x86_64
+              cp314-manylinux_x86_64
+          - arch: x86_64
+            runner: ubuntu-latest
+            platform: musllinux
+            build: >-
+              cp39-musllinux_x86_64
+              cp310-musllinux_x86_64
+              cp311-musllinux_x86_64
+              cp312-musllinux_x86_64
+              cp313-musllinux_x86_64
+              cp314-musllinux_x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: manylinux
+            build: >-
+              cp39-manylinux_aarch64
+              cp310-manylinux_aarch64
+              cp311-manylinux_aarch64
+              cp312-manylinux_aarch64
+              cp313-manylinux_aarch64
+              cp314-manylinux_aarch64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: musllinux
+            build: >-
+              cp39-musllinux_aarch64
+              cp310-musllinux_aarch64
+              cp311-musllinux_aarch64
+              cp312-musllinux_aarch64
+              cp313-musllinux_aarch64
+              cp314-musllinux_aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Create pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sha.outputs.short }}
+          name: ${{ steps.sha.outputs.short }}
+          body: ${{ github.event.head_commit.message }}
+          prerelease: true
+          files: wheelhouse/*.whl
