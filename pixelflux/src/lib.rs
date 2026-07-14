@@ -1636,6 +1636,7 @@ fn run_wayland_thread(
         clock: Clock::new(),
         frame_counter: 0,
         pending_force_idr: false,
+        needs_full_render: true,
         use_gpu,
         video_encoder: None,
         vaapi_state: StripeState::default(),
@@ -2040,6 +2041,7 @@ fn run_wayland_thread(
                     } else {
                         state.pending_force_idr = true;
                     }
+                    state.needs_full_render = true;
                 }
                 CalloopEvent::Msg(ThreadCommand::StopCapture) => {
                     println!("[Wayland] Capture loop stopped.");
@@ -2273,6 +2275,7 @@ fn run_wayland_thread(
                     } else {
                         state.pending_force_idr = true;
                     }
+                    state.needs_full_render = true;
                 }
                 CalloopEvent::Msg(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps }) => {
                     if let Some(b) = bitrate_kbps { state.settings.video_bitrate_kbps = b; }
@@ -2414,7 +2417,7 @@ fn run_wayland_thread(
             let height = state.settings.height;
 
             if let Some(output) = state.outputs.first().cloned() {
-                let render_age = if state.overlay_state.is_animated() { 0 } else { 1 };
+                let render_age = if state.overlay_state.is_animated() || state.needs_full_render { 0 } else { 1 };
                 if state.use_gpu {
                     if let Some(renderer) = state.gles_renderer.as_mut() {
                         if let Some((_bo, dmabuf)) = state.offscreen_buffer.as_mut() {
@@ -2545,44 +2548,36 @@ fn run_wayland_thread(
                                                 damage_rects = damage.clone();
                                             }
                                             render_sync = Some(result.sync);
+                                            state.needs_full_render = false;
                                         },
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if pool_slot.is_some() {
-                                        use smithay::backend::renderer::ExportMem;
-                                        let region = Rectangle::from_size((width, height).into());
-                                        let copied = renderer
-                                            .copy_framebuffer(&frame, region, Fourcc::Abgr8888)
-                                            .and_then(|mapping| {
-                                                renderer.map_texture(&mapping).map(|slice| {
-                                                    if let Some((_, ref mut buf)) = pool_slot {
-                                                        let n = slice.len().min(buf.len());
-                                                        buf[..n].copy_from_slice(&slice[..n]);
-                                                    }
-                                                })
+                                        if let Some((_, ref mut buf)) = pool_slot {
+                                            let _ = renderer.with_context(|gl| unsafe {
+                                                gl.ReadPixels(
+                                                    0,
+                                                    0,
+                                                    width,
+                                                    height,
+                                                    smithay::backend::renderer::gles::ffi::RGBA,
+                                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                                );
                                             });
-                                        if let Err(e) = copied {
-                                            eprintln!("[Wayland] GLES readback failed: {e:?}");
-                                            if let Some((id, buf)) = pool_slot.take() {
-                                                if let Some(ref pool) = state.encode_pool {
-                                                    pool.cancel(id, buf);
-                                                }
-                                            }
                                         }
                                     } else if state.pending_screenshot.is_some() {
-                                        use smithay::backend::renderer::ExportMem;
-                                        let region = Rectangle::from_size((width, height).into());
-                                        let copied = renderer
-                                            .copy_framebuffer(&frame, region, Fourcc::Abgr8888)
-                                            .and_then(|mapping| {
-                                                renderer.map_texture(&mapping).map(|slice| {
-                                                    let n = slice.len().min(state.frame_buffer.len());
-                                                    state.frame_buffer[..n].copy_from_slice(&slice[..n]);
-                                                })
-                                            });
-                                        if let Err(e) = copied {
-                                            eprintln!("[Wayland] GLES screenshot readback failed: {e:?}");
-                                        }
+                                        let _ = renderer.with_context(|gl| unsafe {
+                                            gl.ReadPixels(
+                                                0,
+                                                0,
+                                                width,
+                                                height,
+                                                smithay::backend::renderer::gles::ffi::RGBA,
+                                                smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                                state.frame_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                                            );
+                                        });
                                     }
                                 },
                                 Err(e) => eprintln!("Failed to bind buffer: {:?}", e)
@@ -2727,10 +2722,11 @@ fn run_wayland_thread(
                                             draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
                                         }
 
-                                let render_age = if state.overlay_state.is_animated() { 0 } else { buf_age };
+                                let render_age = if state.overlay_state.is_animated() || state.needs_full_render { 0 } else { buf_age };
                                 match damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
                                     Ok(result) => {
                                         render_success = true;
+                                        state.needs_full_render = false;
                                         if let Some(damage) = result.damage { damage_rects = damage.clone(); }
                                     },
                                     Err(e) => eprintln!("Render error: {:?}", e)

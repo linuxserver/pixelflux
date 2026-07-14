@@ -279,6 +279,7 @@ pub struct AppState {
 
     pub frame_counter: u16,
     pub pending_force_idr: bool,
+    pub needs_full_render: bool,
     pub use_gpu: bool,
 
     pub video_encoder: Option<GpuEncoder>,
