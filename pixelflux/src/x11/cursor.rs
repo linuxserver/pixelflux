@@ -98,7 +98,10 @@ pub fn acquire(size_cap: i32) {
 /// An X11 capture stopped: the last one out stops and joins the monitor. Runs detached
 /// from the GIL — the thread may be blocked attaching to deliver a cursor — and the join
 /// is bounded: a thread that misses the wake (X server wedged mid-shutdown) is abandoned
-/// with a warning rather than hanging the caller; it exits on its own next event.
+/// with a warning rather than hanging the caller; it exits on its own next event. A stop
+/// issued from inside the cursor callback runs on the monitor thread itself, where a join
+/// can only time out: it signals and detaches instead, and the loop observes the stop flag
+/// once the callback unwinds.
 pub fn release(py: Python<'_>) {
     let monitor = {
         let mut slot = SLOT.lock().unwrap();
@@ -110,6 +113,11 @@ pub fn release(py: Python<'_>) {
         }
     };
     if let Some(m) = monitor {
+        if m.join.thread().id() == std::thread::current().id() {
+            m.stop.store(true, Ordering::SeqCst);
+            wake(&m.wake_win);
+            return;
+        }
         py.detach(move || {
             m.stop.store(true, Ordering::SeqCst);
             wake(&m.wake_win);
@@ -313,10 +321,11 @@ fn deliver(payload: Option<&Payload>) {
 }
 
 /// XFixes ARGB image -> callback payload: cropped to the visible bounding box (hotspot
-/// re-based to it), downscaled so the longest edge fits `cap`, and PNG-encoded. Alpha is
-/// copied through as-is: the consumers on both backends already treat the premultiplied
-/// values as straight alpha, and cursors are overwhelmingly binary-alpha, so parity beats a
-/// re-multiply. A fully transparent image is an intentional pointer hide.
+/// re-based to it), downscaled so the longest edge fits `cap`, un-premultiplied, and
+/// PNG-encoded. Scaling runs in premultiplied space — per-channel filtering is only linear
+/// there, and fully transparent texels cannot bleed dark fringes into edges — and straight
+/// alpha is produced last, since that is what PNG carries. A fully transparent image is an
+/// intentional pointer hide.
 fn cursor_to_png(img: &GetCursorImageReply, cap: i32) -> (&'static str, Vec<u8>, i32, i32) {
     let w = img.width as usize;
     let h = img.height as usize;
@@ -359,6 +368,7 @@ fn cursor_to_png(img: &GetCursorImageReply, cap: i32) -> (&'static str, Vec<u8>,
         hot_x = (hot_x as f32 * scale) as i32;
         hot_y = (hot_y as f32 * scale) as i32;
     }
+    crate::unpremultiply_rgba(&mut image);
     let mut png = Vec::new();
     match image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
         Ok(()) => ("png", png, hot_x, hot_y),
@@ -406,6 +416,22 @@ mod tests {
         assert_eq!(t, "png");
         assert!(!data.is_empty());
         assert_eq!((hx, hy), (1, 2));
+    }
+
+    /// Premultiplied color becomes straight alpha in the PNG: a half-alpha pixel stored
+    /// as ARGB (128,64,32,16) decodes to RGBA (128,64,32) at alpha 128. selkies'
+    /// `unpremultiply_rgba` (display_utils) mirrors the same integer rounding so the seed
+    /// and live paths hash a cursor to the same content handle.
+    #[test]
+    fn fractional_alpha_unpremultiplied() {
+        let (t, data, _, _) = cursor_to_png(&reply(2, 2, 0, 0, vec![0x8040_2010; 4]), 32);
+        assert_eq!(t, "png");
+        let img = image::load_from_memory(&data).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [128, 64, 32, 128]);
+        // Binary alpha passes through untouched.
+        let (_, data, _, _) = cursor_to_png(&reply(1, 1, 0, 0, vec![0xFF10_2030]), 32);
+        let img = image::load_from_memory(&data).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [0x10, 0x20, 0x30, 0xFF]);
     }
 
     /// An oversized cursor is downscaled so its longest edge fits the cap, with the

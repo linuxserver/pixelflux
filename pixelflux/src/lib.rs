@@ -3339,6 +3339,25 @@ fn live_x11() -> &'static Mutex<Vec<Arc<crate::x11::Controls>>> {
     LIVE_X11.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Convert premultiplied-alpha RGBA pixels to the straight alpha PNG expects. Every cursor
+/// source feeding the callback stores premultiplied color (XFixes and Xcursor by format
+/// definition, wl_shm/dmabuf by Wayland convention); encoding those values as straight
+/// alpha double-darkens antialiased edges. Rounds as `(c * 255 + a/2) / a`, clamped —
+/// selkies' python seed path mirrors this exact integer math so both sources hash a cursor
+/// to the same content handle.
+pub(crate) fn unpremultiply_rgba(image: &mut image::RgbaImage) {
+    for p in image.pixels_mut() {
+        let a = p.0[3] as u32;
+        if a == 0 {
+            p.0 = [0, 0, 0, 0];
+        } else if a < 255 {
+            for c in &mut p.0[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+}
+
 /// Best-effort nice boost for the calling capture/encode/delivery thread. These threads
 /// compete with the very workload being captured, so a scheduling edge keeps frame pacing
 /// steady under load. Requires CAP_SYS_NICE (or root); otherwise EPERM and silently a no-op.

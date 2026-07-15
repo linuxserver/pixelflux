@@ -726,11 +726,13 @@ impl AppState {
     ///    - **SHM**: hash only the sprite's sub-region — width/height/stride/offset/format plus the
     ///      pixel span — because many sprites share one pool and differ only by `offset`, so hashing
     ///      the whole pool would collide. On a cache miss (and only when ≤128×128) convert the
-    ///      BGRA/XRGB pixels to RGBA and PNG-encode; `Xrgb8888` has no alpha so byte 3 is forced
-    ///      opaque, and stride/offset are clamped non-negative with checked arithmetic so a garbage
-    ///      descriptor skips pixels instead of panicking.
+    ///      BGRA/XRGB pixels to RGBA, un-premultiply (wl_shm cursor content is premultiplied by
+    ///      convention; PNG carries straight alpha), and PNG-encode; `Xrgb8888` has no alpha so
+    ///      byte 3 is forced opaque, and stride/offset are clamped non-negative with checked
+    ///      arithmetic so a garbage descriptor skips pixels instead of panicking.
     ///    - **dmabuf** (`NotManaged`): bind it to the GLES renderer, copy the framebuffer to
-    ///      `Abgr8888`, map it back, and PNG-encode using the derived readback stride.
+    ///      `Abgr8888`, map it back, un-premultiply, and PNG-encode using the derived readback
+    ///      stride.
     ///    The PNG cache is bounded at 100 entries by arbitrary eviction; content-hashing means an
     ///    evicted sprite simply re-inserts on the next render.
     ///
@@ -851,6 +853,7 @@ impl AppState {
                                             }
                                         }
 
+                                        crate::unpremultiply_rgba(&mut img_buf);
                                         let mut bytes = Vec::new();
                                         if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
                                             self.cursor_cache.insert(hash, bytes.clone());
@@ -919,6 +922,7 @@ impl AppState {
                                                  }
                                              }
 
+                                             crate::unpremultiply_rgba(&mut img_buf);
                                              let mut bytes = Vec::new();
                                              if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
                                                  self.cursor_cache.insert(hash, bytes.clone());
