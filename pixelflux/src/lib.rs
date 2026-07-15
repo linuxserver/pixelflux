@@ -2553,18 +2553,20 @@ fn run_wayland_thread(
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
                                     if pool_slot.is_some() {
-                                        if let Some((_, ref mut buf)) = pool_slot {
-                                            let _ = renderer.with_context(|gl| unsafe {
-                                                gl.ReadPixels(
-                                                    0,
-                                                    0,
-                                                    width,
-                                                    height,
-                                                    smithay::backend::renderer::gles::ffi::RGBA,
-                                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
-                                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                                                );
-                                            });
+                                        if !damage_rects.is_empty() {
+                                            if let Some((_, ref mut buf)) = pool_slot {
+                                                let _ = renderer.with_context(|gl| unsafe {
+                                                    gl.ReadPixels(
+                                                        0,
+                                                        0,
+                                                        width,
+                                                        height,
+                                                        smithay::backend::renderer::gles::ffi::RGBA,
+                                                        smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                                    );
+                                                });
+                                            }
                                         }
                                     } else if state.pending_screenshot.is_some() {
                                         let _ = renderer.with_context(|gl| unsafe {
