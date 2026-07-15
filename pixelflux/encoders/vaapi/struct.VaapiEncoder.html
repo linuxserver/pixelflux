@@ -17,7 +17,7 @@ lands every input as GPU NV12.</li>
 so <code>reconfigure_rate</code> re-opens the codec only when a value actually changes. <code>recording_sink</code> is
 the optional Unix-socket H.264 fan-out; <code>omit_stripe_headers</code> drops the 10-byte framing when the
 consumer wants a bare Annex-B stream.</p>
-</div></details><h2 id="implementations" class="section-header">Implementations<a href="#implementations" class="anchor">§</a></h2><div id="implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-VaapiEncoder" class="impl"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#234-1115">Source</a><a href="#impl-VaapiEncoder" class="anchor">§</a><h3 class="code-header">impl <a class="struct" href="struct.VaapiEncoder.html" title="struct pixelflux::encoders::vaapi::VaapiEncoder">VaapiEncoder</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.new" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#238-243">Source</a><h4 class="code-header">pub fn <a href="#method.new" class="fn">new</a>(
+</div></details><h2 id="implementations" class="section-header">Implementations<a href="#implementations" class="anchor">§</a></h2><div id="implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-VaapiEncoder" class="impl"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#234-1107">Source</a><a href="#impl-VaapiEncoder" class="anchor">§</a><h3 class="code-header">impl <a class="struct" href="struct.VaapiEncoder.html" title="struct pixelflux::encoders::vaapi::VaapiEncoder">VaapiEncoder</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.new" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#238-243">Source</a><h4 class="code-header">pub fn <a href="#method.new" class="fn">new</a>(
     settings: &amp;<a class="struct" href="../../struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">RustCaptureSettings</a>,
     recording_sink: <a class="enum" href="https://doc.rust-lang.org/1.97.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;<a class="struct" href="../../recording_sink/struct.RecordingSink.html" title="struct pixelflux::recording_sink::RecordingSink">RecordingSink</a>&gt;&gt;,
 ) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.0/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;Self, <a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</h4></section></summary><div class="docblock"><p>Build a VA-API encoder for the Wayland <strong>dmabuf</strong> path — the source is a DRM-PRIME
@@ -30,7 +30,7 @@ dmabuf that the filter graph <code>hwmap</code>s onto a VA surface. Thin wrapper
 that the filter graph <code>hwupload</code>s onto a VA surface. Thin wrapper over <code>new_impl</code> with
 <code>host_input = true</code>; the GPU still does the ARGB→NV12 convert, so there is no CPU colorspace
 conversion.</p>
-</div></details><details class="toggle method-toggle" open><summary><section id="method.reconfigure_rate" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#782-806">Source</a><h4 class="code-header">pub fn <a href="#method.reconfigure_rate" class="fn">reconfigure_rate</a>(&amp;mut self, settings: &amp;<a class="struct" href="../../struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">RustCaptureSettings</a>)</h4></section></summary><div class="docblock"><p>Stays cheap enough for the pipeline to call on every single frame by re-opening the
+</div></details><details class="toggle method-toggle" open><summary><section id="method.reconfigure_rate" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#774-798">Source</a><h4 class="code-header">pub fn <a href="#method.reconfigure_rate" class="fn">reconfigure_rate</a>(&amp;mut self, settings: &amp;<a class="struct" href="../../struct.RustCaptureSettings.html" title="struct pixelflux::RustCaptureSettings">RustCaptureSettings</a>)</h4></section></summary><div class="docblock"><p>Stays cheap enough for the pipeline to call on every single frame by re-opening the
 codec only when a rate-control or framerate setting has actually changed — an unconditional
 re-open here would force a needless IDR every frame and cripple the stream.</p>
 <p>The change test is deliberately narrow, to keep that guard tight: in CBR, a different target
@@ -38,7 +38,7 @@ bitrate or VBV multiplier; in any mode, a different target fps. When nothing cha
 without touching the codec. On a real change it caches the new fps / bitrate / VBV / keyframe
 interval and calls <code>reopen_codec</code> carrying the <strong>current</strong> QP, so a CQP stream keeps its
 quantizer across the change.</p>
-</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_dmabuf" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#868-973">Source</a><h4 class="code-header">pub fn <a href="#method.encode_dmabuf" class="fn">encode_dmabuf</a>(
+</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_dmabuf" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#860-965">Source</a><h4 class="code-header">pub fn <a href="#method.encode_dmabuf" class="fn">encode_dmabuf</a>(
     &amp;mut self,
     dmabuf: &amp;Dmabuf,
     frame_number: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u64.html">u64</a>,
@@ -65,7 +65,7 @@ double-close.</li>
 <li><strong>Collect</strong>: pull each converted frame from the sink, stamp <code>pict_type = I</code> when
 <code>force_idr</code>, send it to the encoder, and drain packets via <code>collect_packet</code>.</li>
 </ol>
-</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_host_argb" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#985-1044">Source</a><h4 class="code-header">pub fn <a href="#method.encode_host_argb" class="fn">encode_host_argb</a>(
+</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_host_argb" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#977-1036">Source</a><h4 class="code-header">pub fn <a href="#method.encode_host_argb" class="fn">encode_host_argb</a>(
     &amp;mut self,
     bgra: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u8.html">u8</a>],
     stride: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.usize.html">usize</a>,
@@ -81,7 +81,7 @@ GPU-uploadable frame, clamped to <code>min(width*4, stride, dst_stride)</code> p
 colorspace conversion); feed the graph, where <code>hwupload</code> stages it onto a VA surface and
 <code>scale_vaapi</code> converts ARGB→NV12; then pull converted frames, stamp <code>pict_type = I</code> when
 <code>force_idr</code>, encode, and drain packets via <code>collect_packet</code>.</p>
-</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_raw" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#1056-1114">Source</a><h4 class="code-header">pub fn <a href="#method.encode_raw" class="fn">encode_raw</a>(
+</div></details><details class="toggle method-toggle" open><summary><section id="method.encode_raw" class="method"><a class="src rightside" href="../../../src/pixelflux/encoders/vaapi.rs.html#1048-1106">Source</a><h4 class="code-header">pub fn <a href="#method.encode_raw" class="fn">encode_raw</a>(
     &amp;mut self,
     nv12_pixels: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u8.html">u8</a>],
     frame_number: <a class="primitive" href="https://doc.rust-lang.org/1.97.0/std/primitive.u64.html">u64</a>,
