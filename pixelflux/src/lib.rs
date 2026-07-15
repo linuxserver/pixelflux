@@ -1659,6 +1659,8 @@ fn run_wayland_thread(
         encode_stats: Arc::new(WlEncodeStats::new()),
         pool_last_render: Vec::new(),
         render_seq: 0,
+        pool_content_gen: Vec::new(),
+        content_gen: 0,
         pending_screenshot: None,
     };
 
@@ -1986,6 +1988,10 @@ fn run_wayland_thread(
                             ));
                             state.pool_last_render = vec![0; WL_POOL_SURFACES];
                             state.render_seq = 0;
+                            // u64::MAX marks every slot stale so each one is read back
+                            // before its first publish, whatever the damage says.
+                            state.pool_content_gen = vec![u64::MAX; WL_POOL_SURFACES];
+                            state.content_gen = 0;
                             let c = &state.encode_controls;
                             c.bitrate_kbps.store(settings.video_bitrate_kbps, Ordering::Relaxed);
                             c.vbv_mult_milli.store(
@@ -2552,21 +2558,30 @@ fn run_wayland_thread(
                                         },
                                         Err(e) => eprintln!("Render error: {:?}", e)
                                     }
-                                    if pool_slot.is_some() {
-                                        if !damage_rects.is_empty() {
-                                            if let Some((_, ref mut buf)) = pool_slot {
-                                                let _ = renderer.with_context(|gl| unsafe {
-                                                    gl.ReadPixels(
-                                                        0,
-                                                        0,
-                                                        width,
-                                                        height,
-                                                        smithay::backend::renderer::gles::ffi::RGBA,
-                                                        smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
-                                                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                                                    );
-                                                });
-                                            }
+                                    if !damage_rects.is_empty() {
+                                        state.content_gen += 1;
+                                    }
+                                    if let Some((id, ref mut buf)) = pool_slot {
+                                        // No-damage ticks skip the readback, so a pooled
+                                        // buffer can lag the offscreen target whenever the
+                                        // encoder held the other slot across a tick. Publishing
+                                        // a lagging buffer would let a paint-over / burst /
+                                        // recovery send re-encode pre-damage pixels; one
+                                        // catch-up readback keeps every published buffer
+                                        // current while idle readbacks stay skipped.
+                                        if render_success && state.pool_content_gen[id] != state.content_gen {
+                                            let _ = renderer.with_context(|gl| unsafe {
+                                                gl.ReadPixels(
+                                                    0,
+                                                    0,
+                                                    width,
+                                                    height,
+                                                    smithay::backend::renderer::gles::ffi::RGBA,
+                                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                                );
+                                            });
+                                            state.pool_content_gen[id] = state.content_gen;
                                         }
                                     } else if state.pending_screenshot.is_some() {
                                         let _ = renderer.with_context(|gl| unsafe {

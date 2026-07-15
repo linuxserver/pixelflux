@@ -641,11 +641,15 @@ pub struct EncodedStripe {
 ///    below that the per-stripe encoder and thread overhead outweighs the parallelism and the tiny
 ///    H.264 slices compress poorly. The persistent `stripes` vector is resized to match, preserving
 ///    per-stripe state across frames.
-/// 2. **Dirty map**: with external compositor damage (`hash_damage == false`) each `damage_rects`
+/// 2. **Idle fast path**: a frame on which no stripe can emit anything (no damage / clean
+///    hashes, no paint-over due, no burst, no recovery IDR, not streaming) only advances the
+///    per-stripe no-motion bookkeeping inline and returns without dispatching the stripe
+///    fan-out, so a static capture never wakes the rayon pool.
+/// 3. **Dirty map**: with external compositor damage (`hash_damage == false`) each `damage_rects`
 ///    rectangle marks every stripe whose row range it overlaps. With `hash_damage == true` (X11,
 ///    which has no compositor damage) per-stripe content hashing drives dirtiness instead — except
 ///    in streaming H.264, where every stripe is sent unconditionally so the hash is skipped.
-/// 3. **Per-stripe decision** (in `stripe_body`): a stripe is sent when it is dirty, when a
+/// 4. **Per-stripe decision** (in `stripe_body`): a stripe is sent when it is dirty, when a
 ///    paint-over / recovery burst is in flight, when streaming mode is on, or when `force_idr_all`
 ///    is set. Quality is chosen per case — base JPEG quality / base CRF for live content, the
 ///    paint-over quality/CRF after `paint_over_trigger_frames` static frames (once per still region,
@@ -653,14 +657,14 @@ pub struct EncodedStripe {
 ///    enabled and actually lower, else the base CRF, since a recovery burst still needs to stream so
 ///    CBR can refine it). A newly dirty frame cancels any pending burst or paint-over and reverts to
 ///    base quality.
-/// 4. **Recovery IDR** (`force_idr_all`): forces a send on every stripe even when static so a
+/// 5. **Recovery IDR** (`force_idr_all`): forces a send on every stripe even when static so a
 ///    reconnecting client can resume. For H.264 it forces an IDR and arms a short streaming burst
 ///    (unless one is already pending, so it cannot preempt an in-flight burst) because the keyframe
 ///    is base-quality — worsened further by CBR — and a damage-gated static stream would otherwise
 ///    never refine it; for JPEG, where every stripe is already intra, it resends a
 ///    previously-painted-over stripe at the paint-over quality already on screen so a joining viewer
 ///    does not see a downgrade.
-/// 5. **Encoding**:
+/// 6. **Encoding**:
 ///    - **JPEG** (`output_mode 0`): source byte order is RGBA on the GPU readback path and BGRA on
 ///      X11; each worker thread reuses its thread-local TurboJPEG compressor. Header-less output
 ///      hands the compressed buffer straight through; otherwise a 6-byte stripe header (`0x03` tag,
@@ -672,7 +676,7 @@ pub struct EncodedStripe {
 ///      rather than encoding garbage), and an 8-byte fixed header (frame number, y-start, width,
 ///      height) is emitted. The live CBR VBV budget is recomputed here from the bitrate/fps so it
 ///      rescales with live changes.
-/// 6. **Dispatch**: a single full-frame stripe runs inline (sequential — empirically faster than a
+/// 7. **Dispatch**: a single full-frame stripe runs inline (sequential — empirically faster than a
 ///    one-element rayon job) with a single-band colour conversion and the same thread policy as the
 ///    OpenH264 encoder — one fewer than the available cores, clamped to `[1, 4]`. The slice threads
 ///    keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
@@ -714,6 +718,63 @@ pub fn encode_cpu(
 
     let stripe_geometries =
         compute_stripe_geometries(height as usize, n_processing_stripes, settings.output_mode);
+
+    // Idle fast path: a static frame must still advance every stripe's paint-over countdown,
+    // but nothing else — so when no stripe can emit anything this frame, do that bookkeeping
+    // inline and return before the rayon fan-out. Waking the whole worker pool 60x/s for
+    // no-op stripes is the dominant idle cost (tens of percent of a core), dwarfing the real
+    // per-frame work. "Static" is known up front for damage-authoritative sources (Wayland:
+    // empty damage list); hash-damage sources (X11) instead take a sequential early-exit
+    // hash scan, probing the most-recently-dirty stripe first so live content bails out
+    // after a single stripe hash. A clean scan performs exactly the state transitions
+    // `content_dirty` would (hash unchanged, change streak reset), so the damage-block
+    // machinery observes no difference.
+    let idle_candidate = damage_rects.is_empty()
+        && !force_idr_all
+        && !(settings.output_mode == 1 && settings.video_streaming_mode);
+    if idle_candidate {
+        let paint_over_armed = settings.use_paint_over_quality
+            && if settings.output_mode == 0 {
+                settings.paint_over_jpeg_quality > settings.jpeg_quality
+            } else {
+                settings.video_paintover_crf < settings.video_crf
+            };
+        let no_pending_send = |st: &StripeState| {
+            (settings.output_mode == 0 || st.h264_burst_frames_remaining <= 0)
+                && (!paint_over_armed
+                    || st.paint_over_sent
+                    || st.no_motion_frame_count.saturating_add(1)
+                        < settings.paint_over_trigger_frames)
+        };
+        let quiescent = if !hash_damage {
+            stripes.iter().all(no_pending_send)
+        } else {
+            let width_bytes = width as usize * 4;
+            let hint = stripes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, st)| st.no_motion_frame_count)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let clean = |i: usize| {
+                let st = &stripes[i];
+                if !no_pending_send(st) || st.in_damage_block {
+                    return false;
+                }
+                let (y, h) = stripe_geometries[i];
+                let bytes = &raw_pixels[y * width_bytes..(y + h) * width_bytes];
+                fast_hash(bytes) == st.last_hash
+            };
+            clean(hint) && (0..stripes.len()).filter(|&i| i != hint).all(clean)
+        };
+        if quiescent {
+            for st in stripes.iter_mut() {
+                st.no_motion_frame_count = st.no_motion_frame_count.saturating_add(1);
+                st.consecutive_changes = 0;
+            }
+            return Vec::new();
+        }
+    }
     let mut stripe_is_dirty = vec![false; n_processing_stripes];
     if !damage_rects.is_empty() {
         for rect in damage_rects {
@@ -1063,6 +1124,98 @@ mod tests {
         assert!(st.content_dirty(&a, 2, 3));
         assert!(!st.in_damage_block);
         assert!(!st.content_dirty(&a, 2, 3));
+    }
+
+    /// With compositor damage as the authority (Wayland), a clean frame must still advance the
+    /// paint-over countdown and fire the repaint at the trigger, and once every stripe has
+    /// latched (`paint_over_sent`) further clean frames must produce nothing — that quiescent
+    /// tail is the idle fast path, which skips the stripe fan-out entirely.
+    #[test]
+    fn clean_frames_countdown_fire_paintover_then_go_quiescent() {
+        use crate::RustCaptureSettings;
+        let (w, h) = (64, 128);
+        let pixels = vec![128u8; (w * h * 4) as usize];
+        let settings = RustCaptureSettings {
+            width: w,
+            height: h,
+            output_mode: 0,
+            jpeg_quality: 60,
+            paint_over_jpeg_quality: 90,
+            use_paint_over_quality: true,
+            paint_over_trigger_frames: 5,
+            ..Default::default()
+        };
+        let mut stripes = Vec::new();
+        let full = [smithay::utils::Rectangle::new(
+            (0, 0).into(),
+            (w, h).into(),
+        )];
+        let dirty = super::encode_cpu(
+            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, None, false,
+        );
+        assert!(!dirty.is_empty(), "damaged frame must encode");
+
+        let mut fired_at = None;
+        for frame in 1..=20u16 {
+            let out = super::encode_cpu(
+                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, None, false,
+            );
+            if !out.is_empty() {
+                assert!(fired_at.is_none(), "paint-over must fire exactly once");
+                fired_at = Some(frame);
+            }
+        }
+        assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
+        assert!(
+            stripes.iter().all(|st| st.paint_over_sent),
+            "all stripes latched after the repaint"
+        );
+    }
+
+    /// Hash-damage sources (X11) take the sequential-scan fast path: static frames advance
+    /// the countdown and fire the paint-over exactly once, the quiescent tail emits nothing,
+    /// and a subsequent content change is still detected and encoded (streak state reset by
+    /// the fast path must not swallow the wake-up).
+    #[test]
+    fn hash_scan_idles_after_paintover_and_wakes_on_change() {
+        use crate::RustCaptureSettings;
+        let (w, h) = (64, 128);
+        let static_px = vec![128u8; (w * h * 4) as usize];
+        let changed_px = vec![200u8; (w * h * 4) as usize];
+        let settings = RustCaptureSettings {
+            width: w,
+            height: h,
+            output_mode: 0,
+            jpeg_quality: 60,
+            paint_over_jpeg_quality: 90,
+            use_paint_over_quality: true,
+            paint_over_trigger_frames: 5,
+            damage_block_threshold: 10,
+            damage_block_duration: 10,
+            ..Default::default()
+        };
+        let mut stripes = Vec::new();
+        let first = super::encode_cpu(
+            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, None, false,
+        );
+        assert!(!first.is_empty(), "first frame hashes as changed and encodes");
+
+        let mut fired_at = None;
+        for frame in 1..=20u16 {
+            let out = super::encode_cpu(
+                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, None, false,
+            );
+            if !out.is_empty() {
+                assert!(fired_at.is_none(), "paint-over must fire exactly once while static");
+                fired_at = Some(frame);
+            }
+        }
+        assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
+
+        let woke = super::encode_cpu(
+            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, None, false,
+        );
+        assert!(!woke.is_empty(), "content change after idle must encode");
     }
 
     /// Total rows covered by a geometry — the sum of all stripe heights.

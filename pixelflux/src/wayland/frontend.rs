@@ -214,6 +214,11 @@ pub enum GpuEncoder {
 ///    - **`pool_last_render` / `render_seq`**: buffer-age bookkeeping for the pixman path, which
 ///      renders directly into the pooled buffers (an age is "renders since this slot was last the
 ///      target"). The GLES path renders into one fixed offscreen buffer and never consults these.
+///    - **`pool_content_gen` / `content_gen`**: staleness bookkeeping for the GLES readback path,
+///      which skips the GPU readback on no-damage ticks. `content_gen` advances whenever a render
+///      reports damage; a pooled buffer whose stamp lags it holds pre-damage pixels and must be
+///      read back once before publishing, so the encoder's paint-over / burst / recovery sends
+///      never ship stale content.
 ///
 /// 2. **Delivery** (`deliver_tx` / `deliver_join`): encoded frames go to a dedicated delivery
 ///    thread over a capacity-1 rendezvous channel, mirroring the X11 single-slot FramePool
@@ -318,6 +323,8 @@ pub struct AppState {
     pub encode_stats: Arc<crate::WlEncodeStats>,
     pub pool_last_render: Vec<u64>,
     pub render_seq: u64,
+    pub pool_content_gen: Vec<u64>,
+    pub content_gen: u64,
     pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
