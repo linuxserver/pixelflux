@@ -39,6 +39,8 @@ use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
+pub mod cursor;
+
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
 /// payloads) the owning `ScreenCapture` pyclass flips from the Python thread and the capture thread
 /// reads at the top of each iteration.

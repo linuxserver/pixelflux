@@ -25,7 +25,7 @@
 //! |--------|---------|
 //! | [`encoders`] | Encoder backends: software x264/JPEG, OpenH264, NVENC, VA-API, watermark overlay |
 //! | [`wayland`] | Headless Smithay compositor, cursor rendering |
-//! | [`x11`] | X11/XShm capture loop and stripe dispatch |
+//! | [`x11`] | X11/XShm capture loop, XFixes out-of-band cursor monitor, and stripe dispatch |
 //! | [`pipeline`] | Frame-processing policy shared by both backends (send/QP/keyframe decisions) |
 //! | [`recording_sink`] | Unix-socket H.264 fan-out for external recording |
 //! | [`computer_use`] | HTTP API for AI-agent desktop control (screenshots, input injection) |
@@ -293,6 +293,9 @@ pub struct RustCaptureSettings {
     pub video_fullframe: bool,
     pub video_streaming_mode: bool,
     pub capture_cursor: bool,
+    /// Longest cursor edge the out-of-band cursor callback delivers; larger images are
+    /// downscaled (`<= 0` = uncapped). Compositing via `capture_cursor` is unaffected.
+    pub cursor_size_cap: i32,
     pub watermark_path: String,
     pub watermark_location_enum: i32,
     pub encode_node_index: i32,
@@ -395,6 +398,7 @@ impl Default for RustCaptureSettings {
             video_fullframe: false,
             video_streaming_mode: false,
             capture_cursor: false,
+            cursor_size_cap: 32,
             watermark_path: String::new(),
             watermark_location_enum: 0,
             encode_node_index: -2,
@@ -468,6 +472,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         video_fullframe: settings.getattr("video_fullframe")?.extract()?,
         video_streaming_mode: settings.getattr("video_streaming_mode")?.extract()?,
         capture_cursor: settings.getattr("capture_cursor")?.extract()?,
+        cursor_size_cap: settings
+            .getattr("cursor_size_cap")
+            .ok()
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(32),
         watermark_path,
         watermark_location_enum: settings.getattr("watermark_location_enum")?.extract()?,
         encode_node_index: settings.getattr("encode_node_index")?.extract()?,
@@ -3270,6 +3279,9 @@ struct CaptureSettings {
     #[pyo3(get, set)] recording_socket: Py<PyAny>,
     /// Compositor cursor-theme size in pixels; <=0 keeps the theme default (24).
     #[pyo3(get, set)] cursor_size: i32,
+    /// Longest cursor edge the X11 out-of-band cursor callback delivers; larger
+    /// images are downscaled. <=0 disables the cap.
+    #[pyo3(get, set)] cursor_size_cap: i32,
 }
 
 #[pymethods]
@@ -3291,7 +3303,7 @@ impl CaptureSettings {
             auto_adjust_screen_capture_size: false, omit_stripe_headers: false,
             deferred_free: false, encode_node_path: py.None(),
             render_node_path: py.None(), auto_gpu: py.None(), use_wayland: py.None(),
-            recording_socket: py.None(), cursor_size: -1,
+            recording_socket: py.None(), cursor_size: -1, cursor_size_cap: 32,
         }
     }
 }
@@ -3512,6 +3524,9 @@ impl ScreenCapture {
         if let Some(c) = &controls {
             live_x11().lock().unwrap().retain(|x| !Arc::ptr_eq(x, c));
         }
+        if backend == 1 {
+            crate::x11::cursor::release(py);
+        }
         if backend == 2 {
             if WAYLAND_OWNER
                 .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -3655,6 +3670,7 @@ impl ScreenCapture {
         );
 
         let controls = Arc::new(crate::x11::Controls::new(&rs));
+        let cursor_cap = rs.cursor_size_cap;
         live_x11().lock().unwrap().push(controls.clone());
         let c2 = controls.clone();
         let c3 = controls.clone();
@@ -3755,6 +3771,8 @@ impl ScreenCapture {
         st.encode_tid_rx = late_etid_rx;
         st.deliver_handle = Some(deliver_handle);
         st.deliver_thread_id = Some(deliver_thread_id);
+        drop(st);
+        crate::x11::cursor::acquire(cursor_cap);
         Ok(())
     }
 
@@ -3862,6 +3880,7 @@ impl ScreenCapture {
                     *c.tunables.lock().unwrap() = Some(t);
                     c.tunables_dirty.store(true, Ordering::Release);
                 }
+                crate::x11::cursor::set_size_cap(rs.cursor_size_cap);
             }
             2 => wayland_update_tunables(py, t),
             _ => {}
@@ -3924,15 +3943,30 @@ impl ScreenCapture {
     fn inject_mouse_scroll(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_scroll(x, y))
     }
+    /// Toggle compositing the cursor into captured frames (the alternative to the
+    /// out-of-band cursor callback): the X11 grab re-reads the flag per frame, Wayland
+    /// forwards to the compositor.
     fn set_cursor_rendering(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+        let (backend, controls) = {
+            let st = self.inner.lock().unwrap();
+            (st.backend, st.controls.clone())
+        };
+        if backend == 1 {
+            if let Some(c) = &controls {
+                c.capture_cursor.store(enabled, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_cursor_rendering(enabled))
     }
-    /// Register the client-copy cursor callback, or stash it until the backend exists.
-    ///
-    /// The backend slot lock is held across the check so a concurrent backend creation cannot miss
-    /// the stash; before the backend exists the callback is stored in `PENDING_CURSOR_CALLBACK` and
-    /// applied by `ensure_wayland_backend` at creation.
+    /// Register the client-copy cursor callback for whichever backend runs: the X11 cursor
+    /// monitor reads it from its shared slot (re-delivering the current cursor to a late
+    /// registration), and the Wayland backend takes it directly — or stashes it in
+    /// `PENDING_CURSOR_CALLBACK`, applied by `ensure_wayland_backend` at creation; the
+    /// backend slot lock is held across the check so a concurrent creation cannot miss the
+    /// stash.
     fn set_cursor_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        crate::x11::cursor::set_callback(callback.clone_ref(py));
         let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
         let g = slot.lock().unwrap();
         match g.as_ref() {
@@ -4004,14 +4038,16 @@ fn ensure_wayland_display(
 /// Stop every live capture (registered with atexit) before interpreter finalization.
 ///
 /// The interpreter-teardown gate is set first so no detached thread may attach to a finalizing
-/// interpreter, and a never-applied cursor stash is dropped while the GIL is held. Every X11
-/// capture's stop flag is set, and a live Wayland capture is stopped over the command channel (the
-/// compositor thread clears its callback and encoder on `StopCapture`). A brief grace sleep lets
-/// the stops be observed before Python finalizes.
+/// interpreter, and the cursor callbacks (the X11 monitor's and a never-applied Wayland stash)
+/// are dropped while the GIL is held. Every X11 capture's stop flag is set, and a live Wayland
+/// capture is stopped over the command channel (the compositor thread clears its callback and
+/// encoder on `StopCapture`). A brief grace sleep lets the stops be observed before Python
+/// finalizes.
 #[pyfunction]
 fn _stop_all_captures(py: Python<'_>) {
     PY_SHUTDOWN.store(true, Ordering::Relaxed);
     *PENDING_CURSOR_CALLBACK.lock().unwrap() = None;
+    crate::x11::cursor::shutdown();
     if let Some(slot) = LIVE_X11.get() {
         for c in slot.lock().unwrap().iter() {
             c.stop.store(true, Ordering::Relaxed);
@@ -4035,6 +4071,8 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StripeFrame>()?;
     m.add_class::<CaptureSettings>()?;
     m.add_class::<ScreenCapture>()?;
+    // Feature probe for consumers: this build delivers X11 cursors via set_cursor_callback.
+    m.add("X11_CURSOR_CALLBACK", true)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
