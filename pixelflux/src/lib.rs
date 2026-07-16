@@ -496,6 +496,9 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .getattr("recording_socket")
             .ok()
             .and_then(|v| v.extract::<String>().ok())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("PIXELFLUX_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("SELKIES_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
             .unwrap_or_default(),
         omit_stripe_headers: settings
             .getattr("omit_stripe_headers")
