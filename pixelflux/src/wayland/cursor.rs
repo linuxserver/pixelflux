@@ -75,15 +75,18 @@ impl Cursor {
     }
 
     /// A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
+    /// Xcursor stores premultiplied color; the PNG carries straight alpha. The
+    /// compositing paths (`get_image*`) keep the premultiplied pixels blending needs.
     pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
 
-        let img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
+        let mut img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
             image_data.width,
             image_data.height,
             image_data.pixels_rgba.clone(),
         )?;
+        crate::unpremultiply_rgba(&mut img_buf);
 
         let mut bytes: Vec<u8> = Vec::new();
         let mut cursor = IoCursor::new(&mut bytes);
