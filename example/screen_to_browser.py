@@ -57,7 +57,6 @@ base_capture_settings.use_cpu = False
 # so memoryview(frame) is sent with no copy or re-frame on any mode. The buffer
 # protocol pins the buffer alive across every Python version (no PEP 688).
 ZERO_COPY = True
-base_capture_settings.deferred_free = True  # ignored by the C-API; kept for parity
 
 # --- H.264 Quality Settings ---
 # Constant Rate Factor (0-51, lower is better quality & higher bitrate).
@@ -270,10 +269,10 @@ async def websocket_handler(websocket):
             "callback": on_stripe # Store reference to prevent GC
         }
 
-        # --- 5. Start the Capture with the settings and callback ---
+        # --- 5. Start the Capture with the callback and settings ---
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, client_module.start_capture, client_settings, on_stripe
+            None, client_module.start_capture, on_stripe, client_settings
         )
         print(f"Capture started for client {client_id}.")
 

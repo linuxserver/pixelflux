@@ -3263,9 +3263,6 @@ struct CaptureSettings {
     #[pyo3(get, set)] video_max_qp: i32,
     #[pyo3(get, set)] auto_adjust_screen_capture_size: bool,
     #[pyo3(get, set)] omit_stripe_headers: bool,
-    /// Informational: frames always own their buffers and free on last reference;
-    /// consumers set this to signal they hold frames past the callback (zero-copy send).
-    #[pyo3(get, set)] deferred_free: bool,
     #[pyo3(get, set)] encode_node_path: Py<PyAny>,
     /// Compositor render node (Wayland): an explicit path wins; empty with auto_gpu
     /// set lets the library pick one; empty without falls back to the encoder node.
@@ -3301,7 +3298,7 @@ impl CaptureSettings {
             keyframe_interval_s: 0.0,
             video_min_qp: 0, video_max_qp: 0,
             auto_adjust_screen_capture_size: false, omit_stripe_headers: false,
-            deferred_free: false, encode_node_path: py.None(),
+            encode_node_path: py.None(),
             render_node_path: py.None(), auto_gpu: py.None(), use_wayland: py.None(),
             recording_socket: py.None(), cursor_size: -1, cursor_size_cap: 32,
         }
@@ -3613,8 +3610,8 @@ impl ScreenCapture {
     fn start_capture(
         &self,
         py: Python<'_>,
-        settings: &Bound<'_, PyAny>,
         callback: Py<PyAny>,
+        settings: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let live_wayland_restart = want_wayland(settings)
             && self.inner.lock().unwrap().backend == 2
