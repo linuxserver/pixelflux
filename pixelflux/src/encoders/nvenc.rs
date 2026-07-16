@@ -27,7 +27,6 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
-use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -409,7 +408,7 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
 /// with a `0` length recording a failed registration so that address is never re-pinned.
 /// `current_qp` tracks the live ConstQP so a paint-over reconfigure is skipped when unchanged.
 /// `encode_config` and `init_params` are retained so in-place reconfigure can resubmit them.
-/// `recording_sink` is the optional H.264 fan-out, `omit_stripe_headers` drops the 10-byte wire
+/// `omit_stripe_headers` drops the 10-byte wire
 /// header, and `node_index` is the effective CUDA device this session is bound to — a reuse across
 /// captures that now targets a different device must rebuild rather than reconfigure.
 pub struct NvencEncoder {
@@ -437,7 +436,6 @@ pub struct NvencEncoder {
     egl: Arc<EglFunctions>,
     _nvenc_lib: Arc<NvencLibrary>,
     nvenc_funcs: NV_ENCODE_API_FUNCTION_LIST,
-    recording_sink: Option<Arc<RecordingSink>>,
     omit_stripe_headers: bool,
     node_index: i32,
 }
@@ -769,7 +767,6 @@ impl NvencEncoder {
     pub fn new(
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
-        recording_sink: Option<Arc<RecordingSink>>,
     ) -> Result<Self, String> {
         println!("[NVENC] Initializing...");
 
@@ -1094,7 +1091,6 @@ impl NvencEncoder {
                 egl,
                 _nvenc_lib: nvenc_lib,
                 nvenc_funcs: function_list,
-                recording_sink,
                 omit_stripe_headers: settings.omit_stripe_headers,
                 node_index: settings.encode_node_index.max(0),
             })
@@ -1312,12 +1308,6 @@ impl NvencEncoder {
         }
     }
 
-    /// Swap the recording fan-out sink for a session kept alive across capture restarts —
-    /// each restart rebinds the socket, so the previous sink must not be written to after the swap.
-    pub fn set_recording_sink(&mut self, sink: Option<Arc<RecordingSink>>) {
-        self.recording_sink = sink;
-    }
-
     /// Reconfigure the live session's ConstQP when `target_qp` differs from the current QP,
     /// returning whether a reconfigure actually happened.
     ///
@@ -1495,9 +1485,6 @@ impl NvencEncoder {
         if data_size > 0 && !data_ptr.is_null() {
             let slice = std::slice::from_raw_parts(data_ptr, data_size);
             output.extend_from_slice(slice);
-            if let Some(ref sink) = self.recording_sink {
-                sink.write_frame(slice);
-            }
         }
 
         (self.nvenc_funcs.nvEncUnlockBitstream.unwrap())(self.encoder_session, output_bitstream);

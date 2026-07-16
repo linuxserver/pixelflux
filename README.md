@@ -239,9 +239,9 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 
 **Performance Note:** Software (Pixman) rendering, the absence of a hardware encoder, or utilizing a render node different from the encoding node will force a "Readback" fallback, copying pixels to the CPU and breaking the zero-copy chain (higher latency and CPU load). A watermark does **not** force readback — on the GPU path it is composited into the frame before encoding.
 
-## Recording Sink (Wayland)
+## Recording Sink
 
-The Wayland backend can output the raw H.264 video stream directly to a Unix domain socket for external recording.
+The capture session can output the raw H.264 video stream directly to a Unix domain socket for external recording.
 
 *Note: This feature requires full-frame H.264 encoding (CPU, VA-API, or NVENC) and does not work with JPEG or striped H.264 modes.*
 

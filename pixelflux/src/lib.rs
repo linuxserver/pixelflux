@@ -171,7 +171,7 @@ pub mod encoders {
 
 /// Headless Wayland compositor and cursor rendering.
 pub mod wayland;
-/// Unix-socket H.264 recording sink for external capture tools.
+/// Unix-socket H.264 recording fan-out for external capture tools.
 pub mod recording_sink;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
@@ -978,10 +978,9 @@ fn build_readback_encoders(
     settings: &RustCaptureSettings,
     try_gpu: bool,
     prior: Option<GpuEncoder>,
-    recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
 ) -> (Option<GpuEncoder>, Option<crate::encoders::oh264::Openh264Encoder>) {
     if settings.output_mode == 1 && settings.use_openh264 {
-        match crate::encoders::oh264::Openh264Encoder::new(settings, recording_sink) {
+        match crate::encoders::oh264::Openh264Encoder::new(settings) {
             Some(e) => {
                 println!("[Wayland] OpenH264 software encoder selected.");
                 return (None, Some(e));
@@ -1004,7 +1003,6 @@ fn build_readback_encoders(
         if let Some(GpuEncoder::Nvenc(mut enc)) = prior {
             match enc.reconfigure_resolution(settings) {
                 Ok(()) => {
-                    enc.set_recording_sink(recording_sink);
                     println!("[Wayland] NVENC session reconfigured in place.");
                     return (Some(GpuEncoder::Nvenc(enc)), None);
                 }
@@ -1014,7 +1012,7 @@ fn build_readback_encoders(
             }
         }
         println!("[Wayland] Nvidia Encoder detected. Initializing NVENC...");
-        match NvencEncoder::new(settings, std::ptr::null(), recording_sink) {
+        match NvencEncoder::new(settings, std::ptr::null()) {
             Ok(e) => {
                 println!("[Wayland] NVENC Encoder initialized successfully.");
                 return (Some(GpuEncoder::Nvenc(e)), None);
@@ -1026,7 +1024,7 @@ fn build_readback_encoders(
         if settings.video_fullcolor {
             println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
         } else {
-            match VaapiEncoder::new(settings, recording_sink) {
+            match VaapiEncoder::new(settings) {
                 Ok(e) => {
                     println!("[Wayland] VAAPI Encoder initialized successfully.");
                     return (Some(GpuEncoder::Vaapi(e)), None);
@@ -1068,22 +1066,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     crate::boost_thread_priority(-10);
     let mut settings = cfg.settings;
     let (mut video_encoder, mut openh264_encoder) =
-        build_readback_encoders(&settings, cfg.try_gpu, cfg.prior, cfg.recording_sink.clone());
+        build_readback_encoders(&settings, cfg.try_gpu, cfg.prior);
     if cfg.try_gpu && video_encoder.is_none() && openh264_encoder.is_none() {
         println!("[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding.");
-    }
-    if cfg.recording_sink.is_some()
-        && settings.output_mode == 1
-        && video_encoder.is_none()
-        && openh264_encoder.is_none()
-        && !settings.video_fullframe
-    {
-        eprintln!(
-            "[recording_sink] WARNING: recording_socket is set but the CPU encoder is running in \
-             multi-stripe mode. This produces N independent sub-frame H.264 streams that \
-             cannot be muxed together. Set video_fullframe=true on the Python CaptureSettings \
-             (or use a working GPU encoder) to produce a recordable single-stream output."
-        );
     }
     let n_stripes = wayland_stripe_count(
         &settings,
@@ -1187,12 +1172,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         eprintln!("[wl-encode] NV12 CSC failed: {e:?}");
                     }
                 }
-                let force_idr_for_recording = cfg
-                    .recording_sink
-                    .as_ref()
-                    .map(|s| s.should_force_idr())
-                    .unwrap_or(false);
-                let force_idr = decision.force_idr || force_idr_for_recording;
+                let force_idr = decision.force_idr;
                 let result = match encoder {
                     GpuEncoder::Nvenc(enc) => {
                         enc.encode_raw(&nv12_buffer, f.frame_id as u64, decision.target_qp, force_idr)
@@ -1223,12 +1203,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 requested_idr,
             );
             if decision.send {
-                let force_idr_for_recording = cfg
-                    .recording_sink
-                    .as_ref()
-                    .map(|s| s.should_force_idr())
-                    .unwrap_or(false);
-                let force_idr = decision.force_idr || force_idr_for_recording;
+                let force_idr = decision.force_idr;
                 let stride = (width * 4) as usize;
                 match enc.encode_host_argb(&f.buf, stride, f.frame_id as u64, force_idr, cfg.use_gpu) {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
@@ -1260,7 +1235,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 f.frame_id,
                 cfg.use_gpu,
                 false,
-                cfg.recording_sink.as_ref(),
                 force_idr_all,
             );
         }
@@ -1270,6 +1244,14 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
         if !out.is_empty() {
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
+            if let Some(ref socket) = cfg.recording_sink {
+                for stripe in &out {
+                    let _ = socket.write_encoded_frame(stripe);
+                }
+                if socket.should_force_idr() {
+                    cfg.controls.force_idr.store(true, Ordering::Relaxed);
+                }
+            }
             let _ = cfg.deliver_tx.send(out);
         }
     }
@@ -1862,7 +1844,6 @@ fn run_wayland_thread(
                                 Some(GpuEncoder::Nvenc(enc)) => {
                                     match enc.reconfigure_resolution(&settings) {
                                         Ok(()) => {
-                                            enc.set_recording_sink(state.recording_sink.clone());
                                             println!("[Wayland] NVENC session reconfigured in place.");
                                             true
                                         }
@@ -1883,7 +1864,7 @@ fn run_wayland_thread(
                                     std::ptr::null()
                                 };
 
-                                match NvencEncoder::new(&settings, egl_display, state.recording_sink.clone()) {
+                                match NvencEncoder::new(&settings, egl_display) {
                                     Ok(encoder) => {
                                         state.video_encoder = Some(GpuEncoder::Nvenc(encoder));
                                         println!("[Wayland] NVENC Encoder initialized successfully.");
@@ -1900,7 +1881,7 @@ fn run_wayland_thread(
                             if settings.video_fullcolor {
                                 println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
                             } else {
-                                match VaapiEncoder::new(&settings, state.recording_sink.clone()) {
+                                match VaapiEncoder::new(&settings) {
                                     Ok(encoder) => {
                                         state.video_encoder = Some(GpuEncoder::Vaapi(encoder));
                                         println!(
@@ -1930,7 +1911,7 @@ fn run_wayland_thread(
                     if state.recording_sink.is_some() && settings.output_mode == 0 {
                         eprintln!(
                             "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
-                             The recording sink requires a single H.264 stream. Please set output_mode=1 \
+                             The recording socket requires a single H.264 stream. Please set output_mode=1 \
                              on the Python CaptureSettings to produce a recordable output."
                         );
                     }
@@ -2880,6 +2861,11 @@ fn run_wayland_thread(
                                             data, data_type: 2, stripe_y_start: 0,
                                             stripe_height: height, frame_id: state.frame_counter as i32,
                                         }];
+                                        if let Some(ref socket) = state.recording_sink {
+                                            for stripe in &stripes {
+                                                let _ = socket.write_encoded_frame(stripe);
+                                            }
+                                        }
                                         // Non-blocking: a full slot parks the frame
                                         // (delivered ahead of any new encode above).
                                         match tx.try_send(stripes) {

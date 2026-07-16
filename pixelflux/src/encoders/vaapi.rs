@@ -21,9 +21,6 @@ use std::sync::Once;
 use ffmpeg_sys_next as ff;
 use libc::{close, dup};
 
-use std::sync::Arc;
-
-use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
@@ -179,13 +176,12 @@ pub struct VaapiEncoder {
     current_vbv_mult: f64,
     current_kf_s: f64,
 
-    recording_sink: Option<Arc<RecordingSink>>,
     omit_stripe_headers: bool,
 }
 
 /// Assert `VaapiEncoder` is `Send`: its raw FFmpeg pointers are owned exclusively and the
 /// encoder is driven from a single capture thread, so moving the whole object across threads adds
-/// no aliasing (its `recording_sink` `Arc` is already `Send`).
+/// no aliasing.
 unsafe impl Send for VaapiEncoder {}
 
 /// Tear down every FFmpeg object in dependency order so nothing is freed while still
@@ -237,9 +233,8 @@ impl VaapiEncoder {
     /// `host_input = false`.
     pub fn new(
         settings: &RustCaptureSettings,
-        recording_sink: Option<Arc<RecordingSink>>,
     ) -> Result<Self, String> {
-        Self::new_impl(settings, recording_sink, false)
+        Self::new_impl(settings, false)
     }
 
     /// Build a VA-API encoder for the X11 **host-ARGB** path — the source is a CPU BGRA frame
@@ -248,9 +243,8 @@ impl VaapiEncoder {
     /// conversion.
     pub fn new_host(
         settings: &RustCaptureSettings,
-        recording_sink: Option<Arc<RecordingSink>>,
     ) -> Result<Self, String> {
-        Self::new_impl(settings, recording_sink, true)
+        Self::new_impl(settings, true)
     }
 
     /// Stand up the whole VA-API pipeline for one capture, shared by the dmabuf and
@@ -295,7 +289,6 @@ impl VaapiEncoder {
     /// order, so no FFmpeg object leaks on the error path.
     fn new_impl(
         settings: &RustCaptureSettings,
-        recording_sink: Option<Arc<RecordingSink>>,
         host_input: bool,
     ) -> Result<Self, String> {
         FF_INIT.call_once(|| {});
@@ -642,7 +635,6 @@ impl VaapiEncoder {
                 current_bitrate_kbps: settings.video_bitrate_kbps,
                 current_vbv_mult: settings.video_vbv_multiplier,
                 current_kf_s: settings.keyframe_interval_s,
-                recording_sink,
                 omit_stripe_headers: settings.omit_stripe_headers,
             })
         }
@@ -805,8 +797,7 @@ impl VaapiEncoder {
     /// described to the client as one full-height stripe: tag `0x04`, a keyframe flag (`0x01`/`0x00`
     /// from `AV_PKT_FLAG_KEY`), the frame number as a big-endian `u16`, a `0` y-start (a whole frame
     /// starts at the top), then width and height as big-endian `u16`s, followed by the raw Annex-B
-    /// payload. A `recording_sink`, when attached, instead receives the bare payload with no header,
-    /// because a recording is a plain elementary stream that must not carry the transport framing.
+    /// payload. The recording sink intercepts frames at the delivery layer.
     /// `omit_stripe_headers` drops the header on the network path too, for a consumer that already
     /// wants raw Annex-B. The loop drains `avcodec_receive_packet` until the encoder is empty,
     /// unref'ing each packet before the next iteration.
@@ -829,9 +820,6 @@ impl VaapiEncoder {
 
             let slice = std::slice::from_raw_parts(data, size);
             output.extend_from_slice(slice);
-            if let Some(ref sink) = self.recording_sink {
-                sink.write_frame(slice);
-            }
 
             ff::av_packet_unref(self.packet);
         }

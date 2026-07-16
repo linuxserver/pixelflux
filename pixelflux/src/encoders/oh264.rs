@@ -19,8 +19,6 @@
 //! strict-GOP streaming behavior. Host ARGB is converted to I420 with the same
 //! BT.709 path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
 
-use crate::recording_sink::RecordingSink;
-use std::sync::Arc;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange,
@@ -59,7 +57,7 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 /// target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but with the QP pinned to a
 /// single value). `current_bitrate_bps` tracks the currently-accepted live CBR target so a
 /// rejected change can be rolled back. `omit_stripe_headers` drops the 10-byte wire header for
-/// bare Annex-B output, and `recording_sink` is the optional raw-Annex-B fan-out.
+/// bare Annex-B output.
 pub struct Openh264Encoder {
     encoder: Encoder,
     width: usize,
@@ -70,15 +68,13 @@ pub struct Openh264Encoder {
     current_bitrate_bps: i32,
     is_cbr: bool,
     omit_stripe_headers: bool,
-    recording_sink: Option<Arc<RecordingSink>>,
 }
 
 impl Openh264Encoder {
     /// Build an OpenH264 encoder from the capture settings, or `None` on init failure.
     ///
     /// `None` lets the caller fall back to the x264 software stripe path. Like the NVENC/VAAPI
-    /// encoders, this one writes raw Annex-B directly to `recording_sink` and self-prepends the
-    /// wire header on the buffer it returns.
+    /// encoders, this one self-prepends the wire header on the buffer it returns.
     ///
     /// 1. **Geometry**: width and height are floored to even values (`& !1`, min 2) because 4:2:0
     ///    chroma subsampling requires it. A 4:4:4 full-color request is only warned about —
@@ -116,8 +112,8 @@ impl Openh264Encoder {
     ///      constant: RC_OFF ignores the QP range and RC_QUALITY rejects a `min == max` range.
     ///
     /// After construction the encoder is primed for four fixed slices and VUI signaling via
-    /// `enable_four_slices`, then the recording sink is attached.
-    pub fn new(settings: &RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Option<Self> {
+    /// `enable_four_slices`.
+    pub fn new(settings: &RustCaptureSettings) -> Option<Self> {
         if settings.video_fullcolor {
             eprintln!("[openh264] 4:4:4 full-color requested; OpenH264 is 4:2:0-only, encoding 4:2:0.");
         }
@@ -170,10 +166,8 @@ impl Openh264Encoder {
             current_bitrate_bps: bps as i32,
             is_cbr,
             omit_stripe_headers: settings.omit_stripe_headers,
-            recording_sink: None,
         };
         me.enable_four_slices();
-        me.recording_sink = recording_sink;
         Some(me)
     }
 
@@ -405,9 +399,6 @@ impl Openh264Encoder {
                 bitstream.write_vec(&mut out);
                 if out.len() == header_sz {
                     return Ok(Vec::new());
-                }
-                if let Some(ref sink) = self.recording_sink {
-                    sink.write_frame(&out[header_sz..]);
                 }
                 Ok(out)
             }

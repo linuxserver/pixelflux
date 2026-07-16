@@ -164,10 +164,7 @@ enum X11Encoder {
 /// content frame-to-frame. Full-frame H.264 runs through `decide_hw_fullframe`; striped JPEG/x264
 /// runs through `encode_cpu` with `hash_damage=true`.
 ///
-/// `recording_sink` is the optional Unix-socket H.264 fan-out (parity with the Wayland path),
-/// `None` unless a recording socket is configured. It is owned here rather than created per frame
-/// because the hardware encoders write to it internally; the software CPU / OpenH264 paths are fed
-/// from `process()`.
+/// Recording sink fan-out is handled at the delivery layer.
 pub struct X11Pipeline {
     settings: RustCaptureSettings,
     stripes: Vec<StripeState>,
@@ -197,7 +194,7 @@ impl X11Pipeline {
     pub fn new(settings: RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");
-            match Openh264Encoder::new(&settings, recording_sink.clone()) {
+            match Openh264Encoder::new(&settings) {
                 Some(e) => X11Encoder::Openh264(e),
                 None => {
                     eprintln!("[x11] OpenH264 init failed; falling back to software x264");
@@ -214,7 +211,7 @@ impl X11Pipeline {
                     X11Encoder::None
                 } else {
                     println!("[x11] Initializing Unified VAAPI Encoder...");
-                    match VaapiEncoder::new_host(&settings, recording_sink.clone()) {
+                    match VaapiEncoder::new_host(&settings) {
                         Ok(e) => {
                             println!("[x11] VAAPI Encoder initialized successfully.");
                             X11Encoder::Vaapi(e)
@@ -227,7 +224,7 @@ impl X11Pipeline {
                 }
             } else {
                 println!("[x11] Nvidia Encoder detected. Initializing NVENC...");
-                match NvencEncoder::new(&settings, std::ptr::null(), recording_sink.clone()) {
+                match NvencEncoder::new(&settings, std::ptr::null()) {
                     Ok(e) => {
                         println!("[x11] NVENC Encoder initialized successfully.");
                         X11Encoder::Nvenc(e)
@@ -415,7 +412,6 @@ impl X11Pipeline {
                 self.frame_counter,
                 false,
                 true,
-                self.recording_sink.as_ref(),
                 force_idr_all,
             )
         };
