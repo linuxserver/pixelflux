@@ -43,7 +43,7 @@ sudo apt-get install -y \
   libva-dev
 ```
 
-> **Notes:** the FFmpeg bindings (`ffmpeg-next` 8.1) require **FFmpeg 8.1**; on distros shipping an older FFmpeg, install a newer build and point `PKG_CONFIG_PATH` at it. X11 capture uses pure-Rust XCB (no `libX11`/`libxcb`/`Xfixes` dev packages needed); colorspace conversion is pure-Rust and the NVENC/CUDA libraries are loaded at runtime (no compile-time NVIDIA packages).
+> **Notes:** the FFmpeg bindings (`ffmpeg-sys-next` 8.1) work with any system **FFmpeg 6.0–8.1** (only `avcodec`/`avfilter` are used, for `h264_vaapi`); on distros shipping an older FFmpeg, install a newer build and point `PKG_CONFIG_PATH` at it. X11 capture uses pure-Rust XCB (no `libX11`/`libxcb`/`Xfixes` dev packages needed); colorspace conversion is pure-Rust and the NVENC/CUDA libraries are loaded at runtime (no compile-time NVIDIA packages).
 
 ### 2. Hardware Acceleration (Optional but Recommended)
 *   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
@@ -66,11 +66,11 @@ pip install .
 
 ### Backend Selection
 
-By default, `pixelflux` loads the legacy X11 backend. To enable the **Wayland** backend (built on [Smithay](https://github.com/Smithay/smithay)), set the following environment variable before importing the module:
+`pixelflux` supports both an X11 and a **Wayland** backend (the latter built on [Smithay](https://github.com/Smithay/smithay)), selected per capture by the `use_wayland` attribute on `CaptureSettings`:
 
-```bash
-export PIXELFLUX_WAYLAND=true
-```
+- `settings.use_wayland = True` — force the Wayland backend
+- `settings.use_wayland = False` — force the X11 backend
+- `settings.use_wayland = None` (default) — use Wayland when the session exposes a `WAYLAND_DISPLAY`, otherwise X11
 
 To test launching programs into this backend simply add `WAYLAND_DISPLAY=wayland-1` before launching them: 
 
@@ -80,18 +80,21 @@ WAYLAND_DISPLAY=wayland-1 glmark2-es2-wayland -s 1920x1080
 
 ### Automatic GPU Selection
 
-Set `SELKIES_AUTO_GPU=true` (preferred, or the legacy `AUTO_GPU=true`) to let pixelflux pick a
-render node automatically instead of supplying one. It enumerates `/sys/class/drm`, pairs each
-`cardN` with its `renderD*` node by PCI device, and skips non-GPU cards (IPMI/VGA). Selection is
-**driver-aware**: NVIDIA nodes are routed to NVENC, while Intel (`i915`) and AMD (`amdgpu`) nodes
-take the VA-API path. Both the X11 and Wayland backends honor this.
+Set the `auto_gpu` attribute on `CaptureSettings` to let pixelflux pick a render node
+automatically instead of supplying one — `"true"` (or any truthy value) picks the first GPU, and
+a token (a kernel driver name, PCI **vendor** id, or devicetree prefix) picks the first GPU that
+matches. It enumerates `/sys/class/drm`, pairs each `cardN` with its `renderD*` node by PCI
+device, and skips non-GPU cards (IPMI/VGA). Selection is **driver-aware**: NVIDIA nodes are routed
+to NVENC, while Intel (`i915`) and AMD (`amdgpu`) nodes take the VA-API path. Both the X11 and
+Wayland backends honor it. (Selkies fills this from its `--auto-gpu` / `SELKIES_AUTO_GPU` inputs.)
 
-```bash
-export SELKIES_AUTO_GPU=true
+```python
+settings.auto_gpu = "true"
 ```
 
-When auto-selection is off and no node is supplied, an operator-set `DRINODE` (e.g.
-`/dev/dri/renderD128`) is honored before falling back to the software renderer.
+When auto-selection is off, the encoder device is chosen by `encode_node_index` (default `-2` =
+auto): `-1` forces software and `>= 0` selects `/dev/dri/renderD(128 + index)`; an explicit
+`encode_node_path` / `render_node_path` takes precedence.
 
 ### Capture Settings
 
@@ -115,7 +118,7 @@ settings.scale = 1.0  # Fractional scaling (Wayland only)
 # 0 for JPEG, 1 for H.264
 settings.output_mode = 1
 # Force CPU encoding and ignore hardware encoders
-capture_settings.use_cpu = False
+settings.use_cpu = False
 
 # --- Debugging ---
 settings.debug_logging = False # Enable/disable the continuous FPS and settings log to the console.
@@ -137,21 +140,21 @@ settings.video_vbv_multiplier = 1.5                # Optional CBR VBV size as a 
 settings.auto_adjust_screen_capture_size = True   # Allow pixelflux to adjust its capture width and height.
 
 # --- Hardware Acceleration ---
-# >= 0: Enable GPU Encoding on /dev/dri/renderD(128 + index)
-# -1: Disable GPU Encoding (System will try NVENC if available when using the x11 backend, Wayland needs this set to a render node)
-settings.vaapi_render_node_index = -1
-# Explicit render node path (X11). Takes precedence over the positional index above and
-# avoids the index ambiguity. Must be a bytes object, e.g. b"/dev/dri/renderD128".
-settings.vaapi_render_node_path = None
+# Encoder device selection:
+#   -2: Auto-detect (default; combine with auto_gpu — see Automatic GPU Selection)
+#   -1: Force software encoding
+#   >= 0: Use the GPU at /dev/dri/renderD(128 + index)
+settings.encode_node_index = -2
+# Explicit encoder device path; takes precedence over the index above. str or bytes,
+# e.g. "/dev/dri/renderD128".
+settings.encode_node_path = None
+# Explicit compositor render node (Wayland); str or bytes.
+settings.render_node_path = None
 
 # --- Wire Format / Zero-Copy (X11) ---
 # False (default): prepend the per-stripe header to each packet (the WebSocket path).
 # True: emit the raw encoded payload with no header (for a WebRTC path that frames itself).
 settings.omit_stripe_headers = False
-# Deprecated/ignored: the native frame handed to your callback always owns its buffer
-# (zero-copy on every Python version, see below), so this flag no longer has any effect.
-# Kept only for backward compatibility.
-settings.deferred_free = False
 
 # --- Change Detection & Optimization ---
 settings.use_paint_over_quality = True  # Enable paint-over/IDR requests for static regions
@@ -172,14 +175,14 @@ In Wayland mode, `pixelflux` acts as the compositor. You cannot use external too
 
 ```python
 capture = ScreenCapture()
-capture.start_capture(settings, my_callback)
+capture.start_capture(my_callback, settings)
 
 # Inject Mouse Motion (Absolute coordinates)
 capture.inject_mouse_move(x=500.0, y=300.0)
 
-# Inject Mouse Button (1=Left, 2=Middle, 3=Right, etc.)
+# Inject Mouse Button (evdev button codes: 272=Left, 273=Right, 274=Middle)
 # State: 1 = Pressed, 0 = Released
-capture.inject_mouse_button(btn=1, state=1) 
+capture.inject_mouse_button(btn=272, state=1) 
 
 # Inject Scroll (Vertical/Horizontal)
 capture.inject_mouse_scroll(x=0.0, y=10.0)
@@ -192,9 +195,9 @@ capture.inject_key(scancode=17, state=1)
 
 ### Stripe Callback
 
-Your callback receives a single **frame object** (`StripeFrame` on X11, `WaylandFrame` on
-Wayland). Both support the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)`
-— and expose the stripe metadata as attributes:
+Your callback receives a single **`StripeFrame`** object (the same type on both the X11 and
+Wayland backends). It supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` /
+`len(frame)` — and exposes the stripe metadata as attributes:
 
 ```python
 def my_callback(frame):
@@ -265,7 +268,7 @@ The Wayland backend implements the [Anthropic Computer Use specification](https:
 export PIXELFLUX_CU=5000
 ```
 
-When using Computer Use, call `ensure_wayland_display()` before starting a capture to bring the compositor socket up early — this lets apps launched alongside your script connect to `WAYLAND_DISPLAY` immediately. GPU auto-selection (`SELKIES_AUTO_GPU=true` / `auto_gpu` on `CaptureSettings`) works normally; the screenshot path forces a single-frame CPU readback when the GPU is in zero-copy mode.
+When using Computer Use, call `ensure_wayland_display()` before starting a capture to bring the compositor socket up early — this lets apps launched alongside your script connect to `WAYLAND_DISPLAY` immediately. GPU auto-selection (`auto_gpu` on `CaptureSettings`) works normally; the screenshot path forces a single-frame CPU readback when the GPU is in zero-copy mode.
 
 The Computer Use server listens for `POST` requests on `/computer-use` and responds with JSON. Unless otherwise noted, successful actions return:
 
@@ -436,7 +439,7 @@ install at build or runtime beyond the driver.
 *   **Flexible Encoding:**
     *   **Software:** x264 (H.264, incl. 4:4:4) and JPEG with multi-threaded striping.
     *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct BT.709, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert) with Zero-Copy support.
-    *   **Driver-aware GPU auto-selection** via `SELKIES_AUTO_GPU`.
+    *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**
     *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
