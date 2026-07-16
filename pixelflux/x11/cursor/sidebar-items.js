@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["acquire","release","set_callback","set_size_cap","shutdown"]};

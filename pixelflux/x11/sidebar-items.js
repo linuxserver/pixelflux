@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"fn":["run_capture"],"struct":["Controls"]};
+window.SIDEBAR_ITEMS = {"fn":["run_capture"],"mod":["cursor"],"struct":["Controls"]};

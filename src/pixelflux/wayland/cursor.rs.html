@@ -75,72 +75,75 @@
 <a href=#75 id=75 data-nosnippet>75</a>    }
 <a href=#76 id=76 data-nosnippet>76</a>
 <a href=#77 id=77 data-nosnippet>77</a>    <span class="doccomment">/// A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
-<a href=#78 id=78 data-nosnippet>78</a>    </span><span class="kw">pub fn </span>get_png_data(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;(Vec&lt;u8&gt;, u32, u32)&gt; {
-<a href=#79 id=79 data-nosnippet>79</a>        <span class="kw">let </span>icons = load_icon(<span class="kw-2">&amp;</span><span class="self">self</span>.theme, name).ok()<span class="question-mark">?</span>;
-<a href=#80 id=80 data-nosnippet>80</a>        <span class="kw">let </span>image_data = nearest_images(<span class="self">self</span>.size, <span class="kw-2">&amp;</span>icons).next()<span class="question-mark">?</span>;
-<a href=#81 id=81 data-nosnippet>81</a>
-<a href=#82 id=82 data-nosnippet>82</a>        <span class="kw">let </span>img_buf: ImageBuffer&lt;Rgba&lt;u8&gt;, Vec&lt;u8&gt;&gt; = ImageBuffer::from_raw(
-<a href=#83 id=83 data-nosnippet>83</a>            image_data.width,
-<a href=#84 id=84 data-nosnippet>84</a>            image_data.height,
-<a href=#85 id=85 data-nosnippet>85</a>            image_data.pixels_rgba.clone(),
-<a href=#86 id=86 data-nosnippet>86</a>        )<span class="question-mark">?</span>;
-<a href=#87 id=87 data-nosnippet>87</a>
-<a href=#88 id=88 data-nosnippet>88</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes: Vec&lt;u8&gt; = Vec::new();
-<a href=#89 id=89 data-nosnippet>89</a>        <span class="kw">let </span><span class="kw-2">mut </span>cursor = IoCursor::new(<span class="kw-2">&amp;mut </span>bytes);
-<a href=#90 id=90 data-nosnippet>90</a>        img_buf
-<a href=#91 id=91 data-nosnippet>91</a>            .write_to(<span class="kw-2">&amp;mut </span>cursor, image::ImageFormat::Png)
-<a href=#92 id=92 data-nosnippet>92</a>            .ok()<span class="question-mark">?</span>;
-<a href=#93 id=93 data-nosnippet>93</a>
-<a href=#94 id=94 data-nosnippet>94</a>        <span class="prelude-val">Some</span>((bytes, image_data.xhot, image_data.yhot))
-<a href=#95 id=95 data-nosnippet>95</a>    }
-<a href=#96 id=96 data-nosnippet>96</a>}
-<a href=#97 id=97 data-nosnippet>97</a>
-<a href=#98 id=98 data-nosnippet>98</a><span class="doccomment">/// All frames of the theme variant whose pixel size is closest to `size`. XCursor files
-<a href=#99 id=99 data-nosnippet>99</a>/// bundle the same cursor at several sizes, and choosing the nearest one avoids scaling a
-<a href=#100 id=100 data-nosnippet>100</a>/// mismatched bitmap into a blurry or aliased cursor.
-<a href=#101 id=101 data-nosnippet>101</a></span><span class="kw">fn </span>nearest_images(size: u32, images: <span class="kw-2">&amp;</span>[Image]) -&gt; <span class="kw">impl </span>Iterator&lt;Item = <span class="kw-2">&amp;</span>Image&gt; {
-<a href=#102 id=102 data-nosnippet>102</a>    <span class="kw">let </span>nearest_image = images
-<a href=#103 id=103 data-nosnippet>103</a>        .iter()
-<a href=#104 id=104 data-nosnippet>104</a>        .min_by_key(|image| (size <span class="kw">as </span>i32 - image.size <span class="kw">as </span>i32).abs())
-<a href=#105 id=105 data-nosnippet>105</a>        .unwrap();
-<a href=#106 id=106 data-nosnippet>106</a>    images
-<a href=#107 id=107 data-nosnippet>107</a>        .iter()
-<a href=#108 id=108 data-nosnippet>108</a>        .filter(<span class="kw">move </span>|image| image.width == nearest_image.width &amp;&amp; image.height == nearest_image.height)
-<a href=#109 id=109 data-nosnippet>109</a>}
-<a href=#110 id=110 data-nosnippet>110</a>
-<a href=#111 id=111 data-nosnippet>111</a><span class="doccomment">/// Pick which animation frame to show for the elapsed time, so animated cursors (a spinner,
-<a href=#112 id=112 data-nosnippet>112</a>/// a progress ring) actually advance instead of freezing on frame zero; it maps the time onto the
-<a href=#113 id=113 data-nosnippet>113</a>/// frames by cycling their cumulative delays.
-<a href=#114 id=114 data-nosnippet>114</a></span><span class="kw">fn </span>frame(<span class="kw-2">mut </span>millis: u32, size: u32, images: <span class="kw-2">&amp;</span>[Image]) -&gt; Image {
-<a href=#115 id=115 data-nosnippet>115</a>    <span class="kw">let </span>total = nearest_images(size, images).fold(<span class="number">0</span>, |acc, image| acc + image.delay);
-<a href=#116 id=116 data-nosnippet>116</a>    <span class="kw">if </span>total == <span class="number">0 </span>{
-<a href=#117 id=117 data-nosnippet>117</a>        <span class="kw">return </span>nearest_images(size, images).next().unwrap().clone();
-<a href=#118 id=118 data-nosnippet>118</a>    }
-<a href=#119 id=119 data-nosnippet>119</a>    millis %= total;
-<a href=#120 id=120 data-nosnippet>120</a>    <span class="kw">for </span>img <span class="kw">in </span>nearest_images(size, images) {
-<a href=#121 id=121 data-nosnippet>121</a>        <span class="kw">if </span>millis &lt; img.delay {
-<a href=#122 id=122 data-nosnippet>122</a>            <span class="kw">return </span>img.clone();
-<a href=#123 id=123 data-nosnippet>123</a>        }
-<a href=#124 id=124 data-nosnippet>124</a>        millis -= img.delay;
-<a href=#125 id=125 data-nosnippet>125</a>    }
-<a href=#126 id=126 data-nosnippet>126</a>    <span class="macro">unreachable!</span>()
-<a href=#127 id=127 data-nosnippet>127</a>}
-<a href=#128 id=128 data-nosnippet>128</a>
-<a href=#129 id=129 data-nosnippet>129</a><span class="doccomment">/// Parse the named icon from the theme's cursor file into its frames.
-<a href=#130 id=130 data-nosnippet>130</a>///
-<a href=#131 id=131 data-nosnippet>131</a>/// Empty parses are rejected so `nearest_images`'s `min_by_key().unwrap()` cannot panic on a
-<a href=#132 id=132 data-nosnippet>132</a>/// cursor file that has a valid header but zero images.
-<a href=#133 id=133 data-nosnippet>133</a></span><span class="kw">fn </span>load_icon(theme: <span class="kw-2">&amp;</span>CursorTheme, name: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;Image&gt;, String&gt; {
-<a href=#134 id=134 data-nosnippet>134</a>    <span class="kw">let </span>icon_path = theme.load_icon(name).ok_or(<span class="string">"Icon not found"</span>)<span class="question-mark">?</span>;
-<a href=#135 id=135 data-nosnippet>135</a>    <span class="kw">let </span><span class="kw-2">mut </span>cursor_file = std::fs::File::open(icon_path).map_err(|e| e.to_string())<span class="question-mark">?</span>;
-<a href=#136 id=136 data-nosnippet>136</a>    <span class="kw">let </span><span class="kw-2">mut </span>cursor_data = Vec::new();
-<a href=#137 id=137 data-nosnippet>137</a>    cursor_file
-<a href=#138 id=138 data-nosnippet>138</a>        .read_to_end(<span class="kw-2">&amp;mut </span>cursor_data)
-<a href=#139 id=139 data-nosnippet>139</a>        .map_err(|e| e.to_string())<span class="question-mark">?</span>;
-<a href=#140 id=140 data-nosnippet>140</a>    <span class="kw">let </span>imgs = parse_xcursor(<span class="kw-2">&amp;</span>cursor_data).ok_or(<span class="string">"Failed to parse"</span>.to_string())<span class="question-mark">?</span>;
-<a href=#141 id=141 data-nosnippet>141</a>    <span class="kw">if </span>imgs.is_empty() {
-<a href=#142 id=142 data-nosnippet>142</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="string">"Cursor file has no images"</span>.to_string());
-<a href=#143 id=143 data-nosnippet>143</a>    }
-<a href=#144 id=144 data-nosnippet>144</a>    <span class="prelude-val">Ok</span>(imgs)
-<a href=#145 id=145 data-nosnippet>145</a>}
+<a href=#78 id=78 data-nosnippet>78</a>    /// Xcursor stores premultiplied color; the PNG carries straight alpha. The
+<a href=#79 id=79 data-nosnippet>79</a>    /// compositing paths (`get_image*`) keep the premultiplied pixels blending needs.
+<a href=#80 id=80 data-nosnippet>80</a>    </span><span class="kw">pub fn </span>get_png_data(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;(Vec&lt;u8&gt;, u32, u32)&gt; {
+<a href=#81 id=81 data-nosnippet>81</a>        <span class="kw">let </span>icons = load_icon(<span class="kw-2">&amp;</span><span class="self">self</span>.theme, name).ok()<span class="question-mark">?</span>;
+<a href=#82 id=82 data-nosnippet>82</a>        <span class="kw">let </span>image_data = nearest_images(<span class="self">self</span>.size, <span class="kw-2">&amp;</span>icons).next()<span class="question-mark">?</span>;
+<a href=#83 id=83 data-nosnippet>83</a>
+<a href=#84 id=84 data-nosnippet>84</a>        <span class="kw">let </span><span class="kw-2">mut </span>img_buf: ImageBuffer&lt;Rgba&lt;u8&gt;, Vec&lt;u8&gt;&gt; = ImageBuffer::from_raw(
+<a href=#85 id=85 data-nosnippet>85</a>            image_data.width,
+<a href=#86 id=86 data-nosnippet>86</a>            image_data.height,
+<a href=#87 id=87 data-nosnippet>87</a>            image_data.pixels_rgba.clone(),
+<a href=#88 id=88 data-nosnippet>88</a>        )<span class="question-mark">?</span>;
+<a href=#89 id=89 data-nosnippet>89</a>        <span class="kw">crate</span>::unpremultiply_rgba(<span class="kw-2">&amp;mut </span>img_buf);
+<a href=#90 id=90 data-nosnippet>90</a>
+<a href=#91 id=91 data-nosnippet>91</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes: Vec&lt;u8&gt; = Vec::new();
+<a href=#92 id=92 data-nosnippet>92</a>        <span class="kw">let </span><span class="kw-2">mut </span>cursor = IoCursor::new(<span class="kw-2">&amp;mut </span>bytes);
+<a href=#93 id=93 data-nosnippet>93</a>        img_buf
+<a href=#94 id=94 data-nosnippet>94</a>            .write_to(<span class="kw-2">&amp;mut </span>cursor, image::ImageFormat::Png)
+<a href=#95 id=95 data-nosnippet>95</a>            .ok()<span class="question-mark">?</span>;
+<a href=#96 id=96 data-nosnippet>96</a>
+<a href=#97 id=97 data-nosnippet>97</a>        <span class="prelude-val">Some</span>((bytes, image_data.xhot, image_data.yhot))
+<a href=#98 id=98 data-nosnippet>98</a>    }
+<a href=#99 id=99 data-nosnippet>99</a>}
+<a href=#100 id=100 data-nosnippet>100</a>
+<a href=#101 id=101 data-nosnippet>101</a><span class="doccomment">/// All frames of the theme variant whose pixel size is closest to `size`. XCursor files
+<a href=#102 id=102 data-nosnippet>102</a>/// bundle the same cursor at several sizes, and choosing the nearest one avoids scaling a
+<a href=#103 id=103 data-nosnippet>103</a>/// mismatched bitmap into a blurry or aliased cursor.
+<a href=#104 id=104 data-nosnippet>104</a></span><span class="kw">fn </span>nearest_images(size: u32, images: <span class="kw-2">&amp;</span>[Image]) -&gt; <span class="kw">impl </span>Iterator&lt;Item = <span class="kw-2">&amp;</span>Image&gt; {
+<a href=#105 id=105 data-nosnippet>105</a>    <span class="kw">let </span>nearest_image = images
+<a href=#106 id=106 data-nosnippet>106</a>        .iter()
+<a href=#107 id=107 data-nosnippet>107</a>        .min_by_key(|image| (size <span class="kw">as </span>i32 - image.size <span class="kw">as </span>i32).abs())
+<a href=#108 id=108 data-nosnippet>108</a>        .unwrap();
+<a href=#109 id=109 data-nosnippet>109</a>    images
+<a href=#110 id=110 data-nosnippet>110</a>        .iter()
+<a href=#111 id=111 data-nosnippet>111</a>        .filter(<span class="kw">move </span>|image| image.width == nearest_image.width &amp;&amp; image.height == nearest_image.height)
+<a href=#112 id=112 data-nosnippet>112</a>}
+<a href=#113 id=113 data-nosnippet>113</a>
+<a href=#114 id=114 data-nosnippet>114</a><span class="doccomment">/// Pick which animation frame to show for the elapsed time, so animated cursors (a spinner,
+<a href=#115 id=115 data-nosnippet>115</a>/// a progress ring) actually advance instead of freezing on frame zero; it maps the time onto the
+<a href=#116 id=116 data-nosnippet>116</a>/// frames by cycling their cumulative delays.
+<a href=#117 id=117 data-nosnippet>117</a></span><span class="kw">fn </span>frame(<span class="kw-2">mut </span>millis: u32, size: u32, images: <span class="kw-2">&amp;</span>[Image]) -&gt; Image {
+<a href=#118 id=118 data-nosnippet>118</a>    <span class="kw">let </span>total = nearest_images(size, images).fold(<span class="number">0</span>, |acc, image| acc + image.delay);
+<a href=#119 id=119 data-nosnippet>119</a>    <span class="kw">if </span>total == <span class="number">0 </span>{
+<a href=#120 id=120 data-nosnippet>120</a>        <span class="kw">return </span>nearest_images(size, images).next().unwrap().clone();
+<a href=#121 id=121 data-nosnippet>121</a>    }
+<a href=#122 id=122 data-nosnippet>122</a>    millis %= total;
+<a href=#123 id=123 data-nosnippet>123</a>    <span class="kw">for </span>img <span class="kw">in </span>nearest_images(size, images) {
+<a href=#124 id=124 data-nosnippet>124</a>        <span class="kw">if </span>millis &lt; img.delay {
+<a href=#125 id=125 data-nosnippet>125</a>            <span class="kw">return </span>img.clone();
+<a href=#126 id=126 data-nosnippet>126</a>        }
+<a href=#127 id=127 data-nosnippet>127</a>        millis -= img.delay;
+<a href=#128 id=128 data-nosnippet>128</a>    }
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="macro">unreachable!</span>()
+<a href=#130 id=130 data-nosnippet>130</a>}
+<a href=#131 id=131 data-nosnippet>131</a>
+<a href=#132 id=132 data-nosnippet>132</a><span class="doccomment">/// Parse the named icon from the theme's cursor file into its frames.
+<a href=#133 id=133 data-nosnippet>133</a>///
+<a href=#134 id=134 data-nosnippet>134</a>/// Empty parses are rejected so `nearest_images`'s `min_by_key().unwrap()` cannot panic on a
+<a href=#135 id=135 data-nosnippet>135</a>/// cursor file that has a valid header but zero images.
+<a href=#136 id=136 data-nosnippet>136</a></span><span class="kw">fn </span>load_icon(theme: <span class="kw-2">&amp;</span>CursorTheme, name: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;Image&gt;, String&gt; {
+<a href=#137 id=137 data-nosnippet>137</a>    <span class="kw">let </span>icon_path = theme.load_icon(name).ok_or(<span class="string">"Icon not found"</span>)<span class="question-mark">?</span>;
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="kw">let </span><span class="kw-2">mut </span>cursor_file = std::fs::File::open(icon_path).map_err(|e| e.to_string())<span class="question-mark">?</span>;
+<a href=#139 id=139 data-nosnippet>139</a>    <span class="kw">let </span><span class="kw-2">mut </span>cursor_data = Vec::new();
+<a href=#140 id=140 data-nosnippet>140</a>    cursor_file
+<a href=#141 id=141 data-nosnippet>141</a>        .read_to_end(<span class="kw-2">&amp;mut </span>cursor_data)
+<a href=#142 id=142 data-nosnippet>142</a>        .map_err(|e| e.to_string())<span class="question-mark">?</span>;
+<a href=#143 id=143 data-nosnippet>143</a>    <span class="kw">let </span>imgs = parse_xcursor(<span class="kw-2">&amp;</span>cursor_data).ok_or(<span class="string">"Failed to parse"</span>.to_string())<span class="question-mark">?</span>;
+<a href=#144 id=144 data-nosnippet>144</a>    <span class="kw">if </span>imgs.is_empty() {
+<a href=#145 id=145 data-nosnippet>145</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="string">"Cursor file has no images"</span>.to_string());
+<a href=#146 id=146 data-nosnippet>146</a>    }
+<a href=#147 id=147 data-nosnippet>147</a>    <span class="prelude-val">Ok</span>(imgs)
+<a href=#148 id=148 data-nosnippet>148</a>}
 </code></pre></div></section></main></body></html>
