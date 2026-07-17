@@ -771,12 +771,10 @@ where
         if !stripes.is_empty() {
             frame_count += 1;
             stripe_count += stripes.len() as u64;
+            // IDR arming is consumed inside X11Pipeline::process; this tap only fans out.
             if let Some(ref socket) = recording_sink {
                 for stripe in &stripes {
-                    let _ = socket.write_encoded_frame(stripe);
-                }
-                if socket.should_force_idr() {
-                    controls.force_idr.store(true, Ordering::Relaxed);
+                    socket.write_encoded_frame(stripe);
                 }
             }
             on_frame(stripes);

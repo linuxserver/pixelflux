@@ -340,7 +340,14 @@ impl X11Pipeline {
     pub fn process(&mut self, argb: &[u8], stride: usize) -> Vec<EncodedStripe> {
         let width = self.settings.width;
         let height = self.settings.height;
-        let requested = self.pending_force_idr;
+        // A recorder connecting is a first-class IDR request: folding it in here lets the
+        // decision layer send a decodable frame promptly even when the screen is static.
+        let requested = self.pending_force_idr
+            || self
+                .recording_sink
+                .as_ref()
+                .map(|s| s.should_force_idr())
+                .unwrap_or(false);
         let threshold = self.settings.damage_block_threshold;
         let duration = self.settings.damage_block_duration as i32;
 
@@ -360,8 +367,7 @@ impl X11Pipeline {
             );
             if d.send {
                 let fc = self.frame_counter as u64;
-                let force_idr = d.force_idr
-                    || self.recording_sink.as_ref().map(|s| s.should_force_idr()).unwrap_or(false);
+                let force_idr = d.force_idr;
                 let res = match &mut self.hw {
                     X11Encoder::Nvenc(enc) => {
                         enc.encode_cpu_argb(argb, stride, fc, d.target_qp, force_idr)
@@ -416,7 +422,10 @@ impl X11Pipeline {
             )
         };
 
-        self.pending_force_idr = false;
+        // An unserved request stays armed: on an infinite GOP an IDR lost to an encode
+        // error or skip would never self-heal, leaving a joining consumer with an
+        // undecodable stream.
+        self.pending_force_idr = requested && out.is_empty();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         out
     }

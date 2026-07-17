@@ -134,6 +134,10 @@ impl Openh264Encoder {
             .skip_frames(true)
             .adaptive_quantization(false)
             .background_detection(false)
+            // Scene-change detection would inject IDRs the pipeline never asked for,
+            // breaking the infinite-GOP / on-demand-keyframe contract (x264 parity:
+            // `i_scenecut_threshold = 0`).
+            .scene_change_detect(false)
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
             .num_threads(threads);
@@ -338,16 +342,12 @@ impl Openh264Encoder {
     ///    byte-for-byte the layout the NVENC/VAAPI/x264 full-frame paths emit, which is what lets a
     ///    single client demuxer serve every encoder. Its type byte is read from the *actually
     ///    encoded* picture type (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than from `force_idr`,
-    ///    because OpenH264's scene-change detection can emit an IDR the caller never asked for, and
-    ///    the header must label a real decode entry point, not the request. It also carries the
-    ///    frame number, a zero y-start, and the width/height (all big-endian). With
-    ///    `omit_stripe_headers` the output is bare Annex-B.
+    ///    because the encoder may re-type a frame, and the header must label a real decode entry
+    ///    point, not the request. It also carries the frame number, a zero y-start, and the
+    ///    width/height (all big-endian). With `omit_stripe_headers` the output is bare Annex-B.
     /// 5. **Empty payload**: if the encoder produced no bitstream (e.g. a skipped frame), an empty
     ///    vec is returned rather than a lone header — a header with no Annex-B behind it would be a
     ///    malformed frame to the client, and the pipeline reads empty as "nothing to send".
-    /// 6. **Recording sink**: the raw Annex-B payload (past the header) is also written to the
-    ///    recording sink when one is attached, since a recorder wants the bare elementary stream,
-    ///    not the wire framing.
     pub fn encode_host_argb(
         &mut self,
         argb: &[u8],

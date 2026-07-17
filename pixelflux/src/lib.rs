@@ -1115,7 +1115,14 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             }
         }
 
-        let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed);
+        // A recorder connecting counts as a request, so the decision layer sends a
+        // decodable frame even when the screen is static.
+        let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed)
+            || cfg
+                .recording_sink
+                .as_ref()
+                .map(|s| s.should_force_idr())
+                .unwrap_or(false);
 
         let mut out: Vec<EncodedStripe> = Vec::new();
         if let Some(ref mut encoder) = video_encoder {
@@ -1238,15 +1245,17 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
 
         let WlFrame { id, buf, .. } = f;
         pool.recycle(id, buf);
+        // An unserved request stays armed: on an infinite GOP an IDR lost to an encode
+        // error or skip would never self-heal.
+        if requested_idr && out.is_empty() {
+            cfg.controls.force_idr.store(true, Ordering::Relaxed);
+        }
         if !out.is_empty() {
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
             if let Some(ref socket) = cfg.recording_sink {
                 for stripe in &out {
-                    let _ = socket.write_encoded_frame(stripe);
-                }
-                if socket.should_force_idr() {
-                    cfg.controls.force_idr.store(true, Ordering::Relaxed);
+                    socket.write_encoded_frame(stripe);
                 }
             }
             let _ = cfg.deliver_tx.send(out);
@@ -2393,6 +2402,20 @@ fn run_wayland_thread(
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
+            // A recorder connecting counts as a request. Folding it into the pending flags
+            // lets the decision layer send a decodable frame even when the screen is
+            // static, and keeps it armed across ticks that skip encoding (parked frame,
+            // exhausted pool). Both flags are set — like the request-IDR command handlers —
+            // because only one is consumed depending on which encode path is active.
+            if state
+                .recording_sink
+                .as_ref()
+                .map(|s| s.should_force_idr())
+                .unwrap_or(false)
+            {
+                state.pending_force_idr = true;
+                state.encode_controls.force_idr.store(true, Ordering::Relaxed);
+            }
             let requested_idr = state.pending_force_idr;
 
             let mut pool_slot: Option<(usize, Vec<u8>)> = None;
@@ -2827,16 +2850,11 @@ fn run_wayland_thread(
                         let force_idr = decision.force_idr;
                         let target_qp = decision.target_qp;
 
+                        let mut frame_out = false;
                         if send_frame {
                             if let Some(sync) = render_sync.take() {
                                 let _ = sync.wait();
                             }
-                            let force_idr_for_recording = state
-                                .recording_sink
-                                .as_ref()
-                                .map(|s| s.should_force_idr())
-                                .unwrap_or(false);
-                            let force_idr = force_idr || force_idr_for_recording;
                             let result = match encoder {
                                 GpuEncoder::Nvenc(enc) => {
                                     if let Some((_, ref dmabuf)) = state.offscreen_buffer {
@@ -2856,6 +2874,7 @@ fn run_wayland_thread(
 
                             if let Ok(data) = result {
                                 if !data.is_empty() {
+                                    frame_out = true;
                                     state.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
                                     state.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref tx) = state.deliver_tx {
@@ -2865,7 +2884,7 @@ fn run_wayland_thread(
                                         }];
                                         if let Some(ref socket) = state.recording_sink {
                                             for stripe in &stripes {
-                                                let _ = socket.write_encoded_frame(stripe);
+                                                socket.write_encoded_frame(stripe);
                                             }
                                         }
                                         // Non-blocking: a full slot parks the frame
@@ -2883,7 +2902,9 @@ fn run_wayland_thread(
                                 eprintln!("HW Encode Error: {}", e);
                             }
                         }
-                        state.pending_force_idr = false;
+                        // An unserved request stays armed: on an infinite GOP an IDR lost
+                        // to an encode error would never self-heal.
+                        state.pending_force_idr = requested_idr && !frame_out;
                         state.frame_counter = state.frame_counter.wrapping_add(1);
                         }
                     }
