@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
 use std::ffi::CString;
 use std::ptr;
+use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 /// Upper bound on the horizontal stripes the CPU encoder splits a frame into, so the
@@ -580,13 +581,14 @@ impl StripeState {
 ///
 /// # Fields
 ///
-/// * `data` - Compressed payload (JPEG or H.264 NAL units).
+/// * `data` - Compressed payload (JPEG or H.264 NAL units). `Arc`-shared so the recording
+///   tap can retain the frame for its client queues without copying the bytes.
 /// * `data_type` - Codec tag: **1 = JPEG**, **2 = H.264**.
 /// * `stripe_y_start` - Y pixel coordinate of the stripe's top edge within the frame.
 /// * `stripe_height` - Height of the stripe in pixels.
 /// * `frame_id` - Frame sequence number this stripe belongs to.
 pub struct EncodedStripe {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub data_type: i32,
     pub stripe_y_start: i32,
     pub stripe_height: i32,
@@ -932,7 +934,7 @@ pub fn encode_cpu(
                             std::mem::take(&mut stripe_state.packet_buf)
                         };
                         Some(EncodedStripe {
-                            data,
+                            data: Arc::new(data),
                             data_type: 1,
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
@@ -1025,7 +1027,7 @@ pub fn encode_cpu(
                             &mut stripe_state.packet_buf,
                         ) {
                             Some(EncodedStripe {
-                                data: std::mem::take(&mut stripe_state.packet_buf),
+                                data: Arc::new(std::mem::take(&mut stripe_state.packet_buf)),
                                 data_type: 2,
                                 stripe_y_start: y_start as i32,
                                 stripe_height: actual_height as i32,
@@ -1132,14 +1134,14 @@ mod tests {
             (w, h).into(),
         )];
         let dirty = super::encode_cpu(
-            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, None, false,
+            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, false,
         );
         assert!(!dirty.is_empty(), "damaged frame must encode");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, None, false,
+                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once");
@@ -1177,14 +1179,14 @@ mod tests {
         };
         let mut stripes = Vec::new();
         let first = super::encode_cpu(
-            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, None, false,
+            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, false,
         );
         assert!(!first.is_empty(), "first frame hashes as changed and encodes");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, None, false,
+                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once while static");
@@ -1194,7 +1196,7 @@ mod tests {
         assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
 
         let woke = super::encode_cpu(
-            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, None, false,
+            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, false,
         );
         assert!(!woke.is_empty(), "content change after idle must encode");
     }
@@ -1313,7 +1315,7 @@ mod qp_bound_sweep {
                 let mut out = Vec::new();
                 enc.encode_with_headers(
                     &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
-                    i as i64, i == 0, &[], true, &mut out, None,
+                    i as i64, i == 0, &[], true, &mut out,
                 );
                 out
             })
@@ -1336,7 +1338,7 @@ mod qp_bound_sweep {
             video_max_qp: max_qp,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("oh264 init");
+        let mut enc = Openh264Encoder::new(&s).expect("oh264 init");
         (0..FRAMES)
             .map(|i| {
                 let y = text_luma(i);

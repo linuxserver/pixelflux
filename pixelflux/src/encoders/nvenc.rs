@@ -1968,7 +1968,7 @@ mod gpu_tests {
     fn gpu_resolution_reconfigure_roundtrip() {
         let mut s = settings(1280, 720, 60.0);
         let t0 = std::time::Instant::now();
-        let mut enc = NvencEncoder::new(&s, ptr::null(), None).expect("NVENC init");
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
         let init_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let mut stream: Vec<u8> = Vec::new();
@@ -2049,7 +2049,7 @@ mod gpu_tests {
         let mut s = settings(1280, 720, 60.0);
         s.video_cbr_mode = true;
         s.video_bitrate_kbps = 4000;
-        let mut enc = NvencEncoder::new(&s, ptr::null(), None).expect("NVENC init");
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
         let f720 = frame(1280, 720, 10);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f720, 1280 * 4, i, 25, i == 0)
@@ -2082,7 +2082,7 @@ mod gpu_tests {
         }
         let s = settings(1920, 1080, 60.0);
         let before = used_mb();
-        let mut enc = NvencEncoder::new(&s, ptr::null(), None).expect("init");
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("init");
         let f = frame(1920, 1080, 5);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f, 1920 * 4, i, 25, i == 0).expect("encode");
@@ -2097,7 +2097,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_init_above_default_headroom() {
         let s = settings(2160, 4096, 30.0);
-        let mut enc = NvencEncoder::new(&s, ptr::null(), None).expect("NVENC init portrait 4K");
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init portrait 4K");
         assert_eq!(enc.init_params.maxEncodeWidth, 4096);
         assert_eq!(enc.init_params.maxEncodeHeight, 4096);
         let f = frame(2160, 4096, 20);

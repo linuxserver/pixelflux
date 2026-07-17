@@ -314,7 +314,7 @@ pub struct RustCaptureSettings {
     /// infinite GOP, 3 when scheduled keyframes are enabled.
     pub video_vbv_multiplier: f64,
     /// Seconds between scheduled recovery keyframes; `<= 0` keeps the GOP infinite
-    /// (IDRs only on demand: client join / reset, recording cadence).
+    /// (IDRs only on demand: client join / reset, recorder connect).
     pub keyframe_interval_s: f64,
     /// Rate-controlled (CBR) QP clamp: `video_max_qp` bounds the quality FLOOR (screen text stays
     /// legible under motion at the cost of overshooting impossible targets), `video_min_qp` bounds
@@ -496,9 +496,6 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .getattr("recording_socket")
             .ok()
             .and_then(|v| v.extract::<String>().ok())
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("PIXELFLUX_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
-            .or_else(|| std::env::var("SELKIES_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
             .unwrap_or_default(),
         omit_stripe_headers: settings
             .getattr("omit_stripe_headers")
@@ -1183,7 +1180,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 };
                 match result {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
-                        data,
+                        data: Arc::new(data),
                         data_type: 2,
                         stripe_y_start: 0,
                         stripe_height: height,
@@ -1207,7 +1204,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 let stride = (width * 4) as usize;
                 match enc.encode_host_argb(&f.buf, stride, f.frame_id as u64, force_idr, cfg.use_gpu) {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
-                        data,
+                        data: Arc::new(data),
                         data_type: 2,
                         stripe_y_start: 0,
                         stripe_height: height,
@@ -1708,12 +1705,17 @@ fn run_wayland_thread(
                         crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
 
                     if let Some(output) = state.outputs.first() {
-                        let current_mode = output.current_mode().unwrap();
-                        let current_w = current_mode.size.w;
-                        let current_h = current_mode.size.h;
-                        let current_scale = output.current_scale().fractional_scale();
-                        let current_refresh = current_mode.refresh;
+                        // Never panic the compositor thread: an output momentarily
+                        // without a current mode falls back to the requested geometry so
+                        // the reconfigure below is a no-op for size/refresh instead of
+                        // unwrap-panicking, which would drop every Wayland client with no
+                        // recovery short of a process restart.
                         let target_refresh = (settings.target_fps * 1000.0).round() as i32;
+                        let (current_w, current_h, current_refresh) = match output.current_mode() {
+                            Some(m) => (m.size.w, m.size.h, m.refresh),
+                            None => (settings.width, settings.height, target_refresh),
+                        };
+                        let current_scale = output.current_scale().fractional_scale();
 
                         let scale = settings.scale.max(0.1);
                         let logical_width = (settings.width as f64 / scale).round() as i32;
@@ -2858,7 +2860,7 @@ fn run_wayland_thread(
                                     state.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref tx) = state.deliver_tx {
                                         let stripes = vec![EncodedStripe {
-                                            data, data_type: 2, stripe_y_start: 0,
+                                            data: Arc::new(data), data_type: 2, stripe_y_start: 0,
                                             stripe_height: height, frame_id: state.frame_counter as i32,
                                         }];
                                         if let Some(ref socket) = state.recording_sink {
@@ -2954,7 +2956,7 @@ fn run_wayland_thread(
 /// four stripe-metadata ints as Python attributes.
 #[pyclass]
 struct StripeFrame {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     #[pyo3(get, set)]
     data_type: i32,
     #[pyo3(get, set)]
@@ -2966,10 +2968,10 @@ struct StripeFrame {
 }
 
 impl StripeFrame {
-    /// Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
+    /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
-    fn new_owned_meta(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
+    fn new_owned_meta(data: Arc<Vec<u8>>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
         Self { data, data_type, stripe_y_start, stripe_height, frame_id }
     }
 }
@@ -2981,7 +2983,7 @@ impl StripeFrame {
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
     fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
-        Self { data, data_type, stripe_y_start, stripe_height, frame_id }
+        Self { data: Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id }
     }
 
     fn __len__(&self) -> usize {
@@ -3210,7 +3212,7 @@ fn stripe_frame_from_buffer(
     stripe_height: i32,
     frame_id: i32,
 ) -> StripeFrame {
-    StripeFrame::new_owned_meta(data, data_type, stripe_y_start, stripe_height, frame_id)
+    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id)
 }
 
 /// Capture configuration read by `start_capture` (each field by attribute name via

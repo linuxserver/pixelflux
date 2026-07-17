@@ -377,7 +377,7 @@ impl X11Pipeline {
                 match res {
                     Ok(data) if !data.is_empty() => {
                         vec![EncodedStripe {
-                            data,
+                            data: Arc::new(data),
                             data_type: 2,
                             stripe_y_start: 0,
                             stripe_height: height,

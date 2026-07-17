@@ -459,7 +459,7 @@ mod tests {
             target_fps: 30.0,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("openh264 init");
+        let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
         let stride = 128 * 4;
         let idr = enc.encode_host_argb(&busy_frame(128, 96, 0), stride, 0, true, false).expect("encode idr");
         assert!(idr.len() > 10, "IDR frame should produce output");
@@ -489,7 +489,7 @@ mod tests {
             omit_stripe_headers: true,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("openh264 init");
+        let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
         let out = enc.encode_host_argb(&busy_frame(128, 96, 0), 128 * 4, 0, true, false).expect("encode");
         assert!(
             out.starts_with(&[0, 0, 0, 1]) || out.starts_with(&[0, 0, 1]),
@@ -511,7 +511,7 @@ mod tests {
                 target_fps: 30.0,
                 ..Default::default()
             };
-            let mut e = Openh264Encoder::new(&s, None).unwrap();
+            let mut e = Openh264Encoder::new(&s).unwrap();
             let _ = e.encode_host_argb(&busy_frame(w, h, 0), stride, 0, true, false).unwrap();
             (1..24).map(|t| e.encode_host_argb(&busy_frame(w, h, t), stride, t as u64, false, false).unwrap().len()).sum()
         };
@@ -533,7 +533,7 @@ mod tests {
             target_fps: 30.0,
             ..Default::default()
         };
-        let mut e = Openh264Encoder::new(&s, None).unwrap();
+        let mut e = Openh264Encoder::new(&s).unwrap();
         let _ = e.encode_host_argb(&busy_frame(w, h, 0), stride, 0, true, false).unwrap();
         let high: usize =
             (1..24).map(|t| e.encode_host_argb(&busy_frame(w, h, t), stride, t as u64, false, false).unwrap().len()).sum();
@@ -557,7 +557,7 @@ mod tests {
             target_fps: 30.0,
             ..Default::default()
         };
-        let mut e = Openh264Encoder::new(&s, None).unwrap();
+        let mut e = Openh264Encoder::new(&s).unwrap();
         let _ = e.encode_host_argb(&busy_frame(w, h, 0), stride, 0, true, false).unwrap();
         let low: usize =
             (1..24).map(|t| e.encode_host_argb(&busy_frame(w, h, t), stride, t as u64, false, false).unwrap().len()).sum();
@@ -584,7 +584,7 @@ mod tests {
                 target_fps: 30.0,
                 ..Default::default()
             };
-            let mut e = Openh264Encoder::new(&s, None).unwrap();
+            let mut e = Openh264Encoder::new(&s).unwrap();
             let mut total = e.encode_host_argb(&gradient_frame(w, h, 0), stride, 0, true, false).unwrap().len();
             total += (1..24)
                 .map(|t| e.encode_host_argb(&gradient_frame(w, h, t), stride, t as u64, false, false).unwrap().len())
@@ -614,7 +614,7 @@ mod tests {
         };
         let frame = busy_frame(w, h, 0);
         for rgba in [false, true] {
-            let mut e = Openh264Encoder::new(&s, None).unwrap();
+            let mut e = Openh264Encoder::new(&s).unwrap();
             let out = e.encode_host_argb(&frame, stride, 0, true, rgba).expect("encode");
             assert!(out.len() > 10, "rgba_input={rgba} must produce output");
             assert_eq!(out[0], 0x04, "rgba_input={rgba} output must carry the wire header");
@@ -642,7 +642,7 @@ mod slice_tests {
             video_cbr_mode: true,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("encoder");
+        let mut enc = Openh264Encoder::new(&s).expect("encoder");
         let frame = vec![0x80u8; 640 * 480 * 4];
         let out = enc.encode_host_argb(&frame, 640 * 4, 0, true, false).expect("encode");
         let mut nals = 0;
@@ -705,7 +705,7 @@ mod slice_tests {
                 target_fps: 60.0,
                 ..Default::default()
             };
-            let mut e = Openh264Encoder::new(&s, None).unwrap();
+            let mut e = Openh264Encoder::new(&s).unwrap();
             let mut total = 0usize;
             let mut idrs = 0usize;
             for t in 0..60u64 {
@@ -752,7 +752,7 @@ mod slice_tests {
             target_fps: 60.0,
             ..Default::default()
         };
-        let mut e = Openh264Encoder::new(&s, None).unwrap();
+        let mut e = Openh264Encoder::new(&s).unwrap();
         unsafe {
             let mut p: openh264_sys2::SEncParamExt = std::mem::zeroed();
             let ret = e.encoder.raw_api().get_option(
@@ -798,7 +798,7 @@ mod rebuild_cost {
             ..Default::default()
         };
         let t = std::time::Instant::now();
-        let mut e = Openh264Encoder::new(&s, None).expect("init");
+        let mut e = Openh264Encoder::new(&s).expect("init");
         let init_ms = t.elapsed().as_secs_f64() * 1000.0;
         let frame = vec![128u8; 1920 * 1080 * 4];
         let t = std::time::Instant::now();
