@@ -31,7 +31,7 @@ libloading = "0.9"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image. Pure-Rust XCB; links the system libxcb.
-x11rb = { version = "0.13", features = ["shm", "xfixes"] }
+x11rb = { version = "0.13", features = ["shm", "xfixes", "xtest", "randr"] }
 image = "=0.25.9"
 # The crate's build.rs probes the FFmpeg found via pkg-config and emits
 # per-version cfgs; one crate version supports FFmpeg 3.0 UP TO the release it

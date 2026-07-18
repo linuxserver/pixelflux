@@ -1417,8 +1417,7 @@ impl NvencEncoder {
     ///    — a `0x04` tag, a picture-type byte derived from the *actual* encoded `pictureType`
     ///    (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than the `force_idr` request, the low 16 bits
     ///    of the frame number, a zero field, and the width and height (all big-endian).
-    /// 4. **Emit and fan out**: append the encoded bytes, mirror them to the recording sink when one
-    ///    is attached, unlock the bitstream, and return the framed buffer.
+    /// 4. **Emit**: append the encoded bytes, unlock the bitstream, and return the framed buffer.
     unsafe fn submit_frame(
         &mut self,
         mapped_buffer: NV_ENC_INPUT_PTR,

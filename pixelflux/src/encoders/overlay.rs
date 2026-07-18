@@ -211,12 +211,15 @@ impl OverlayState {
         }
     }
 
-    /// Render element for a software cursor `image` at `pos` (logical coords).
+    /// Render element for a software cursor `image` at logical `pos` on an output with
+    /// fractional `scale`; the position converts to physical here so the composited cursor
+    /// lands where the damage tracker and clients (which work in physical pixels) expect it.
     pub fn get_cursor_element<R>(
         &self,
         renderer: &mut R,
         image: xcursor::parser::Image,
-        pos: Point<i32, smithay::utils::Logical>,
+        pos: Point<f64, smithay::utils::Logical>,
+        scale: f64,
     ) -> Option<MemoryRenderBufferRenderElement<R>>
     where
         R: Renderer + ImportMem,
@@ -233,7 +236,7 @@ impl OverlayState {
 
         let hot: Point<i32, smithay::utils::Physical> =
             (image.xhot as i32, image.yhot as i32).into();
-        let phys_pos: Point<i32, smithay::utils::Physical> = (pos.x, pos.y).into();
+        let phys_pos = pos.to_physical(smithay::utils::Scale::from(scale)).to_i32_round();
 
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,

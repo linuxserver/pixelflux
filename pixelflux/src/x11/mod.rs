@@ -39,6 +39,7 @@ use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
+pub mod computer_use;
 pub mod cursor;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
@@ -290,7 +291,7 @@ fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
 /// The result may go negative near the frame edges, which `overlay_cursor` clips per pixel to match
 /// the server's own edge clipping.
 #[inline]
-fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
+pub(crate) fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
     (x as i32 - xhot as i32 - cap_x, y as i32 - yhot as i32 - cap_y)
 }
 
@@ -298,7 +299,7 @@ fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: 
 /// at `(img_x, img_y)`, blending each pixel through `blend_pixel` with per-pixel bounds clipping so
 /// an image straddling a frame edge writes only its in-frame portion.
 #[allow(clippy::too_many_arguments)]
-fn overlay_cursor(
+pub(crate) fn overlay_cursor(
     frame: &mut [u8],
     stride: usize,
     frame_w: i32,
@@ -719,7 +720,7 @@ where
                 .is_some_and(|pl| pl.reshape(&psettings, size_changed));
             if !reshaped {
                 drop(pipeline.take());
-                pipeline = Some(X11Pipeline::new(psettings.clone(), recording_sink.clone()));
+                pipeline = Some(X11Pipeline::new(psettings.clone()));
                 if let Some(pl) = &pipeline {
                     let enc_name = pl.encoder_name();
                     let mut log_msg = format!(
@@ -749,7 +750,13 @@ where
         }
         let pl = pipeline.as_mut().unwrap();
 
-        if controls.force_idr.swap(false, Ordering::Relaxed) {
+        // A recorder connecting to the socket sink needs a fresh decode entry point; it is
+        // folded into the same standard request-IDR path as a client-driven force_idr.
+        let sink_idr = recording_sink
+            .as_ref()
+            .map(|s| s.should_force_idr())
+            .unwrap_or(false);
+        if controls.force_idr.swap(false, Ordering::Relaxed) || sink_idr {
             pl.request_idr();
         }
         if controls.rate_dirty.swap(false, Ordering::Acquire) {

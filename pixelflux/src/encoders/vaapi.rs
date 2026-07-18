@@ -138,9 +138,8 @@ fn ff_err_str(err: i32) -> String {
 ///
 /// `current_qp` / `qp_hysteresis_counter` drive the CQP hysteresis in `update_qp`. `cbr_mode`,
 /// `current_bitrate_kbps`, `current_vbv_mult`, and `current_kf_s` cache the live rate-control state
-/// so `reconfigure_rate` re-opens the codec only when a value actually changes. `recording_sink` is
-/// the optional Unix-socket H.264 fan-out; `omit_stripe_headers` drops the 10-byte framing when the
-/// consumer wants a bare Annex-B stream.
+/// so `reconfigure_rate` re-opens the codec only when a value actually changes.
+/// `omit_stripe_headers` drops the 10-byte framing when the consumer wants a bare Annex-B stream.
 pub struct VaapiEncoder {
     encoder_ctx: *mut ff::AVCodecContext,
     codec: *const ff::AVCodec,
@@ -797,7 +796,7 @@ impl VaapiEncoder {
     /// described to the client as one full-height stripe: tag `0x04`, a keyframe flag (`0x01`/`0x00`
     /// from `AV_PKT_FLAG_KEY`), the frame number as a big-endian `u16`, a `0` y-start (a whole frame
     /// starts at the top), then width and height as big-endian `u16`s, followed by the raw Annex-B
-    /// payload. The recording sink intercepts frames at the delivery layer.
+    /// payload.
     /// `omit_stripe_headers` drops the header on the network path too, for a consumer that already
     /// wants raw Annex-B. The loop drains `avcodec_receive_packet` until the encoder is empty,
     /// unref'ing each packet before the next iteration.

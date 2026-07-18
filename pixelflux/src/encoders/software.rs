@@ -9,8 +9,7 @@
 //! Frames are split into horizontal stripes processed in parallel via rayon. Each stripe is
 //! independently hashed against the previous frame for change detection, and only dirty stripes
 //! are encoded. The x264 path maintains per-stripe encoder state across frames for inter-prediction;
-//! the JPEG path is stateless. An optional recording sink receives the H.264 NAL units for
-//! muxing into a file or socket stream.
+//! the JPEG path is stateless.
 
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
@@ -371,10 +370,9 @@ impl H264EncoderWrapper {
     ///
     /// The boolean return is load-bearing: `x264_encoder_encode` can legitimately produce nothing on
     /// a given call, and the caller must forward a stripe only when real bytes exist — never an empty
-    /// or header-only packet. The output also serves two consumers at once, which is why framing is
-    /// conditional: the transport needs the pipeline's small wire header to route the stripe, while
-    /// the optional recording sink needs the *bare* Annex-B elementary stream with no wire header so
-    /// it can be muxed directly.
+    /// or header-only packet. Framing is conditional because the transport needs the pipeline's small
+    /// wire header to route the stripe, while `omit_headers` consumers take the bare Annex-B
+    /// elementary stream.
     ///
     /// 1. **Picture setup**: wraps the borrowed Y/U/V planes and their strides in an
     ///    `x264_picture_t` with the encoder's CSP, stamps the presentation timestamp with `frame_id`,
@@ -387,9 +385,8 @@ impl H264EncoderWrapper {
     ///    the client keys its decode-recovery on the frame type it truly received (IDR = `0x01`,
     ///    I = `0x02`, else `0x00`), then the caller's `fixed_header` (frame number, y-start, width,
     ///    height). With `omit_headers` the output is bare Annex-B.
-    /// 4. **Payload + recording**: every NAL payload is appended to `output_buf`, and each is also
-    ///    forwarded to the recording sink when one is attached — giving the sink raw Annex-B without
-    ///    the wire header.
+    /// 4. **Payload**: every NAL payload is appended to `output_buf` after the optional header,
+    ///    so the bytes past the wire header are always a contiguous Annex-B access unit.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_with_headers(
         &mut self,
@@ -581,8 +578,8 @@ impl StripeState {
 ///
 /// # Fields
 ///
-/// * `data` - Compressed payload (JPEG or H.264 NAL units). `Arc`-shared so the recording
-///   tap can retain the frame for its client queues without copying the bytes.
+/// * `data` - Compressed payload (JPEG or H.264 NAL units). `Arc`-shared so every
+///   delivery-layer consumer can retain the frame without copying the bytes.
 /// * `data_type` - Codec tag: **1 = JPEG**, **2 = H.264**.
 /// * `stripe_y_start` - Y pixel coordinate of the stripe's top edge within the frame.
 /// * `stripe_height` - Height of the stripe in pixels.
@@ -603,8 +600,7 @@ pub struct EncodedStripe {
 /// parallel stripes; bandwidth is precious, so unchanged stripes are skipped. Each stripe is
 /// independently hashed against the previous frame for change detection, and only dirty stripes
 /// are encoded. The x264 path maintains per-stripe encoder state across frames for
-/// inter-prediction; the JPEG path is stateless. The recording sink is attached only in
-/// single-stripe mode because several independent sub-frame bitstreams cannot be muxed.
+/// inter-prediction; the JPEG path is stateless.
 ///
 /// # Arguments
 ///
@@ -676,10 +672,10 @@ pub struct EncodedStripe {
 ///    OpenH264 encoder — one fewer than the available cores, clamped to `[1, 4]`. The slice threads
 ///    keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
 ///    because `zerolatency` makes x264 slice-threaded and more than four slices trips decode
-///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread. Multiple stripes instead run across the
-///    rayon pool with a single x264 thread and one conversion band each, since the parallelism there
-///    already comes from encoding the stripes concurrently. The recording sink is attached only in single-stripe mode, because the several
-///    independent sub-frame bitstreams of striped mode cannot be muxed into one recording.
+///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread.
+///    Multiple stripes instead run across the rayon pool with a single x264 thread and one
+///    conversion band each, since the parallelism there already comes from encoding the stripes
+///    concurrently.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,

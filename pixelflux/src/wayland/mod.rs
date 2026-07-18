@@ -11,5 +11,7 @@
 
 /// Headless Smithay compositor, protocol handlers, and input routing.
 pub mod frontend;
-/// Wayland cursor shape to PNG resolution.
+/// Wayland cursor shape to PNG resolution and the cursor delivery worker.
 pub mod cursor;
+/// Seat keymap ownership: base layout plus batched overlay keysym binding.
+pub mod keymap;

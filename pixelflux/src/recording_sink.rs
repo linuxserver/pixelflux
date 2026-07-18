@@ -211,6 +211,87 @@ impl Drop for RecordingSink {
     }
 }
 
+#[cfg(test)]
+mod cost_tests {
+    //! The sink's isolation contract, measured: feeding a frame must cost nothing when no
+    //! recorder is connected (empty-clients early return), microseconds when a healthy
+    //! recorder drains its queue, and stay bounded (a lock + `try_send`, never a blocking
+    //! write) when a recorder stalls completely — until the bounded queue overflows and the
+    //! client is dropped, returning the tap to idle cost.
+
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    fn frame(len: usize) -> EncodedStripe {
+        let mut data = vec![0u8; len];
+        data[0] = 0x04; // wire-header tag so the 10-byte strip path runs
+        EncodedStripe {
+            data: Arc::new(data),
+            data_type: 2,
+            stripe_y_start: 0,
+            stripe_height: 720,
+            frame_id: 0,
+        }
+    }
+
+    fn feed_timed(sink: &RecordingSink, n: usize, len: usize) -> (f64, f64) {
+        let f = frame(len);
+        let mut max_us = 0f64;
+        let mut total_us = 0f64;
+        for _ in 0..n {
+            let t = Instant::now();
+            sink.write_encoded_frame(&f);
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            total_us += us;
+            max_us = max_us.max(us);
+            thread::sleep(Duration::from_micros(200));
+        }
+        (total_us / n as f64, max_us)
+    }
+
+    #[test]
+    fn stalled_recorder_isolation_cost() {
+        let path = format!("/tmp/pf-sink-cost-{}.sock", std::process::id());
+        let sink = RecordingSink::try_bind(&path).expect("bind");
+
+        // Idle: no client connected.
+        let (idle_mean, idle_max) = feed_timed(&sink, 500, 100_000);
+
+        // Healthy: a client draining as fast as it can.
+        let mut healthy = UnixStream::connect(&path).expect("connect");
+        thread::sleep(Duration::from_millis(200));
+        let drain = thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 20];
+            while healthy.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+        let (healthy_mean, healthy_max) = feed_timed(&sink, 500, 100_000);
+
+        // Stalled: a connected client that never reads. The socket buffer fills, then the
+        // bounded queue fills, then the client is dropped (~256 frames later).
+        let stalled = UnixStream::connect(&path).expect("connect");
+        thread::sleep(Duration::from_millis(200));
+        let (stalled_mean, stalled_max) = feed_timed(&sink, 500, 100_000);
+        drop(stalled);
+
+        println!(
+            "[sink-cost] idle    mean {idle_mean:.3}us max {idle_max:.3}us\n\
+             [sink-cost] healthy mean {healthy_mean:.3}us max {healthy_max:.3}us\n\
+             [sink-cost] stalled mean {stalled_mean:.3}us max {stalled_max:.3}us"
+        );
+        drop(sink);
+        let _ = drain.join();
+
+        assert!(idle_mean < 5.0, "idle feed should be sub-5us, was {idle_mean:.3}us");
+        assert!(healthy_mean < 100.0, "healthy feed should be tens of us, was {healthy_mean:.3}us");
+        assert!(
+            stalled_max < 10_000.0,
+            "a stalled recorder must never block the tap >10ms, was {stalled_max:.3}us"
+        );
+    }
+}
+
 /// Write one whole frame to a recorder's socket, resuming across the soft timeouts a slow reader
 /// induces so a partial Annex-B NAL is never left behind. Aborts if `stop` is set (the client was
 /// dropped by [`RecordingSink::write_encoded_frame`]) or a hard error occurs.
