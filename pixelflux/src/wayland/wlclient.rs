@@ -68,6 +68,50 @@ pub(crate) fn wait_readable(fd: RawFd, timeout: Duration) -> Result<bool, String
     }
 }
 
+/// Poll two fds for readability at once (wayland socket + a wake pipe); returns
+/// `(a_readable, b_readable)`, both false on timeout. Hangup counts as readable
+/// so a closed wake pipe unblocks its waiter.
+pub(crate) fn wait_readable2(
+    a: RawFd,
+    b: RawFd,
+    timeout: Option<Duration>,
+) -> Result<(bool, bool), String> {
+    loop {
+        let mut pfds = [
+            libc::pollfd { fd: a, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: b, events: libc::POLLIN, revents: 0 },
+        ];
+        let ms = timeout.map(|t| t.as_millis().max(1) as libc::c_int).unwrap_or(-1);
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, ms) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("poll: {err}"));
+        }
+        let hit = |r: libc::c_short| r & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+        return Ok((hit(pfds[0].revents), hit(pfds[1].revents)));
+    }
+}
+
+/// Drain every pending byte from a wake pipe without blocking.
+pub(crate) fn drain_pipe(fd: RawFd) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            return;
+        }
+    }
+}
+
+/// One wake byte, non-blocking; a full pipe already guarantees a pending wake.
+pub(crate) fn wake_write(fd: RawFd) {
+    let b = [1u8];
+    unsafe { libc::write(fd, b.as_ptr() as *const libc::c_void, 1) };
+}
+
 /// `EventQueue::roundtrip` with a deadline: a wedged compositor becomes an error
 /// instead of hanging the calling thread (and everything queued behind it).
 pub(crate) fn bounded_roundtrip<S>(
@@ -132,6 +176,15 @@ pub(crate) fn memfd_with(data: &[u8]) -> Result<OwnedFd, String> {
 pub(crate) fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd), String> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Non-blocking CLOEXEC pipe for wake signalling (read end, write end).
+pub(crate) fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
         return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })

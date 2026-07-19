@@ -820,15 +820,14 @@ pub fn set_app_wayland_display(display: Option<String>) {
 
 /// Resolve the app compositor socket PATH for CU typing, or None to type on the
 /// local seat. The ABI value selkies set wins; a standalone CU (no selkies) falls
-/// back to PIXELFLUX_APP_WAYLAND_DISPLAY, then SELKIES_APP_WAYLAND_DISPLAY. A value
-/// naming pixelflux's own compositor means nothing is nested.
+/// back to PIXELFLUX_APP_WAYLAND_DISPLAY. A value naming pixelflux's own
+/// compositor means nothing is nested.
 fn app_wayland_socket_path() -> Option<String> {
     let name = CU_APP_WAYLAND_DISPLAY
         .lock()
         .unwrap()
         .clone()
         .or_else(|| std::env::var("PIXELFLUX_APP_WAYLAND_DISPLAY").ok())
-        .or_else(|| std::env::var("SELKIES_APP_WAYLAND_DISPLAY").ok())
         .filter(|s| !s.is_empty())?;
     if crate::wait_socket_name(Duration::from_millis(0)).as_deref() == Some(name.as_str()) {
         return None;

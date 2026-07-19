@@ -81,11 +81,13 @@ use smithay::{
             element::{
                 memory::MemoryRenderBufferRenderElement,
                 surface::WaylandSurfaceRenderElement,
-                AsRenderElements, Wrap,
+                AsRenderElements, Element, RenderElement, Wrap,
             },
             gles::GlesRenderer,
             pixman::PixmanRenderer,
-            Bind, ImportAll, ImportEgl, ImportMem,
+            sync::SyncPoint,
+            Bind, ExportMem, Frame as _, ImportAll, ImportDma, ImportEgl, ImportMem,
+            Renderer as _,
         },
     },
     desktop::{space::SpaceRenderElements, Space},
@@ -1544,31 +1546,30 @@ fn start_capture_on_display(
 ) {
     use smithay::wayland::fractional_scale::with_fractional_scale;
 
-    // Host-capture mode (primary display): connect on first use and point the
-    // capture thread at the requested size. The compositor keeps running (CU,
-    // clipboard callbacks, input fallbacks) but its renderer is bypassed.
-    if display_id == 0 && !settings.wayland_host_display.is_empty() {
+    // Host-capture mode: connect on first use and point this display's capture
+    // thread at the requested size. The compositor keeps running (CU, clipboard
+    // callbacks, input fallbacks) but its renderer is bypassed.
+    if !settings.wayland_host_display.is_empty() {
         if state.host.is_none() {
-            // The compositor's own allocator device: capture buffers come from the
-            // same render node the encoder imports from (reopened via its live fd,
-            // since the resolved path string is not retained in auto mode).
-            let gbm = if state.use_gpu {
+            // Capture buffers come from the same render node the encoder imports
+            // from, resolved via its live fd (the path string is not retained in
+            // auto mode); each capture thread opens its own device handle.
+            let gbm_path = if state.use_gpu {
                 state.gbm_device.as_ref().and_then(|dev| {
                     use std::os::fd::{AsFd as _, AsRawFd as _};
                     let fd = dev.as_fd().as_raw_fd();
-                    std::fs::read_link(format!("/proc/self/fd/{fd}"))
-                        .ok()
-                        .and_then(|p| std::fs::File::options().read(true).write(true).open(p).ok())
-                        .and_then(|f| GbmDevice::new(f).ok())
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
                 })
             } else {
                 None
             };
-            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm) {
+            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path)
+            {
                 Ok(h) => {
                     println!(
-                        "[HostCapture] capturing host compositor '{}'.",
-                        settings.wayland_host_display
+                        "[HostCapture] capturing host compositor '{}' ({} outputs).",
+                        settings.wayland_host_display,
+                        h.output_count()
                     );
                     state.host = Some(h);
                 }
@@ -1579,7 +1580,13 @@ fn start_capture_on_display(
             }
         }
         if let Some(host) = &state.host {
-            host.start_capture(settings.width, settings.height);
+            // The node's layout offset rides along so the host's heads mirror
+            // selkies' union layout (input coordinates already assume it).
+            if let Some(idx) = state.node_idx_for_id(display_id) {
+                let pos = state.output_nodes[idx].pos;
+                host.set_layout(display_id, pos.0, pos.1);
+            }
+            host.start_capture(display_id, settings.width, settings.height);
         }
     }
 
@@ -1957,6 +1964,80 @@ fn start_capture_on_display(
 /// display's own encode path, and answer a pending screenshot on the primary. Returns true
 /// when the tick was skipped because this display's encode pool was still busy (the caller
 /// then retries shortly instead of waiting a full frame interval).
+/// Stamp the watermark element onto `target` in place — no clear, so the
+/// captured content underneath stays — returning the draw's sync point for the
+/// encoder to wait on.
+fn draw_host_watermark(
+    renderer: &mut GlesRenderer,
+    overlay: &crate::encoders::overlay::OverlayState,
+    target: &mut Dmabuf,
+    size: (i32, i32),
+) -> Result<SyncPoint, String> {
+    let elem = overlay
+        .get_watermark_element(renderer)
+        .ok_or("watermark element unavailable")?;
+    let mut fb = renderer.bind(target).map_err(|e| format!("bind: {e:?}"))?;
+    let mut frame = renderer
+        .render(&mut fb, (size.0, size.1).into(), Transform::Normal)
+        .map_err(|e| format!("render: {e:?}"))?;
+    let dst = elem.geometry(1.0.into());
+    let local = Rectangle::from_size(dst.size);
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+        .map_err(|e| format!("draw: {e:?}"))?;
+    frame.finish().map_err(|e| format!("finish: {e:?}"))
+}
+
+/// Re-compose `src` (the retained host frame) plus the watermark into `target`:
+/// the path a moving watermark needs, since re-drawing over the same retained
+/// buffer would leave trails.
+fn compose_host_watermark(
+    renderer: &mut GlesRenderer,
+    overlay: &crate::encoders::overlay::OverlayState,
+    src: &Dmabuf,
+    target: &mut Dmabuf,
+    size: (i32, i32),
+) -> Result<SyncPoint, String> {
+    let elem = overlay
+        .get_watermark_element(renderer)
+        .ok_or("watermark element unavailable")?;
+    let tex = renderer
+        .import_dmabuf(src, None)
+        .map_err(|e| format!("import: {e:?}"))?;
+    let mut fb = renderer.bind(target).map_err(|e| format!("bind: {e:?}"))?;
+    let full: Rectangle<i32, Physical> = Rectangle::from_size((size.0, size.1).into());
+    let mut frame = renderer
+        .render(&mut fb, (size.0, size.1).into(), Transform::Normal)
+        .map_err(|e| format!("render: {e:?}"))?;
+    frame
+        .render_texture_from_to(
+            &tex,
+            Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
+            full,
+            &[full],
+            // Opaque: the capture format's undefined alpha must not blend, it
+            // would leave the target's previous content (and stamped
+            // watermarks) underneath.
+            &[full],
+            Transform::Normal,
+            1.0,
+            None,
+            &[],
+        )
+        .map_err(|e| format!("texture: {e:?}"))?;
+    let dst = elem.geometry(1.0.into());
+    let local = Rectangle::from_size(dst.size);
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+        .map_err(|e| format!("draw: {e:?}"))?;
+    frame.finish().map_err(|e| format!("finish: {e:?}"))
+}
+
+fn warn_once_host_watermark(e: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("[HostCapture] watermark compositing failed: {e}");
+    }
+}
+
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
@@ -2073,27 +2154,49 @@ fn render_node_tick(
 
     // Host-capture mode: the host compositor already blitted this display's frame
     // into one of our buffers (screencopy); adopt it in place of compositing.
-    let host_mode = state.host.is_some() && node.id == 0;
+    let host_mode = state.host.as_ref().map(|h| h.has_output_for(node.id)).unwrap_or(false);
+    if state.host.is_some() && !host_mode {
+        // No host output backs this display (start_capture already warned):
+        // produce nothing rather than the compositor's own empty content.
+        if let Some((id, buf)) = pool_slot.take() {
+            if let Some(cap) = node.capture.as_ref() {
+                if let Some(ref pool) = cap.encode_pool {
+                    pool.cancel(id, buf);
+                }
+            }
+        }
+        return false;
+    }
     // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
     let mut host_enc_dmabuf: Option<Dmabuf> = None;
     if host_mode {
+        const RETAINED_OK: u8 = 0;
+        const RETAINED_NONE: u8 = 1;
+        const RETAINED_MISMATCH: u8 = 2;
+        let host_idx = node.id;
         let gpu_encoder = node
             .capture
             .as_ref()
             .map(|c| c.video_encoder.is_some())
             .unwrap_or(false);
-        let new_frame = state.host.as_ref().unwrap().try_take_frame();
+        // The session steps out of `state` while frames are adopted so the
+        // renderer can composite the watermark / serve screenshot readbacks.
+        let host = state.host.take().unwrap();
+        let new_frame = host.try_take_frame(host_idx);
         let have_new = new_frame.is_some();
         // Streaming mode wants a constant-rate stream (the client's decoder pipeline
         // is built for it), so re-encode the retained frame every tick like the
-        // compositor path does. Outside streaming mode, stay damage-driven and only
-        // re-encode when an IDR is pending (a viewer opening its keyframe gate).
+        // compositor path does. Outside streaming mode, stay damage-driven, waking
+        // only for a pending IDR (a viewer opening its keyframe gate), a screenshot
+        // request, or a bouncing watermark that must keep moving.
         let streaming = node
             .capture
             .as_ref()
             .map(|c| c.settings.video_streaming_mode)
             .unwrap_or(false);
-        if !have_new && !want_idr_for_host && !streaming {
+        let wm_active = node.overlay_state.is_active();
+        let wm_animated = wm_active && node.overlay_state.is_animated();
+        if !have_new && !want_idr_for_host && !streaming && !take_screenshot && !wm_animated {
             if let Some((id, buf)) = pool_slot.take() {
                 if let Some(cap) = node.capture.as_ref() {
                     if let Some(ref pool) = cap.encode_pool {
@@ -2101,40 +2204,124 @@ fn render_node_tick(
                     }
                 }
             }
+            state.host = Some(host);
             return false;
         }
         if let Some(f) = new_frame {
-            state.host.as_ref().unwrap().retain_frame(f);
+            host.retain_frame(host_idx, f);
         }
         // Consume the (new or prior) retained frame's content into the pool slot /
-        // GPU dmabuf. The frame stays retained for the next IDR.
-        let bad_combo = state.host.as_ref().unwrap().with_retained(|r| {
-            let Some(f) = r else { return true };
-            damage_rects = f.damage.clone();
+        // GPU dmabuf. The frame stays retained for the next IDR. The CPU path
+        // blends the watermark in place; the GPU path composites it below. Damage
+        // is the fresh blit's; a re-encode of retained content has none of its own.
+        let mut wm_drawn = false;
+        let outcome = host.with_retained(host_idx, |r| {
+            let Some(f) = r else { return RETAINED_NONE };
+            damage_rects = if have_new { f.damage.clone() } else { Vec::new() };
             if let Some(cpu) = f.cpu.as_ref() {
                 if gpu_encoder {
-                    return true; // software frames, GPU encoder — mismatch
+                    return RETAINED_MISMATCH; // software frames, GPU encoder
                 }
                 if let Some((_, ref mut buf)) = pool_slot {
                     cpu.write_bgra(f.width, f.height, buf);
+                    if wm_active {
+                        node.overlay_state.blend_bgra(buf, (f.width as usize) * 4, f.width, f.height);
+                        wm_drawn = true;
+                    }
                 }
                 cpu.write_bgra(f.width, f.height, &mut node.frame_buffer);
+                if wm_active {
+                    node.overlay_state
+                        .blend_bgra(&mut node.frame_buffer, (f.width as usize) * 4, f.width, f.height);
+                }
             } else if let Some(dmabuf) = f.dmabuf.as_ref() {
                 if !gpu_encoder {
-                    return true; // GPU frames, CPU encoder — mismatch
+                    return RETAINED_MISMATCH; // GPU frames, CPU encoder
                 }
                 host_enc_dmabuf = Some(dmabuf.clone());
             }
-            false
+            RETAINED_OK
         });
-        if bad_combo {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[HostCapture] host frame type and encoder mismatch \
-                     (GPU host needs a GPU encoder; software host needs a CPU encoder)."
-                );
+        // GPU path: composite the watermark and serve screenshot readbacks with
+        // the renderer. A bouncing watermark re-composes retained content into
+        // this display's offscreen target every tick (drawing in place would
+        // trail); anchored watermarks are stamped once onto each fresh blit and
+        // ride along with retained re-encodes.
+        if let Some(src) = host_enc_dmabuf.clone() {
+            if wm_active {
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    if wm_animated {
+                        if let Some((_, target)) = node.offscreen_buffer.as_mut() {
+                            match compose_host_watermark(
+                                renderer,
+                                &node.overlay_state,
+                                &src,
+                                target,
+                                (width, height),
+                            ) {
+                                Ok(sync) => {
+                                    render_sync = Some(sync);
+                                    host_enc_dmabuf = Some(target.clone());
+                                    wm_drawn = true;
+                                }
+                                Err(e) => warn_once_host_watermark(&e),
+                            }
+                        }
+                    } else if have_new {
+                        let mut target = src.clone();
+                        match draw_host_watermark(
+                            renderer,
+                            &node.overlay_state,
+                            &mut target,
+                            (width, height),
+                        ) {
+                            Ok(sync) => {
+                                render_sync = Some(sync);
+                                wm_drawn = true;
+                            }
+                            Err(e) => warn_once_host_watermark(&e),
+                        }
+                    }
+                }
+            }
+            if take_screenshot {
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    let mut shot = host_enc_dmabuf.clone().unwrap_or(src);
+                    match renderer.bind(&mut shot) {
+                        Ok(fb) => {
+                            let rect = Rectangle::new((0, 0).into(), (width, height).into());
+                            match renderer.copy_framebuffer(&fb, rect, Fourcc::Abgr8888) {
+                                Ok(mapping) => match renderer.map_texture(&mapping) {
+                                    Ok(data) => {
+                                        let n = data.len().min(node.frame_buffer.len());
+                                        node.frame_buffer[..n].copy_from_slice(&data[..n]);
+                                    }
+                                    Err(e) => eprintln!("[HostCapture] screenshot map: {e:?}"),
+                                },
+                                Err(e) => eprintln!("[HostCapture] screenshot copy: {e:?}"),
+                            }
+                        }
+                        Err(e) => eprintln!("[HostCapture] screenshot bind: {e:?}"),
+                    };
+                }
+            }
+        }
+        if wm_drawn {
+            if let Some(rect) = node.overlay_state.damage_rect(width, height) {
+                damage_rects.push(rect);
+            }
+        }
+        state.host = Some(host);
+        if outcome != RETAINED_OK {
+            if outcome == RETAINED_MISMATCH {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[HostCapture] host frame type and encoder mismatch \
+                         (GPU host needs a GPU encoder; software host needs a CPU encoder)."
+                    );
+                }
             }
             if let Some((id, buf)) = pool_slot.take() {
                 if let Some(cap) = node.capture.as_ref() {
@@ -2785,6 +2972,9 @@ fn create_output_on(
     state.space.map_output(&output, (x, y));
     let global = output.create_global::<AppState>(&state.dh);
     let damage_tracker = OutputDamageTracker::from_output(&output);
+    if let Some(host) = state.host.as_ref() {
+        host.set_layout(id, x, y);
+    }
     println!("[Wayland] Output {id} created: {width}x{height} @ ({x}, {y}) scale {scale:.2}.");
     state.output_nodes.push(wayland::frontend::OutputNode {
         id,
@@ -2862,6 +3052,9 @@ fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
         return false;
     }
     state.output_nodes[idx].pos = (x, y);
+    if let Some(host) = state.host.as_ref() {
+        host.set_layout(id, x, y);
+    }
     output.change_current_state(None, None, None, Some((x, y).into()));
     state.space.map_output(&output, (x, y));
     let windows: Vec<smithay::desktop::Window> = state
@@ -2888,6 +3081,9 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     }
     let Some(_) = state.node_idx_for_id(id) else { return false };
     stop_capture_on_display(state, id);
+    if let Some(host) = state.host.as_ref() {
+        host.idle_output(id);
+    }
     wayland_owners().lock().unwrap().remove(&id);
     // Relocate while the node is still registered so output leave/enter both resolve.
     let windows: Vec<smithay::desktop::Window> = state
