@@ -10,7 +10,11 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 wayland-server = { version = "0.31.10", features = ["dlopen"] }
-wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
 crossbeam-channel = "0.5"
 calloop = "0.14"
 turbojpeg = "1.3" 

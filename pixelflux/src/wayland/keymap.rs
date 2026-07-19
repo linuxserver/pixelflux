@@ -40,6 +40,20 @@ pub struct KeymapPolicy {
     by_sym: HashMap<u32, usize>,
     /// Slot recycle order, oldest bind first.
     lru: VecDeque<usize>,
+    /// First overlay keycode (xkb numbering); slot i lives at `overlay_first + i`.
+    overlay_first: u32,
+    /// Overlay slot count.
+    overlay_capacity: usize,
+}
+
+/// Keysym one literal character types as: Latin-1 printables map 1:1, `\n` types
+/// Return (the raw utf32 table maps it to Linefeed, which no keymap binds), other
+/// control characters their `0xffXX` function keysyms, everything else the
+/// `0x01000000 | codepoint` Unicode form (0 = unmappable). The keysym then resolves
+/// against an ACTIVE keymap, never a hardcoded layout table.
+pub fn keysym_for_char(c: char) -> u32 {
+    let c = if c == '\n' { '\r' } else { c };
+    xkb::utf32_to_keysym(c as u32).raw()
 }
 
 /// Compile an XKB_KEYMAP_FORMAT_TEXT_V1 string, or `None` when it does not compile.
@@ -97,12 +111,22 @@ pub fn level0_syms(keymap: &xkb::Keymap) -> HashMap<u32, u32> {
 impl KeymapPolicy {
     /// Placeholder policy before the seat keymap is known; `rebuild_base` fills it in.
     pub fn empty() -> Self {
+        Self::with_overlay_range(OVERLAY_FIRST_KEYCODE, OVERLAY_LAST_KEYCODE)
+    }
+
+    /// Policy with a custom overlay keycode range (inclusive, xkb numbering). The seat
+    /// uses `empty()`'s above-255 range (pure-Wayland clients resolve it fine); the
+    /// virtual-keyboard client typing into a nested compositor uses a sub-256 range so
+    /// XWayland apps under that compositor stay reachable.
+    pub fn with_overlay_range(first: u32, last: u32) -> Self {
         Self {
             base_text: String::new(),
             base_map: HashMap::new(),
             slots: Vec::new(),
             by_sym: HashMap::new(),
             lru: VecDeque::new(),
+            overlay_first: first,
+            overlay_capacity: (last - first + 1) as usize,
         }
     }
 
@@ -145,7 +169,7 @@ impl KeymapPolicy {
         }
         self.by_sym
             .get(&keysym)
-            .map(|&slot| (OVERLAY_FIRST_KEYCODE + slot as u32, 0))
+            .map(|&slot| (self.overlay_first + slot as u32, 0))
     }
 
     /// True when `keysym` resolves at level 0 (base or overlay) — i.e. typable without
@@ -203,9 +227,9 @@ impl KeymapPolicy {
                 self.lru.remove(at);
             }
             self.lru.push_back(slot);
-            return (OVERLAY_FIRST_KEYCODE + slot as u32, 0);
+            return (self.overlay_first + slot as u32, 0);
         }
-        let slot = if self.slots.len() < OVERLAY_CAPACITY {
+        let slot = if self.slots.len() < self.overlay_capacity {
             self.slots.push(None);
             self.slots.len() - 1
         } else {
@@ -220,7 +244,7 @@ impl KeymapPolicy {
         self.by_sym.insert(sym, slot);
         self.lru.push_back(slot);
         *changed = true;
-        (OVERLAY_FIRST_KEYCODE + slot as u32, 0)
+        (self.overlay_first + slot as u32, 0)
     }
 
     /// Oldest slot whose keycode is not currently held down; a held keycode must keep its
@@ -229,7 +253,7 @@ impl KeymapPolicy {
         let at = self
             .lru
             .iter()
-            .position(|&slot| !pressed.contains(&(OVERLAY_FIRST_KEYCODE + slot as u32)))?;
+            .position(|&slot| !pressed.contains(&(self.overlay_first + slot as u32)))?;
         self.lru.remove(at)
     }
 
@@ -255,7 +279,7 @@ impl KeymapPolicy {
             return self.base_text.clone();
         };
         let old_max: u32 = base[num_at..num_at + num_len].trim().parse().unwrap_or(255);
-        let need_max = OVERLAY_FIRST_KEYCODE + occupied.last().map(|&(i, _)| i as u32).unwrap_or(0);
+        let need_max = self.overlay_first + occupied.last().map(|&(i, _)| i as u32).unwrap_or(0);
         let mut text = String::with_capacity(base.len() + occupied.len() * 48);
         text.push_str(&base[..num_at]);
         text.push_str(&old_max.max(need_max).to_string());
@@ -266,7 +290,7 @@ impl KeymapPolicy {
         };
         text.push_str(&rest[..kc_end]);
         for &(i, _) in &occupied {
-            text.push_str(&format!("\t<P{:03}> = {};\n", i, OVERLAY_FIRST_KEYCODE + i as u32));
+            text.push_str(&format!("\t<P{:03}> = {};\n", i, self.overlay_first + i as u32));
         }
         let rest = &rest[kc_end..];
         let Some(close_at) = rest
@@ -366,6 +390,25 @@ mod tests {
             assert_ne!(kc, held_kc, "held keycode must not be rebound");
         }
         assert_eq!(p.resolve(held_sym), Some((held_kc, 0)));
+    }
+
+    #[test]
+    fn sub256_overlay_range_overrides_base_keycode_names() {
+        // The virtual-keyboard client's range collides with keycodes the base
+        // already names (<I150>…); the spliced definitions must win so overlay
+        // keysyms resolve at their assigned keycodes.
+        let mut p = KeymapPolicy::with_overlay_range(150, 255);
+        p.rebuild_base(us_base());
+        let (out, changed) = p.bind_many_plain(&[0x1004E2D, 0x61], &HashSet::new());
+        assert!(changed);
+        assert_eq!(out[0], 150);
+        let km = compile_keymap(&p.keymap_text()).expect("sub-256 overlay keymap compiles");
+        let got = km.key_get_syms_by_level(xkb::Keycode::new(out[0]), 0, 0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].raw(), 0x1004E2D);
+        // 'a' resolves plain in the base without consuming a slot.
+        assert!(out[1] < 150);
+        assert_eq!(out[1], p.resolve(0x61).unwrap().0);
     }
 
     #[test]

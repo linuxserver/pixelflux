@@ -248,7 +248,7 @@ smithay::backend::renderer::element::render_elements! {
 /// the buffer is described precisely enough (fd, stride, DRM modifier) for the importer to interpret
 /// it. One ARGB8888 plane is all that is carried because the compositor's offscreen target is exactly
 /// that single-plane format.
-fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
+pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier();
     let stride = bo.stride();
@@ -308,6 +308,9 @@ pub struct RustCaptureSettings {
     pub debug_logging: bool,
     pub auto_adjust_screen_capture_size: bool,
     pub recording_socket: String,
+    /// Wayland display of an EXTERNAL compositor to capture (host-capture mode);
+    /// empty composites own clients as usual.
+    pub wayland_host_display: String,
     /// When true, encoders emit the raw payload without the per-stripe header byte block;
     /// stripe metadata is then carried only on the frame attributes.
     pub omit_stripe_headers: bool,
@@ -411,6 +414,7 @@ impl Default for RustCaptureSettings {
             debug_logging: false,
             auto_adjust_screen_capture_size: false,
             recording_socket: String::new(),
+            wayland_host_display: String::new(),
             omit_stripe_headers: false,
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,
@@ -498,6 +502,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .unwrap_or(false),
         recording_socket: settings
             .getattr("recording_socket")
+            .ok()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default(),
+        wayland_host_display: settings
+            .getattr("wayland_host_display")
             .ok()
             .and_then(|v| v.extract::<String>().ok())
             .unwrap_or_default(),
@@ -1535,6 +1544,45 @@ fn start_capture_on_display(
 ) {
     use smithay::wayland::fractional_scale::with_fractional_scale;
 
+    // Host-capture mode (primary display): connect on first use and point the
+    // capture thread at the requested size. The compositor keeps running (CU,
+    // clipboard callbacks, input fallbacks) but its renderer is bypassed.
+    if display_id == 0 && !settings.wayland_host_display.is_empty() {
+        if state.host.is_none() {
+            // The compositor's own allocator device: capture buffers come from the
+            // same render node the encoder imports from (reopened via its live fd,
+            // since the resolved path string is not retained in auto mode).
+            let gbm = if state.use_gpu {
+                state.gbm_device.as_ref().and_then(|dev| {
+                    use std::os::fd::{AsFd as _, AsRawFd as _};
+                    let fd = dev.as_fd().as_raw_fd();
+                    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                        .ok()
+                        .and_then(|p| std::fs::File::options().read(true).write(true).open(p).ok())
+                        .and_then(|f| GbmDevice::new(f).ok())
+                })
+            } else {
+                None
+            };
+            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm) {
+                Ok(h) => {
+                    println!(
+                        "[HostCapture] capturing host compositor '{}'.",
+                        settings.wayland_host_display
+                    );
+                    state.host = Some(h);
+                }
+                Err(e) => eprintln!(
+                    "[HostCapture] connect '{}' failed: {e}",
+                    settings.wayland_host_display
+                ),
+            }
+        }
+        if let Some(host) = &state.host {
+            host.start_capture(settings.width, settings.height);
+        }
+    }
+
     let Some(node_idx) = state.node_idx_for_id(display_id) else {
         eprintln!("[Wayland] StartCapture: no output with display id {display_id}.");
         return;
@@ -1967,6 +2015,15 @@ fn render_node_tick(
         }
     }
     let requested_idr = node.capture.as_ref().map(|c| c.pending_force_idr).unwrap_or(false);
+    // A client keyframe request lands on the hardware path's atomic (RequestIdr sets
+    // it whenever an encode pool exists); host mode consults it — without consuming —
+    // to decide whether a static screen must re-encode its retained frame.
+    let hw_idr_pending = node
+        .capture
+        .as_ref()
+        .map(|c| c.encode_controls.force_idr.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let want_idr_for_host = requested_idr || hw_idr_pending;
 
     let mut pool_slot: Option<(usize, Vec<u8>)> = None;
     if let Some(cap) = node.capture.as_ref() {
@@ -2014,7 +2071,84 @@ fn render_node_tick(
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(true);
 
-    if state.use_gpu {
+    // Host-capture mode: the host compositor already blitted this display's frame
+    // into one of our buffers (screencopy); adopt it in place of compositing.
+    let host_mode = state.host.is_some() && node.id == 0;
+    // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
+    let mut host_enc_dmabuf: Option<Dmabuf> = None;
+    if host_mode {
+        let gpu_encoder = node
+            .capture
+            .as_ref()
+            .map(|c| c.video_encoder.is_some())
+            .unwrap_or(false);
+        let new_frame = state.host.as_ref().unwrap().try_take_frame();
+        let have_new = new_frame.is_some();
+        // Streaming mode wants a constant-rate stream (the client's decoder pipeline
+        // is built for it), so re-encode the retained frame every tick like the
+        // compositor path does. Outside streaming mode, stay damage-driven and only
+        // re-encode when an IDR is pending (a viewer opening its keyframe gate).
+        let streaming = node
+            .capture
+            .as_ref()
+            .map(|c| c.settings.video_streaming_mode)
+            .unwrap_or(false);
+        if !have_new && !want_idr_for_host && !streaming {
+            if let Some((id, buf)) = pool_slot.take() {
+                if let Some(cap) = node.capture.as_ref() {
+                    if let Some(ref pool) = cap.encode_pool {
+                        pool.cancel(id, buf);
+                    }
+                }
+            }
+            return false;
+        }
+        if let Some(f) = new_frame {
+            state.host.as_ref().unwrap().retain_frame(f);
+        }
+        // Consume the (new or prior) retained frame's content into the pool slot /
+        // GPU dmabuf. The frame stays retained for the next IDR.
+        let bad_combo = state.host.as_ref().unwrap().with_retained(|r| {
+            let Some(f) = r else { return true };
+            damage_rects = f.damage.clone();
+            if let Some(cpu) = f.cpu.as_ref() {
+                if gpu_encoder {
+                    return true; // software frames, GPU encoder — mismatch
+                }
+                if let Some((_, ref mut buf)) = pool_slot {
+                    cpu.write_bgra(f.width, f.height, buf);
+                }
+                cpu.write_bgra(f.width, f.height, &mut node.frame_buffer);
+            } else if let Some(dmabuf) = f.dmabuf.as_ref() {
+                if !gpu_encoder {
+                    return true; // GPU frames, CPU encoder — mismatch
+                }
+                host_enc_dmabuf = Some(dmabuf.clone());
+            }
+            false
+        });
+        if bad_combo {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[HostCapture] host frame type and encoder mismatch \
+                     (GPU host needs a GPU encoder; software host needs a CPU encoder)."
+                );
+            }
+            if let Some((id, buf)) = pool_slot.take() {
+                if let Some(cap) = node.capture.as_ref() {
+                    if let Some(ref pool) = cap.encode_pool {
+                        pool.cancel(id, buf);
+                    }
+                }
+            }
+            return false;
+        }
+        render_success = true;
+    }
+
+    if !host_mode && state.use_gpu {
         if let Some(renderer) = state.gles_renderer.as_mut() {
             let mut cap = node.capture.as_mut();
             if let Some((_bo, dmabuf)) = node.offscreen_buffer.as_mut() {
@@ -2193,7 +2327,7 @@ fn render_node_tick(
                 }
             }
         }
-    } else {
+    } else if !host_mode {
         if let Some(renderer) = state.pixman_renderer.as_mut() {
             let mut cap = node.capture.as_mut();
             let (ptr, buf_age) = match pool_slot {
@@ -2436,16 +2570,21 @@ fn render_node_tick(
                     if let Some(sync) = render_sync.take() {
                         let _ = sync.wait();
                     }
+                    // Host-capture frames encode from the buffer the host blitted
+                    // into; otherwise from this display's own composited buffer.
+                    let enc_dmabuf: Option<Dmabuf> = host_enc_dmabuf
+                        .clone()
+                        .or_else(|| node.offscreen_buffer.as_ref().map(|(_, d)| d.clone()));
                     let result = match encoder {
                         GpuEncoder::Nvenc(enc) => {
-                            if let Some((_, ref dmabuf)) = node.offscreen_buffer {
+                            if let Some(ref dmabuf) = enc_dmabuf {
                                 enc.encode(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
                             } else {
                                 Err("NVENC ZeroCopy requires offscreen buffer (GPU context)".to_string())
                             }
                         },
                         GpuEncoder::Vaapi(enc) => {
-                            if let Some((_, ref dmabuf)) = node.offscreen_buffer {
+                            if let Some(ref dmabuf) = enc_dmabuf {
                                 enc.encode_dmabuf(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
                             } else {
                                 Err("Vaapi ZeroCopy requires offscreen buffer (GPU context)".to_string())
@@ -2658,6 +2797,33 @@ fn create_output_on(
         overlay_state: OverlayState::default(),
         capture: None,
     });
+    // A nested session opens one host toplevel per screen and stacks the extras
+    // on an existing output until a display exists for them: hand the newest
+    // stacked window to the new output.
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for w in state.space.elements() {
+        let oid = wayland::frontend::window_output_id(w);
+        match counts.iter_mut().find(|(o, _)| *o == oid) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((oid, 1)),
+        }
+    }
+    let adopt = state
+        .space
+        .elements()
+        .filter(|w| {
+            let oid = wayland::frontend::window_output_id(w);
+            counts.iter().any(|(o, c)| *o == oid && *c >= 2)
+        })
+        .max_by_key(|w| wayland::frontend::window_meta(w).map(|m| m.id).unwrap_or(0))
+        .cloned();
+    if let Some(window) = adopt {
+        state.place_window_on_output(&window, id);
+        println!(
+            "[Wayland] Output {id}: adopted stacked window {}.",
+            wayland::frontend::window_meta(&window).map(|m| m.id).unwrap_or(0)
+        );
+    }
     true
 }
 
@@ -2979,6 +3145,7 @@ fn run_wayland_thread(
         use_gpu,
         cursor_helper: Cursor::load(cursor_size),
         keymap_policy: wayland::keymap::KeymapPolicy::empty(),
+        host: None,
         current_cursor_icon: None,
         cursor_buffer: None,
         render_cursor_on_framebuffer: false,
@@ -3174,6 +3341,10 @@ fn run_wayland_thread(
                     }
                 }
                 ThreadCommand::KeyboardKey { scancode, state: key_state_val } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.key(scancode, key_state_val > 0);
+                        return;
+                    }
                     let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
                     let serial = next_serial();
                     let time = wayland_time();
@@ -3251,6 +3422,10 @@ fn run_wayland_thread(
                     let _ = reply.send(keymap_str);
                 }
                 ThreadCommand::PointerMotion { x, y } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_motion_abs(x, y);
+                        return;
+                    }
                     let serial = next_serial();
                     let time = wayland_time();
                     // (x, y) are physical union-layout coordinates: each output occupies
@@ -3342,6 +3517,10 @@ fn run_wayland_thread(
                     }
                 }
                 ThreadCommand::PointerButton { btn, state: btn_state_val } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_button(btn, btn_state_val > 0);
+                        return;
+                    }
                     let serial = next_serial();
                     let time = wayland_time();
                     let button_state = if btn_state_val > 0 { smithay::backend::input::ButtonState::Pressed } else { smithay::backend::input::ButtonState::Released };
@@ -3364,6 +3543,10 @@ fn run_wayland_thread(
                     }
                 }
                 ThreadCommand::PointerAxis { x, y } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_axis(x, y);
+                        return;
+                    }
                     let time = wayland_time();
                     
                     if let Some(pointer) = state.seat.get_pointer() {
@@ -3587,6 +3770,24 @@ fn run_wayland_thread(
 
             let any_capturing = state.output_nodes.iter().any(|n| n.capture.is_some());
             if !any_capturing && state.pending_screenshot.is_none() {
+                // No render/encode work, but committed clients still need their
+                // frame callbacks: a vsynced client (FIFO Vulkan present, games, a
+                // nested compositor's own clients) otherwise blocks in its swap
+                // until a viewer attaches — apps appear frozen whenever nobody is
+                // watching.
+                let time = state.clock.now();
+                for node in &state.output_nodes {
+                    for window in state
+                        .space
+                        .elements_for_output(&node.output)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                    {
+                        window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
+                            Some(node.output.clone())
+                        });
+                    }
+                }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
@@ -4128,6 +4329,8 @@ struct CaptureSettings {
     #[pyo3(get, set)] use_wayland: Py<PyAny>,
     /// H.264 recording tap: a Unix socket path to bind, or empty for none.
     #[pyo3(get, set)] recording_socket: Py<PyAny>,
+    /// Wayland display of an EXTERNAL compositor to capture (host-capture mode).
+    #[pyo3(get, set)] wayland_host_display: Py<PyAny>,
     /// Compositor cursor-theme size in pixels; <=0 keeps the theme default (24).
     #[pyo3(get, set)] cursor_size: i32,
     /// Longest cursor edge the X11 out-of-band cursor callback delivers; larger
@@ -4155,7 +4358,8 @@ impl CaptureSettings {
             auto_adjust_screen_capture_size: false, omit_stripe_headers: false,
             encode_node_path: py.None(),
             render_node_path: py.None(), auto_gpu: py.None(), use_wayland: py.None(),
-            recording_socket: py.None(), cursor_size: -1, cursor_size_cap: 32,
+            recording_socket: py.None(), wayland_host_display: py.None(),
+            cursor_size: -1, cursor_size_cap: 32,
         }
     }
 }
@@ -4860,6 +5064,88 @@ impl ScreenCapture {
     fn set_keymap_string(&self, py: Python<'_>, text: String) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_string(text))
     }
+    /// Compositor apps run under (a nested labwc/kwin session pixelflux captures),
+    /// the target for Computer-Use text injection; selkies resolves it and hands it
+    /// over. Empty clears it. Stored process-wide since the CU server is per-process.
+    fn set_app_wayland_display(&self, display: String) {
+        crate::computer_use::set_app_wayland_display(
+            if display.is_empty() { None } else { Some(display) },
+        );
+    }
+    /// Type `text` through `display`'s zwp_virtual_keyboard_manager_v1 as a one-shot
+    /// client: selkies' text-injection path, targeting whichever compositor the apps
+    /// live under (the nested session's, or pixelflux's own in a direct session).
+    /// Blocking; releases the GIL for the duration. Raises
+    /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
+    fn type_text_wayland(&self, py: Python<'_>, display: String, text: String) -> PyResult<()> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::vkclient::type_text_to(&path, &text)
+        })
+        .map_err(|e: String| {
+            if e.contains("zwp_virtual_keyboard_manager_v1") {
+                VirtualKeyboardUnavailable::new_err(e)
+            } else {
+                pyo3::exceptions::PyRuntimeError::new_err(e)
+            }
+        })
+    }
+    /// Mimes the app compositor's current selection offers (empty = nothing copied).
+    fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
+        py.detach(move || {
+            crate::wayland::dcclient::list_types(&app_socket_path(&display)?)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// The app compositor selection's payload for `mime`, or None when nothing is
+    /// copied or the selection does not offer that mime.
+    fn clipboard_read_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        mime: String,
+    ) -> PyResult<Option<Py<pyo3::types::PyBytes>>> {
+        let data = py
+            .detach(move || crate::wayland::dcclient::read(&app_socket_path(&display)?, &mime))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(data.map(|d| pyo3::types::PyBytes::new(py, &d).unbind()))
+    }
+    /// Take the app compositor's selection, serving `entries` (mime, bytes) to
+    /// every paster from a background thread until another client copies.
+    fn clipboard_write_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::write(&app_socket_path(&display)?, entries))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Drop the app compositor's selection.
+    fn clipboard_clear_app(&self, py: Python<'_>, display: String) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::clear(&app_socket_path(&display)?))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Invoke `callback(mimes: list[str])` from a background thread on every
+    /// selection change in the app compositor (including the one current at call
+    /// time). A second watch for the same display replaces the first.
+    fn clipboard_watch_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::watch(&app_socket_path(&display)?, callback))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Stop the selection watch for `display` (no-op without one).
+    fn clipboard_unwatch_app(&self, py: Python<'_>, display: String) {
+        let _ = py.detach(move || {
+            crate::wayland::dcclient::unwatch(&app_socket_path(&display)?);
+            Ok::<(), String>(())
+        });
+    }
     fn inject_mouse_move(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_move(x, y))
     }
@@ -5194,6 +5480,27 @@ fn _stop_all_captures(py: Python<'_>) {
 
 /// The `pixelflux` Python module: registers the exported classes and functions, and hooks
 /// `_stop_all_captures` into `atexit` so every live capture is stopped before interpreter shutdown.
+/// Socket path for a Wayland display name, with the ABI methods' error shape.
+fn app_socket_path(display: &str) -> Result<String, String> {
+    crate::wayland::wlclient::socket_path(display)
+        .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())
+}
+
+pyo3::create_exception!(
+    pixelflux,
+    VirtualKeyboardUnavailable,
+    pyo3::exceptions::PyRuntimeError,
+    "The target compositor does not advertise zwp_virtual_keyboard_manager_v1."
+);
+
+/// Start the Computer-Use HTTP server: a bare port listens on all interfaces,
+/// `host:port` scopes it. Idempotent; the PIXELFLUX_CU env var remains the
+/// standalone fallback.
+#[pyfunction]
+fn start_computer_use(bind: String) {
+    crate::computer_use::start_cu_server(&bind);
+}
+
 #[pymodule]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WaylandBackend>()?;
@@ -5208,6 +5515,11 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_recording, m)?)?;
     m.add_function(wrap_pyfunction!(stop_recording, m)?)?;
     m.add_function(wrap_pyfunction!(recording_status, m)?)?;
+    m.add_function(wrap_pyfunction!(start_computer_use, m)?)?;
+    m.add(
+        "VirtualKeyboardUnavailable",
+        m.py().get_type::<VirtualKeyboardUnavailable>(),
+    )?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
     if let Ok(atexit) = m.py().import("atexit") {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));

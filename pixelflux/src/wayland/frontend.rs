@@ -397,6 +397,9 @@ pub struct AppState {
     /// Seat keymap owner: base layout plus batched overlay binds. Every seat keymap swap
     /// flows through this policy, so keymap identity has exactly one writer.
     pub keymap_policy: KeymapPolicy,
+    /// Host-capture session when pixelflux captures an EXTERNAL compositor:
+    /// frames arrive by screencopy and input routes to its virtual devices.
+    pub host: Option<crate::wayland::host::HostSession>,
 
     pub current_cursor_icon: Option<CursorImageStatus>,
     pub cursor_buffer: Option<WlBuffer>,
@@ -665,7 +668,35 @@ impl CompositorHandler for AppState {
                 // A new toplevel opens fullscreened on the output the pointer is on
                 // (primary when indeterminate); the choice is pinned on the window's
                 // meta so the acked commit maps to the same output.
-                let target_id = self.pointer_display();
+                let mut target_id = self.pointer_display();
+                // A second fullscreen surface from a client that already owns one on
+                // the target output is screen-like (a nested compositor opens one
+                // host toplevel per screen): place it on an empty output when one
+                // exists instead of stacking it.
+                if let Some(client) = toplevel.wl_surface().client() {
+                    let same_client = |w: &Window| {
+                        w.wl_surface()
+                            .and_then(|s| s.client())
+                            .map_or(false, |c| c.id() == client.id())
+                    };
+                    let crowded = self
+                        .space
+                        .elements()
+                        .chain(self.pending_windows.iter())
+                        .any(|w| window_output_id(w) == target_id && same_client(w));
+                    if crowded {
+                        let empty = self.output_nodes.iter().map(|n| n.id).find(|oid| {
+                            !self
+                                .space
+                                .elements()
+                                .chain(self.pending_windows.iter())
+                                .any(|w| window_output_id(w) == *oid)
+                        });
+                        if let Some(oid) = empty {
+                            target_id = oid;
+                        }
+                    }
+                }
                 if let Some(meta) = window_meta(&window) {
                     meta.output.store(target_id, Ordering::Relaxed);
                 }
@@ -1119,6 +1150,12 @@ impl AppState {
         let text = self.keymap_policy.keymap_text();
         if text.is_empty() {
             return;
+        }
+        // Host-capture mode: the same managed keymap rides on the virtual
+        // keyboard, so the host compositor translates injected keycodes with
+        // selkies' keymap (overlay binds included) instead of its own.
+        if let Some(host) = &self.host {
+            host.set_keymap(&text);
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             if let Err(e) = keyboard.set_keymap_from_string(self, text) {

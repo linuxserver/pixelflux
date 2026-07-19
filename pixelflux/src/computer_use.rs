@@ -30,6 +30,7 @@ use image::{ImageBuffer, Rgba, ImageFormat};
 use serde::Deserialize;
 use tiny_http;
 
+use crate::wayland::keymap::keysym_for_char;
 use crate::ThreadCommand;
 
 fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
@@ -48,14 +49,6 @@ pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
         .map_err(|e| format!("PNG encode error: {}", e))?;
     Ok(png)
-}
-
-/// Keysym for one literal character: Latin-1 printables map 1:1, control characters map
-/// onto their `0xffXX` function keysyms, everything else onto the `0x01000000 | codepoint`
-/// Unicode form (0 = unmappable). The keysym then resolves against the backend's ACTIVE
-/// keymap, never a hardcoded layout table.
-fn keysym_for_char(c: char) -> u32 {
-    xkb::utf32_to_keysym(c as u32).raw()
 }
 
 fn scancode_for_keyname(name: &str) -> Option<u32> {
@@ -498,32 +491,48 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
 
         "type" => {
             let text = req.text.as_deref().ok_or("Missing text")?;
+            // A nested app compositor owns the apps on its own socket; type there as
+            // a virtual-keyboard client, since keys on pixelflux's own seat carry an
+            // overlay keymap the inner compositor never sees. Falls through to the
+            // local seat if the app socket is unreachable.
+            if b.name() == "wayland" {
+                if let Some(sock) = app_wayland_socket_path() {
+                    // Failures log once per socket value; every request still
+                    // retries, so a compositor that comes back is used again
+                    // immediately (and re-arms the logging).
+                    static FAILED_SOCK: Mutex<Option<String>> = Mutex::new(None);
+                    match crate::wayland::vkclient::type_text_to(&sock, text) {
+                        Ok(()) => {
+                            *FAILED_SOCK.lock().unwrap() = None;
+                            return Ok(ok_json());
+                        }
+                        Err(e) => {
+                            let mut last = FAILED_SOCK.lock().unwrap();
+                            if last.as_deref() != Some(sock.as_str()) {
+                                eprintln!(
+                                    "[ComputerUse] app-compositor type via {sock} failed ({e}); using local seat until it is reachable"
+                                );
+                                *last = Some(sock);
+                            }
+                        }
+                    }
+                }
+            }
             let mut resolver = KeyResolver::new(b);
             let syms: Vec<u32> = text.chars().map(keysym_for_char).collect();
             resolver.prefetch(&syms);
             // Base+AltGr resolution stays the preferred path; only what the active keymap
             // cannot reach at all goes through the backend's transient-bind fallback.
             let mut unresolved: Vec<u32> = Vec::new();
-            for (ch, &sym) in text.chars().zip(&syms) {
-                if ch != '\n'
-                    && sym != 0
-                    && resolver.resolve(sym).is_none()
-                    && !unresolved.contains(&sym)
-                {
+            for &sym in &syms {
+                if sym != 0 && resolver.resolve(sym).is_none() && !unresolved.contains(&sym) {
                     unresolved.push(sym);
                 }
             }
             b.with_transient_keysyms(&unresolved, &mut |bound| {
-                for (i, (ch, &sym)) in text.chars().zip(&syms).enumerate() {
+                for (i, &sym) in syms.iter().enumerate() {
                     if i > 0 && i % 50 == 0 {
                         sleep_ms(20);
-                    }
-                    if ch == '\n' {
-                        b.key(36, true);
-                        sleep_ms(10);
-                        b.key(36, false);
-                        sleep_ms(10);
-                        continue;
                     }
                     if let Some((sc, level)) = resolver.resolve(sym) {
                         let level_mods = level_modifiers(level, 0, b.altgr_keycode());
@@ -798,6 +807,35 @@ fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
     Some(reply)
 }
 
+/// Socket of the compositor apps run under when it is nested under pixelflux
+/// (labwc/kwin): keys injected into pixelflux's own seat carry an overlay keymap
+/// the inner compositor never sees, so CU text is typed as a client of this
+/// socket instead. Set by selkies over the ScreenCapture ABI.
+static CU_APP_WAYLAND_DISPLAY: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set (or clear, with None/empty) the app compositor socket for CU text injection.
+pub fn set_app_wayland_display(display: Option<String>) {
+    *CU_APP_WAYLAND_DISPLAY.lock().unwrap() = display.filter(|s| !s.is_empty());
+}
+
+/// Resolve the app compositor socket PATH for CU typing, or None to type on the
+/// local seat. The ABI value selkies set wins; a standalone CU (no selkies) falls
+/// back to PIXELFLUX_APP_WAYLAND_DISPLAY, then SELKIES_APP_WAYLAND_DISPLAY. A value
+/// naming pixelflux's own compositor means nothing is nested.
+fn app_wayland_socket_path() -> Option<String> {
+    let name = CU_APP_WAYLAND_DISPLAY
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(|| std::env::var("PIXELFLUX_APP_WAYLAND_DISPLAY").ok())
+        .or_else(|| std::env::var("SELKIES_APP_WAYLAND_DISPLAY").ok())
+        .filter(|s| !s.is_empty())?;
+    if crate::wait_socket_name(Duration::from_millis(0)).as_deref() == Some(name.as_str()) {
+        return None;
+    }
+    crate::wayland::wlclient::socket_path(&name)
+}
+
 /// Make the Wayland compositor the preferred CU backend: once a live calloop sender is
 /// registered, every subsequent request routes to it instead of an X11 connection.
 pub fn register_wayland_backend(tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>) {
@@ -811,21 +849,39 @@ pub(crate) fn wayland_command_sender(
     WAYLAND_TX.lock().unwrap().clone()
 }
 
-/// Start the CU server if `PIXELFLUX_CU` names a port. Guarded so that exactly one server
-/// binds per process no matter how many call sites (module import, Wayland compositor init)
-/// race to spawn it; backend selection stays per-request, so a server bound at import serves
-/// a compositor that only starts later.
+/// Start the CU server if `PIXELFLUX_CU` names a bind (the standalone fallback;
+/// a selkies-managed session passes the setting through [`start_cu_server`]).
 pub fn spawn_cu_from_env() {
-    let Ok(port_str) = std::env::var("PIXELFLUX_CU") else { return };
-    let Ok(port) = port_str.parse::<u16>() else {
-        println!("[ComputerUse] Invalid PIXELFLUX_CU value: '{}' - expected a port number", port_str);
-        return;
+    if let Ok(bind) = std::env::var("PIXELFLUX_CU") {
+        start_cu_server(&bind);
+    }
+}
+
+/// Start the CU server on `bind`: a bare port listens on all interfaces (the
+/// container-deployment default), `host:port` scopes it. Guarded so that exactly
+/// one server binds per process no matter how many call sites (module import,
+/// Wayland compositor init, the selkies setting) race to spawn it; backend
+/// selection stays per-request, so a server bound at import serves a compositor
+/// that only starts later.
+pub fn start_cu_server(bind: &str) {
+    let addr = if bind.contains(':') {
+        bind.to_string()
+    } else {
+        match bind.parse::<u16>() {
+            Ok(port) => format!("0.0.0.0:{port}"),
+            Err(_) => {
+                println!("[ComputerUse] Invalid bind '{bind}' - expected a port or host:port");
+                return;
+            }
+        }
     };
     static SPAWNED: OnceLock<()> = OnceLock::new();
     let mut first = false;
-    SPAWNED.get_or_init(|| { first = true; });
+    SPAWNED.get_or_init(|| {
+        first = true;
+    });
     if first {
-        thread::spawn(move || run_cu_server(port));
+        thread::spawn(move || run_cu_server(addr));
     }
 }
 
@@ -843,19 +899,16 @@ fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
 /// Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
 /// the session much as a human viewer would.
 ///
-/// It runs on its own thread listening on `0.0.0.0:<port>` for POST `/computer-use` JSON actions
+/// It runs on its own thread listening on `addr` for POST `/computer-use` JSON actions
 /// (screenshot, mouse_move, click, key, scroll, …). The backend and the framebuffer dimensions
 /// are re-resolved on every request rather than cached, because the compositor can start, the
 /// stream can resize, or the X server can restart underneath the agent — a stale size would
 /// misplace every coordinate. On Wayland a screenshot forces a one-frame GPU readback when the
 /// pipeline is in zero-copy mode; on X11 it is a one-shot `GetImage` of the root window.
-pub fn run_cu_server(port: u16) {
-    println!(
-        "[ComputerUse] Server listening on port {}",
-        port,
-    );
+pub fn run_cu_server(addr: String) {
+    println!("[ComputerUse] Server listening on {}", addr);
 
-    let server = match tiny_http::Server::http(format!("0.0.0.0:{}", port)) {
+    let server = match tiny_http::Server::http(addr.as_str()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[ComputerUse] Failed to start server: {}", e);

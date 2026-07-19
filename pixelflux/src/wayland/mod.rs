@@ -15,3 +15,11 @@ pub mod frontend;
 pub mod cursor;
 /// Seat keymap ownership: base layout plus batched overlay keysym binding.
 pub mod keymap;
+/// Virtual-keyboard client for typing into a nested app compositor's socket.
+pub mod vkclient;
+/// Shared plumbing for outbound Wayland client connections.
+pub mod wlclient;
+/// Data-control clipboard client bridging a nested app compositor's selection.
+pub mod dcclient;
+/// Host-capture mode: capture/inject as a client of an external compositor.
+pub mod host;
