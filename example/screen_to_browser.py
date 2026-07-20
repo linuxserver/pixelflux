@@ -256,9 +256,14 @@ async def websocket_handler(websocket):
                 # Copy fallback: the frame already carries its native wire header.
                 item_to_queue = {'data': bytes(frame), 'owner': None}
 
-            asyncio.run_coroutine_threadsafe(
-                client_queue.put(item_to_queue), g_loop
-            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    client_queue.put(item_to_queue), g_loop
+                )
+            except RuntimeError:
+                # Loop closed between the check and the call (teardown race);
+                # dropping the item's references recycles the frame buffer.
+                pass
 
         # --- 4. Register and Start Resources for this Client ---
         send_task = asyncio.create_task(send_stripes_task(websocket, client_queue))

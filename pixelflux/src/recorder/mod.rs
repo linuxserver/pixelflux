@@ -276,7 +276,10 @@ fn offer_frame(shared: &RecShared, tx: &Sender<TapFrame>, stripes: &[EncodedStri
     if s.data.is_empty() {
         return;
     }
-    let offset = if s.data.len() > 10 && s.data[0] == 0x04 { 10 } else { 0 };
+    let offset = if s.data.len() >= 10 && s.data[0] == 0x04 { 10 } else { 0 };
+    if s.data.len() == offset {
+        return;
+    }
     let pts_us = shared.start.elapsed().as_micros() as u64;
     match tx.try_send((s.data.clone(), offset, pts_us)) {
         Ok(()) => {

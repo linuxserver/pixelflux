@@ -59,6 +59,8 @@ pub struct RecordingSink {
     ///
     /// [`should_force_idr`]: RecordingSink::should_force_idr
     client_connected: Arc<AtomicBool>,
+    /// One-time notice that the session's H.264 frames are striped and unrecordable.
+    warned_unrecordable: AtomicBool,
 }
 
 impl RecordingSink {
@@ -147,6 +149,7 @@ impl RecordingSink {
             clients,
             shutdown,
             client_connected,
+            warned_unrecordable: AtomicBool::new(false),
         })
     }
 
@@ -156,21 +159,41 @@ impl RecordingSink {
         self.client_connected.swap(false, Ordering::Relaxed)
     }
 
-    /// Delivery-layer tap for one encoded stripe. Only H.264 frames (`data_type == 2`) are
-    /// forwarded; the 10-byte wire header (`0x04` tag) is skipped via the queued offset so the
-    /// output is a plain Annex-B elementary stream.
+    /// Delivery-layer tap for one encoded frame. The socket carries a single H.264
+    /// elementary stream, so only a lone full-height stripe (`data_type == 2`) is
+    /// recordable: striped CPU encodes are N independent per-stripe streams, and
+    /// interleaving them would produce an undecodable file — those are skipped with a
+    /// one-time notice (live streaming is unaffected). The 10-byte wire header
+    /// (`0x04` tag) is skipped via the queued offset so consumers receive plain
+    /// Annex-B.
     ///
-    /// Never blocks and never copies: the `Arc` payload is cloned into each client's bounded
-    /// queue with `try_send`, and a client whose queue is full or whose writer died is dropped.
-    pub fn write_encoded_frame(&self, stripe: &EncodedStripe) {
-        if stripe.data.is_empty() || stripe.data_type != 2 {
+    /// Never blocks and never copies: the `Arc` payload is cloned into each client's
+    /// bounded queue with `try_send`, and a client whose queue is full or whose
+    /// writer died is dropped.
+    pub fn write_frame(&self, stripes: &[EncodedStripe], full_height: i32) {
+        let mut h264 = stripes
+            .iter()
+            .filter(|s| s.data_type == 2 && !s.data.is_empty());
+        let Some(stripe) = h264.next() else { return };
+        if h264.next().is_some() || stripe.stripe_y_start != 0 || stripe.stripe_height != full_height
+        {
+            if !self.warned_unrecordable.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[recording_sink] WARNING: striped H.264 frames are not recordable \
+                     (the socket carries one elementary stream); use a full-frame encoder \
+                     to record this session"
+                );
+            }
             return;
         }
-        let offset = if stripe.data.len() > 10 && stripe.data[0] == 0x04 {
+        let offset = if stripe.data.len() >= 10 && stripe.data[0] == 0x04 {
             10
         } else {
             0
         };
+        if stripe.data.len() == offset {
+            return;
+        }
 
         let mut clients = self.clients.lock().unwrap();
         if clients.is_empty() {
@@ -242,7 +265,7 @@ mod cost_tests {
         let mut total_us = 0f64;
         for _ in 0..n {
             let t = Instant::now();
-            sink.write_encoded_frame(&f);
+            sink.write_frame(std::slice::from_ref(&f), 720);
             let us = t.elapsed().as_secs_f64() * 1e6;
             total_us += us;
             max_us = max_us.max(us);

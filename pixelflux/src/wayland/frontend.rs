@@ -228,6 +228,22 @@ pub struct WlCapture {
     pub last_tick: Option<Instant>,
 }
 
+impl WlCapture {
+    /// Arm a keyframe on whichever path is live, plus a full render so a static
+    /// screen still produces the frame. Exactly ONE flag is set: the pool encode
+    /// loop consumes the atomic, every other path consumes `pending_force_idr` —
+    /// setting both would leave one armed forever (the host-mode idle gate polls
+    /// them every tick, so a stuck flag disables idle skipping for the session).
+    pub fn request_idr(&mut self) {
+        if self.encode_pool.is_some() {
+            self.encode_controls.force_idr.store(true, Ordering::Relaxed);
+        } else {
+            self.pending_force_idr = true;
+        }
+        self.needs_full_render = true;
+    }
+}
+
 /// One virtual output and everything sized to it: the Smithay `Output` + its advertised
 /// global, its layout position, the damage tracker, render targets, and the (at most one)
 /// capture bound to it. `id` is the Python-facing display key; id 0 is the primary

@@ -617,9 +617,7 @@ where
             stripe_count += stripes.len() as u64;
             // IDR arming is consumed inside X11Pipeline::process; this tap only fans out.
             if let Some(ref socket) = recording_sink {
-                for stripe in &stripes {
-                    socket.write_encoded_frame(stripe);
-                }
+                socket.write_frame(&stripes, psettings.height);
             }
             on_frame(stripes);
         }

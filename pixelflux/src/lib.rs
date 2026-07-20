@@ -1340,9 +1340,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
             if let Some(ref socket) = cfg.recording_sink {
-                for stripe in &out {
-                    socket.write_encoded_frame(stripe);
-                }
+                socket.write_frame(&out, settings.height);
             }
             crate::recorder::wayland_tap(cfg.display_id, &out);
             let _ = cfg.deliver_tx.send(out);
@@ -1609,8 +1607,6 @@ fn start_capture_on_display(
         settings.height &= !1;
     }
 
-    let recording_sink = crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
-
     // Tear down this display's previous capture first; its hardware sessions are the
     // reuse candidates below (zero-copy inline, readback via the encode config).
     let mut prior_zero_copy: Option<GpuEncoder> = None;
@@ -1619,6 +1615,11 @@ fn start_capture_on_display(
         prior_zero_copy = old.video_encoder.take();
         prior_readback_encoder = teardown_capture(&mut old);
     }
+
+    // Bind only after the old capture is gone: its sink unlinks the socket path in
+    // Drop, which would strip a fresh bind's filesystem name and leave every later
+    // recorder connect with ENOENT.
+    let recording_sink = crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
 
     {
         // Never panic the compositor thread: an output momentarily without a current
@@ -1943,16 +1944,10 @@ fn start_capture_on_display(
         log_stream_settings(&settings, 1, cap.video_encoder.as_ref(), false);
     }
     drop(prior_readback_encoder);
-    // Force the keyframe on the now-active path (as RequestIdr does), unconditionally:
-    // the damage tracker and offscreen buffer stay warm across stop/start, so a
-    // restarted capture on a static screen otherwise produces no damage, no first
-    // frame, and no IDR in either path.
-    if cap.encode_pool.is_some() {
-        cap.encode_controls.force_idr.store(true, Ordering::Relaxed);
-    } else {
-        cap.pending_force_idr = true;
-    }
-    cap.needs_full_render = true;
+    // Force the keyframe unconditionally: the damage tracker and offscreen buffer
+    // stay warm across stop/start, so a restarted capture on a static screen
+    // otherwise produces no damage, no first frame, and no IDR in either path.
+    cap.request_idr();
 
     node.capture = Some(cap);
     state.output_nodes.insert(node_idx, node);
@@ -2091,8 +2086,7 @@ fn render_node_tick(
             .map(|s| s.should_force_idr())
             .unwrap_or(false)
         {
-            cap.pending_force_idr = true;
-            cap.encode_controls.force_idr.store(true, Ordering::Relaxed);
+            cap.request_idr();
         }
     }
     let requested_idr = node.capture.as_ref().map(|c| c.pending_force_idr).unwrap_or(false);
@@ -2790,9 +2784,7 @@ fn render_node_tick(
                                     stripe_height: height, frame_id: cap.frame_counter as i32,
                                 }];
                                 if let Some(ref socket) = cap.recording_sink {
-                                    for stripe in &stripes {
-                                        socket.write_encoded_frame(stripe);
-                                    }
+                                    socket.write_frame(&stripes, height);
                                 }
                                 crate::recorder::wayland_tap(node.id, &stripes);
                                 // Non-blocking: a full slot parks the frame (delivered
@@ -3790,12 +3782,7 @@ fn run_wayland_thread(
                 ThreadCommand::RequestIdr { display_id } => {
                     if let Some(idx) = state.node_idx_for_id(display_id) {
                         if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
-                            if cap.encode_pool.is_some() {
-                                cap.encode_controls.force_idr.store(true, Ordering::Relaxed);
-                            } else {
-                                cap.pending_force_idr = true;
-                            }
-                            cap.needs_full_render = true;
+                            cap.request_idr();
                         }
                     }
                 }
@@ -4761,6 +4748,14 @@ fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
 struct ScState {
     /// 0 = idle, 1 = X11, 2 = Wayland.
     backend: u8,
+    /// This capture holds one reference on the shared X11 cursor monitor. Set in
+    /// the same locked section as `backend = 1` and TAKEN in the same locked
+    /// section a stop reads the backend, so acquire/release pair exactly per
+    /// capture — inferring the reference from `backend` alone would let a stop
+    /// that interleaves with a start release a reference not yet taken (leaking
+    /// the monitor once the acquire lands). The GIL happens to serialize that
+    /// window today; the pairing must not depend on it.
+    cursor_ref: bool,
     controls: Option<Arc<crate::x11::Controls>>,
     handle: Option<thread::JoinHandle<()>>,
     cap_thread_id: Option<thread::ThreadId>,
@@ -4805,7 +4800,7 @@ impl ScreenCapture {
     /// GIL across the joins would deadlock. A re-entrant stop arriving on the capture, encode, or
     /// deliver thread cannot join itself, so it detaches and lets the threads exit on the stop flag.
     fn stop_internal(&self, py: Python<'_>) -> PyResult<()> {
-        let (handle, deliver_handle, same_thread, backend, controls, wl_display) = {
+        let (handle, deliver_handle, same_thread, backend, controls, wl_display, cursor_ref) = {
             let mut st = self.inner.lock().unwrap();
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
@@ -4825,6 +4820,7 @@ impl ScreenCapture {
             let handle = st.handle.take();
             let deliver_handle = st.deliver_handle.take();
             let backend = st.backend;
+            let cursor_ref = std::mem::take(&mut st.cursor_ref);
             let wl_display = st.wl_display;
             st.backend = 0;
             st.cap_thread_id = None;
@@ -4832,12 +4828,12 @@ impl ScreenCapture {
             st.encode_tid_rx = None;
             st.deliver_thread_id = None;
             st.wl_display = 0;
-            (handle, deliver_handle, same, backend, controls, wl_display)
+            (handle, deliver_handle, same, backend, controls, wl_display, cursor_ref)
         };
         if let Some(c) = &controls {
             live_x11().lock().unwrap().retain(|x| !Arc::ptr_eq(x, c));
         }
-        if backend == 1 {
+        if cursor_ref {
             crate::x11::cursor::release(py);
         }
         if backend == 2 {
@@ -4889,6 +4885,7 @@ impl ScreenCapture {
             id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
             inner: Mutex::new(ScState {
                 backend: 0,
+                cursor_ref: false,
                 controls: None,
                 handle: None,
                 cap_thread_id: None,
@@ -5091,8 +5088,12 @@ impl ScreenCapture {
                 None
             }
         };
+        // Take the monitor reference BEFORE publishing the capture: a stop that
+        // observes this capture must always find the reference it is to release.
+        crate::x11::cursor::acquire(cursor_cap);
         let mut st = self.inner.lock().unwrap();
         st.backend = 1;
+        st.cursor_ref = true;
         st.controls = Some(controls);
         st.handle = Some(handle);
         st.cap_thread_id = tid;
@@ -5101,7 +5102,6 @@ impl ScreenCapture {
         st.deliver_handle = Some(deliver_handle);
         st.deliver_thread_id = Some(deliver_thread_id);
         drop(st);
-        crate::x11::cursor::acquire(cursor_cap);
         Ok(())
     }
 
