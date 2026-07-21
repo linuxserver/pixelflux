@@ -14,7 +14,6 @@ use crate::encoders::nvenc::NvencEncoder;
 use crate::encoders::oh264::Openh264Encoder;
 use crate::encoders::software::{encode_cpu, EncodedStripe, StripeState};
 use crate::encoders::vaapi::VaapiEncoder;
-use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use std::sync::Arc;
 
@@ -164,7 +163,8 @@ enum X11Encoder {
 /// content frame-to-frame. Full-frame H.264 runs through `decide_hw_fullframe`; striped JPEG/x264
 /// runs through `encode_cpu` with `hash_damage=true`.
 ///
-/// Recording sink fan-out is handled at the delivery layer.
+/// Recording fan-out (socket sink and MP4 recorder) is handled at the delivery layer; a
+/// consumer needing a keyframe goes through [`X11Pipeline::request_idr`] like everyone else.
 pub struct X11Pipeline {
     settings: RustCaptureSettings,
     stripes: Vec<StripeState>,
@@ -172,7 +172,6 @@ pub struct X11Pipeline {
     hw_state: StripeState,
     frame_counter: u16,
     pending_force_idr: bool,
-    recording_sink: Option<Arc<RecordingSink>>,
 }
 
 impl X11Pipeline {
@@ -182,8 +181,6 @@ impl X11Pipeline {
     ///
     /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`,
     ///   `encode_node_index`, and `video_fullcolor` fields drive encoder selection.
-    /// * `recording_sink` - Optional Unix-socket H.264 fan-out. Owned by the caller; not
-    ///   rebound on auto-adjust resizes to avoid tearing down the socket listener.
     ///
     /// # Encoder selection
     ///
@@ -191,7 +188,7 @@ impl X11Pipeline {
     /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
     /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls to x264).
     /// 4. **Software** (`X11Encoder::None`) — on any hardware init failure or explicit software.
-    pub fn new(settings: RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Self {
+    pub fn new(settings: RustCaptureSettings) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");
             match Openh264Encoder::new(&settings) {
@@ -248,7 +245,6 @@ impl X11Pipeline {
             hw_state: StripeState::default(),
             frame_counter: 0,
             pending_force_idr: false,
-            recording_sink,
         }
     }
 
@@ -360,8 +356,7 @@ impl X11Pipeline {
             );
             if d.send {
                 let fc = self.frame_counter as u64;
-                let force_idr = d.force_idr
-                    || self.recording_sink.as_ref().map(|s| s.should_force_idr()).unwrap_or(false);
+                let force_idr = d.force_idr;
                 let res = match &mut self.hw {
                     X11Encoder::Nvenc(enc) => {
                         enc.encode_cpu_argb(argb, stride, fc, d.target_qp, force_idr)
@@ -377,7 +372,7 @@ impl X11Pipeline {
                 match res {
                     Ok(data) if !data.is_empty() => {
                         vec![EncodedStripe {
-                            data,
+                            data: Arc::new(data),
                             data_type: 2,
                             stripe_y_start: 0,
                             stripe_height: height,
@@ -416,7 +411,10 @@ impl X11Pipeline {
             )
         };
 
-        self.pending_force_idr = false;
+        // An unserved request stays armed: on an infinite GOP an IDR lost to an encode
+        // error or skip would never self-heal, leaving a joining consumer with an
+        // undecodable stream.
+        self.pending_force_idr = requested && out.is_empty();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         out
     }
@@ -441,7 +439,7 @@ mod tests {
             use_paint_over_quality: false,
             ..Default::default()
         };
-        let mut p = X11Pipeline::new(s, None);
+        let mut p = X11Pipeline::new(s);
         let stride = 128 * 4;
         let frame_a = vec![10u8; stride * 128];
         let mut frame_b = frame_a.clone();
@@ -474,7 +472,7 @@ mod tests {
             target_fps: 60.0,
             ..Default::default()
         };
-        let mut p = X11Pipeline::new(s, None);
+        let mut p = X11Pipeline::new(s);
         let stride = 128 * 4;
         let frame = vec![10u8; stride * 128];
         assert!(!p.process(&frame, stride).is_empty(), "first frame emits");

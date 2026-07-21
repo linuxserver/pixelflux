@@ -9,6 +9,9 @@
 //! and render the appropriate frame at the current scale.
 
 use image::{ImageBuffer, Rgba};
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use std::collections::HashMap;
 use std::io::Cursor as IoCursor;
 use std::io::Read;
 use std::time::Duration;
@@ -16,6 +19,213 @@ use xcursor::{
     parser::{parse_xcursor, Image},
     CursorTheme,
 };
+
+/// One unit of cursor-callback work handed from the calloop thread to the `wl-cursor`
+/// worker. The calloop resolves everything renderer/surface-affine (SHM copies, dmabuf
+/// readbacks, hotspots); the worker does the PNG encode, the cache, and the GIL-bound Python
+/// call so none of that latency lands on the input/render thread. One channel keeps cursor
+/// updates ordered with callback (re)registration.
+pub enum CursorJob {
+    SetCallback(Py<PyAny>),
+    /// Reload the worker's theme handle at a new pixel size; later `Named` jobs render at it.
+    SetSize(i32),
+    Named { name: &'static str },
+    Hide,
+    /// wl_shm cursor sprite: raw pool bytes plus the sub-image descriptor.
+    Shm {
+        hash: u64,
+        width: i32,
+        height: i32,
+        stride: i32,
+        offset: i32,
+        opaque: bool,
+        bytes: Vec<u8>,
+        hot_x: i32,
+        hot_y: i32,
+    },
+    /// dmabuf cursor sprite already read back to tightly-mapped RGBA on the calloop.
+    Gles {
+        hash: u64,
+        width: i32,
+        height: i32,
+        bytes: Vec<u8>,
+        hot_x: i32,
+        hot_y: i32,
+    },
+}
+
+/// Spawn the cursor delivery worker; returns its job channel. The worker owns its own
+/// theme handle, the PNG cache, and the Python callback for the life of the process (like the
+/// compositor thread itself); `PY_SHUTDOWN` gates every Python call.
+pub fn spawn_cursor_worker(cursor_size: i32) -> std::sync::mpsc::Sender<CursorJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<CursorJob>();
+    let _ = std::thread::Builder::new().name("wl-cursor".into()).spawn(move || {
+        let mut helper = Cursor::load(cursor_size);
+        let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut callback: Option<Py<PyAny>> = None;
+        while let Ok(job) = rx.recv() {
+            let (msg_type, data, hot_x, hot_y): (&str, Vec<u8>, i32, i32) = match job {
+                CursorJob::SetCallback(cb) => {
+                    callback = Some(cb);
+                    continue;
+                }
+                CursorJob::SetSize(size) => {
+                    helper = Cursor::load(size);
+                    continue;
+                }
+                CursorJob::Named { name } => match helper.get_png_data(name) {
+                    Some((png, x, y)) => ("png", png, x as i32, y as i32),
+                    None => ("error", Vec::new(), 0, 0),
+                },
+                CursorJob::Hide => ("hide", Vec::new(), 0, 0),
+                CursorJob::Shm {
+                    hash,
+                    width,
+                    height,
+                    stride,
+                    offset,
+                    opaque,
+                    bytes,
+                    hot_x,
+                    hot_y,
+                } => {
+                    let png = cached_png(&mut cache, hash, || {
+                        encode_shm_cursor(width, height, stride, offset, opaque, &bytes)
+                    });
+                    ("png", png, hot_x, hot_y)
+                }
+                CursorJob::Gles { hash, width, height, bytes, hot_x, hot_y } => {
+                    let png = cached_png(&mut cache, hash, || {
+                        encode_gles_cursor(width, height, &bytes)
+                    });
+                    ("png", png, hot_x, hot_y)
+                }
+            };
+            // A sprite whose pixels could not be read yields empty data; suppressing it
+            // preserves the consumer's last cursor instead of blanking it (only an
+            // intentional hide passes with no payload).
+            if data.is_empty() && msg_type != "hide" {
+                continue;
+            }
+            if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(ref cb) = callback {
+                Python::attach(|py| {
+                    let py_bytes = PyBytes::new(py, &data);
+                    let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
+                });
+            }
+        }
+    });
+    tx
+}
+
+/// Content-hash PNG cache lookup with bounded arbitrary eviction; an evicted sprite simply
+/// re-encodes on its next appearance.
+fn cached_png(
+    cache: &mut HashMap<u64, Vec<u8>>,
+    hash: u64,
+    encode: impl FnOnce() -> Vec<u8>,
+) -> Vec<u8> {
+    if let Some(png) = cache.get(&hash) {
+        return png.clone();
+    }
+    let png = encode();
+    if !png.is_empty() {
+        cache.insert(hash, png.clone());
+        if cache.len() > 100 {
+            if let Some(&evict) = cache.keys().next() {
+                cache.remove(&evict);
+            }
+        }
+    }
+    png
+}
+
+/// Convert a wl_shm BGRA/XRGB sprite sub-image to a straight-alpha PNG. Stride/offset are
+/// clamped non-negative with checked arithmetic so a garbage descriptor skips pixels instead of
+/// panicking; sprites larger than 128x128 are ignored (never a hardware cursor).
+fn encode_shm_cursor(
+    width: i32,
+    height: i32,
+    stride: i32,
+    offset: i32,
+    opaque: bool,
+    raw_bytes: &[u8],
+) -> Vec<u8> {
+    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+    let stride_usize = stride.max(0) as usize;
+    let base_offset = offset.max(0) as usize;
+    for y in 0..(height as u32) {
+        for x in 0..(width as u32) {
+            let offset = (y as usize)
+                .checked_mul(stride_usize)
+                .and_then(|row| base_offset.checked_add(row))
+                .and_then(|o| o.checked_add((x as usize) * 4));
+            let offset = match offset {
+                Some(o) => o,
+                None => continue,
+            };
+            if offset.checked_add(4).is_some_and(|end| end <= raw_bytes.len()) {
+                let alpha = if opaque { 255 } else { raw_bytes[offset + 3] };
+                img_buf.put_pixel(
+                    x,
+                    y,
+                    Rgba([raw_bytes[offset + 2], raw_bytes[offset + 1], raw_bytes[offset], alpha]),
+                );
+            }
+        }
+    }
+    crate::unpremultiply_rgba(&mut img_buf);
+    let mut bytes = Vec::new();
+    if img_buf.write_to(&mut IoCursor::new(&mut bytes), image::ImageFormat::Png).is_ok() {
+        bytes
+    } else {
+        Vec::new()
+    }
+}
+
+/// Convert a dmabuf sprite's RGBA readback (stride recovered from the mapping length) to a
+/// straight-alpha PNG.
+fn encode_gles_cursor(width: i32, height: i32, raw_bytes: &[u8]) -> Vec<u8> {
+    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+        return Vec::new();
+    }
+    let stride = super::frontend::rgba_readback_stride(
+        raw_bytes.len(),
+        height as usize,
+        width as usize,
+    );
+    let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+    for y in 0..(height as u32) {
+        for x in 0..(width as u32) {
+            let offset = (y as usize * stride) + (x as usize * 4);
+            if offset + 4 <= raw_bytes.len() {
+                img_buf.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        raw_bytes[offset],
+                        raw_bytes[offset + 1],
+                        raw_bytes[offset + 2],
+                        raw_bytes[offset + 3],
+                    ]),
+                );
+            }
+        }
+    }
+    crate::unpremultiply_rgba(&mut img_buf);
+    let mut bytes = Vec::new();
+    if img_buf.write_to(&mut IoCursor::new(&mut bytes), image::ImageFormat::Png).is_ok() {
+        bytes
+    } else {
+        Vec::new()
+    }
+}
 
 /// The loaded XCursor theme, held for the whole capture so cursor lookups stay cheap.
 ///

@@ -33,12 +33,13 @@ use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
 use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
-use crate::encoders::overlay::WatermarkLocation;
+use crate::encoders::overlay::blend_pixel;
 use crate::encoders::software::EncodedStripe;
 use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
+pub mod computer_use;
 pub mod cursor;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
@@ -261,28 +262,6 @@ fn grab_frame(
     Ok(())
 }
 
-/// Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
-///
-/// Cursor and watermark pixels are overwhelmingly either fully opaque or fully transparent, and this
-/// runs per pixel per frame on the CPU, so the two extremes are special-cased to skip the blend
-/// arithmetic entirely: an opaque source (`a == 255`) simply overwrites, a fully transparent source
-/// (`a == 0`) is left as-is, and only genuine edge pixels pay for the integer source-over. In every
-/// case only the B / G / R bytes are written; the destination's alpha byte is left as the capture
-/// delivered it.
-#[inline]
-fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
-    if a == 255 {
-        dst[0] = b;
-        dst[1] = g;
-        dst[2] = r;
-    } else if a > 0 {
-        let ia = 255 - a as u32;
-        dst[0] = ((b as u32 * a as u32 + dst[0] as u32 * ia) / 255) as u8;
-        dst[1] = ((g as u32 * a as u32 + dst[1] as u32 * ia) / 255) as u8;
-        dst[2] = ((r as u32 * a as u32 + dst[2] as u32 * ia) / 255) as u8;
-    }
-}
-
 /// Frame-space top-left of the cursor image, given the XFixes hotspot position.
 ///
 /// XFixes reports the cursor position at its HOTSPOT; X draws the image with its top-left at
@@ -290,7 +269,7 @@ fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
 /// The result may go negative near the frame edges, which `overlay_cursor` clips per pixel to match
 /// the server's own edge clipping.
 #[inline]
-fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
+pub(crate) fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
     (x as i32 - xhot as i32 - cap_x, y as i32 - yhot as i32 - cap_y)
 }
 
@@ -298,7 +277,7 @@ fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: 
 /// at `(img_x, img_y)`, blending each pixel through `blend_pixel` with per-pixel bounds clipping so
 /// an image straddling a frame edge writes only its in-frame portion.
 #[allow(clippy::too_many_arguments)]
-fn overlay_cursor(
+pub(crate) fn overlay_cursor(
     frame: &mut [u8],
     stride: usize,
     frame_w: i32,
@@ -326,147 +305,6 @@ fn overlay_cursor(
             let b = (px & 0xFF) as u8;
             let off = ty as usize * stride + tx as usize * 4;
             blend_pixel(&mut frame[off..off + 4], r, g, b, a);
-        }
-    }
-}
-
-/// CPU watermark: the raw RGBA pixels (row-major, `w*h*4`) in host memory plus the
-/// placement / animation state, blended directly into the captured BGRA frame.
-///
-/// The blend is on the CPU because the frame is already sitting in host shm memory before it reaches
-/// any encoder, so stamping the overlay there is both the cheapest place to do it and the one place
-/// it applies identically regardless of which encoder (hardware or software) runs downstream. The
-/// pixels are kept as RGBA straight from `image`'s decode and converted per pixel as they are blended.
-struct X11Watermark {
-    pixels: Vec<u8>,
-    w: i32,
-    h: i32,
-    pos_x: i32,
-    pos_y: i32,
-    sub_x: f64,
-    sub_y: f64,
-    vel_x: f64,
-    vel_y: f64,
-    loaded: bool,
-}
-
-impl X11Watermark {
-    /// Load the watermark image at `path` into host RGBA, or return an unloaded stub.
-    ///
-    /// An empty path or any decode failure yields `loaded == false`, which every method treats as a
-    /// no-op, so a missing or broken watermark simply disables the overlay. The bouncing-animation
-    /// velocities are seeded here.
-    fn load(path: &str) -> Self {
-        let mut wm = Self {
-            pixels: Vec::new(),
-            w: 0,
-            h: 0,
-            pos_x: 0,
-            pos_y: 0,
-            sub_x: 0.0,
-            sub_y: 0.0,
-            vel_x: 2.0,
-            vel_y: 2.0,
-            loaded: false,
-        };
-        if path.is_empty() {
-            return wm;
-        }
-        if let Ok(img) = image::open(std::path::Path::new(path)) {
-            let rgba = img.to_rgba8();
-            wm.w = rgba.width() as i32;
-            wm.h = rgba.height() as i32;
-            wm.pixels = rgba.into_vec();
-            wm.loaded = wm.w > 0 && wm.h > 0;
-        }
-        wm
-    }
-
-    /// Set the watermark's top-left placement for this frame from the location enum; a stub
-    /// (unloaded) watermark returns immediately.
-    ///
-    /// The fixed corners and center are direct arithmetic. The animated mode advances a bouncing
-    /// position and reflects velocity off each frame edge, accumulating in the fractional `sub_x` /
-    /// `sub_y` rather than the integer `pos_x` / `pos_y`: a sub-pixel-per-frame velocity has to
-    /// survive between frames or the motion would either stall or snap by whole pixels, so the float
-    /// carries the remainder and `pos_x` / `pos_y` take its floor for the actual blit.
-    fn update_position(&mut self, frame_w: i32, frame_h: i32, loc_enum: i32) {
-        if !self.loaded {
-            return;
-        }
-        match WatermarkLocation::from(loc_enum) {
-            WatermarkLocation::TL => {
-                self.pos_x = 0;
-                self.pos_y = 0;
-            }
-            WatermarkLocation::TR => {
-                self.pos_x = frame_w - self.w;
-                self.pos_y = 0;
-            }
-            WatermarkLocation::BL => {
-                self.pos_x = 0;
-                self.pos_y = frame_h - self.h;
-            }
-            WatermarkLocation::BR => {
-                self.pos_x = frame_w - self.w;
-                self.pos_y = frame_h - self.h;
-            }
-            WatermarkLocation::MI => {
-                self.pos_x = (frame_w - self.w) / 2;
-                self.pos_y = (frame_h - self.h) / 2;
-            }
-            WatermarkLocation::AN => {
-                self.sub_x += self.vel_x;
-                self.sub_y += self.vel_y;
-                if self.sub_x <= 0.0 {
-                    self.sub_x = 0.0;
-                    self.vel_x = self.vel_x.abs();
-                } else if self.sub_x + self.w as f64 >= frame_w as f64 {
-                    self.sub_x = (frame_w - self.w) as f64;
-                    self.vel_x = -self.vel_x.abs();
-                }
-                if self.sub_y <= 0.0 {
-                    self.sub_y = 0.0;
-                    self.vel_y = self.vel_y.abs();
-                } else if self.sub_y + self.h as f64 >= frame_h as f64 {
-                    self.sub_y = (frame_h - self.h) as f64;
-                    self.vel_y = -self.vel_y.abs();
-                }
-                self.pos_x = self.sub_x as i32;
-                self.pos_y = self.sub_y as i32;
-            }
-            WatermarkLocation::None => (),
-        }
-    }
-
-    /// Alpha-blend the loaded watermark into the BGRA frame at its current position; a no-op
-    /// when unloaded. Clips per pixel at the frame bounds because the animated position — or a
-    /// watermark larger than the capture — can leave part of the image off-frame, and only the
-    /// in-frame portion may be written.
-    fn blend_into(&self, frame: &mut [u8], stride: usize, frame_w: i32, frame_h: i32) {
-        if !self.loaded {
-            return;
-        }
-        for y in 0..self.h {
-            let ty = self.pos_y + y;
-            if ty < 0 || ty >= frame_h {
-                continue;
-            }
-            for x in 0..self.w {
-                let tx = self.pos_x + x;
-                if tx < 0 || tx >= frame_w {
-                    continue;
-                }
-                let src = ((y * self.w + x) * 4) as usize;
-                let (r, g, b, a) = (
-                    self.pixels[src],
-                    self.pixels[src + 1],
-                    self.pixels[src + 2],
-                    self.pixels[src + 3],
-                );
-                let off = ty as usize * stride + tx as usize * 4;
-                blend_pixel(&mut frame[off..off + 4], r, g, b, a);
-            }
         }
     }
 }
@@ -719,7 +557,7 @@ where
                 .is_some_and(|pl| pl.reshape(&psettings, size_changed));
             if !reshaped {
                 drop(pipeline.take());
-                pipeline = Some(X11Pipeline::new(psettings.clone(), recording_sink.clone()));
+                pipeline = Some(X11Pipeline::new(psettings.clone()));
                 if let Some(pl) = &pipeline {
                     let enc_name = pl.encoder_name();
                     let mut log_msg = format!(
@@ -749,7 +587,13 @@ where
         }
         let pl = pipeline.as_mut().unwrap();
 
-        if controls.force_idr.swap(false, Ordering::Relaxed) {
+        // A recorder connecting to the socket sink needs a fresh decode entry point; it is
+        // folded into the same standard request-IDR path as a client-driven force_idr.
+        let sink_idr = recording_sink
+            .as_ref()
+            .map(|s| s.should_force_idr())
+            .unwrap_or(false);
+        if controls.force_idr.swap(false, Ordering::Relaxed) || sink_idr {
             pl.request_idr();
         }
         if controls.rate_dirty.swap(false, Ordering::Acquire) {
@@ -771,13 +615,9 @@ where
         if !stripes.is_empty() {
             frame_count += 1;
             stripe_count += stripes.len() as u64;
+            // IDR arming is consumed inside X11Pipeline::process; this tap only fans out.
             if let Some(ref socket) = recording_sink {
-                for stripe in &stripes {
-                    let _ = socket.write_encoded_frame(stripe);
-                }
-                if socket.should_force_idr() {
-                    controls.force_idr.store(true, Ordering::Relaxed);
-                }
+                socket.write_frame(&stripes, psettings.height);
             }
             on_frame(stripes);
         }
@@ -894,7 +734,10 @@ where
     }
     let pool = Arc::new(FramePool::new(POOL_N));
 
-    let mut watermark = X11Watermark::load(&settings.watermark_path);
+    let mut watermark = crate::encoders::overlay::OverlayState::default();
+    if !settings.watermark_path.is_empty() {
+        watermark.load_watermark(&settings.watermark_path, 1.0);
+    }
 
     let enc_pool = pool.clone();
     let enc_controls = controls.clone();
@@ -1058,9 +901,9 @@ where
                 }
             }
 
-            if watermark.loaded {
+            if watermark.is_active() {
                 watermark.update_position(frame_w, frame_h, settings.watermark_location_enum);
-                watermark.blend_into(buf, stride, frame_w, frame_h);
+                watermark.blend_bgra(buf, stride, frame_w, frame_h);
             }
 
             let published = pool.publish(

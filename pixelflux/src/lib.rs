@@ -28,6 +28,7 @@
 //! | [`x11`] | X11/XShm capture loop, XFixes out-of-band cursor monitor, and stripe dispatch |
 //! | [`pipeline`] | Frame-processing policy shared by both backends (send/QP/keyframe decisions) |
 //! | [`recording_sink`] | Unix-socket H.264 fan-out for external recording |
+//! | [`recorder`] | Built-in MP4 recorder (fMP4 muxer + Python/env/REST control surfaces) |
 //! | [`computer_use`] | HTTP API for AI-agent desktop control (screenshots, input injection) |
 //! | [`nvgpufilter`] | Multi-GPU NVENC device filtering via ioctl |
 //!
@@ -80,11 +81,13 @@ use smithay::{
             element::{
                 memory::MemoryRenderBufferRenderElement,
                 surface::WaylandSurfaceRenderElement,
-                AsRenderElements, Wrap,
+                AsRenderElements, Element, RenderElement, Wrap,
             },
             gles::GlesRenderer,
             pixman::PixmanRenderer,
-            Bind, ImportAll, ImportEgl, ImportMem,
+            sync::SyncPoint,
+            Bind, ExportMem, Frame as _, ImportAll, ImportDma, ImportEgl, ImportMem,
+            Renderer as _,
         },
     },
     desktop::{space::SpaceRenderElements, Space},
@@ -96,7 +99,7 @@ use smithay::{
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
     reexports::{
         calloop::{
-            channel::Event as CalloopEvent, generic::Generic, timer::{TimeoutAction, Timer},
+            generic::Generic, timer::{TimeoutAction, Timer},
             EventLoop, Interest, Mode, PostAction,
         },
         pixman,
@@ -113,7 +116,6 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
-        virtual_keyboard::VirtualKeyboardManagerState,
         pointer_warp::PointerWarpManager,
         relative_pointer::RelativePointerManagerState,
         pointer_constraints::PointerConstraintsState,
@@ -173,6 +175,8 @@ pub mod encoders {
 pub mod wayland;
 /// Unix-socket H.264 recording fan-out for external capture tools.
 pub mod recording_sink;
+/// Built-in MP4 recorder: independent capture-to-file with Python/env/REST control.
+pub mod recorder;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
 /// Frame-processing policy shared by the X11 and Wayland backends.
@@ -226,7 +230,9 @@ use encoders::overlay::OverlayState;
 use encoders::software::MAX_STRIPE_CAPACITY;
 use encoders::vaapi::VaapiEncoder;
 
-use wayland::cursor::Cursor;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+
+use wayland::cursor::{Cursor, CursorJob};
 use wayland::frontend::{AppState, ClientState, FocusTarget, GpuEncoder, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
@@ -244,7 +250,7 @@ smithay::backend::renderer::element::render_elements! {
 /// the buffer is described precisely enough (fd, stride, DRM modifier) for the importer to interpret
 /// it. One ARGB8888 plane is all that is carried because the compositor's offscreen target is exactly
 /// that single-plane format.
-fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
+pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier();
     let stride = bo.stride();
@@ -304,6 +310,9 @@ pub struct RustCaptureSettings {
     pub debug_logging: bool,
     pub auto_adjust_screen_capture_size: bool,
     pub recording_socket: String,
+    /// Wayland display of an EXTERNAL compositor to capture (host-capture mode);
+    /// empty composites own clients as usual.
+    pub wayland_host_display: String,
     /// When true, encoders emit the raw payload without the per-stripe header byte block;
     /// stripe metadata is then carried only on the frame attributes.
     pub omit_stripe_headers: bool,
@@ -314,7 +323,7 @@ pub struct RustCaptureSettings {
     /// infinite GOP, 3 when scheduled keyframes are enabled.
     pub video_vbv_multiplier: f64,
     /// Seconds between scheduled recovery keyframes; `<= 0` keeps the GOP infinite
-    /// (IDRs only on demand: client join / reset, recording cadence).
+    /// (IDRs only on demand: client join / reset, recorder connect).
     pub keyframe_interval_s: f64,
     /// Rate-controlled (CBR) QP clamp: `video_max_qp` bounds the quality FLOOR (screen text stays
     /// legible under motion at the cost of overshooting impossible targets), `video_min_qp` bounds
@@ -407,6 +416,7 @@ impl Default for RustCaptureSettings {
             debug_logging: false,
             auto_adjust_screen_capture_size: false,
             recording_socket: String::new(),
+            wayland_host_display: String::new(),
             omit_stripe_headers: false,
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,
@@ -496,9 +506,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .getattr("recording_socket")
             .ok()
             .and_then(|v| v.extract::<String>().ok())
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("PIXELFLUX_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
-            .or_else(|| std::env::var("SELKIES_RECORDING_SOCKET").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_default(),
+        wayland_host_display: settings
+            .getattr("wayland_host_display")
+            .ok()
+            .and_then(|v| v.extract::<String>().ok())
             .unwrap_or_default(),
         omit_stripe_headers: settings
             .getattr("omit_stripe_headers")
@@ -537,20 +549,79 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
 /// the xkb keymap, serving the clipboard, changing live rate and per-frame tunables, and the
 /// computer-use queries that read back the screen, cursor, and geometry.
 pub enum ThreadCommand {
-    StartCapture(Py<PyAny>, RustCaptureSettings),
-    StopCapture,
+    /// Start (or in-place reconfigure) the capture bound to output `display_id`.
+    /// `callback` is the Python per-frame delivery target; `None` starts an internal
+    /// capture with no Python consumer (the built-in recorder taps the delivery layer).
+    StartCapture { display_id: u32, callback: Option<Py<PyAny>>, settings: RustCaptureSettings },
+    /// Stop the capture bound to output `display_id` (other displays keep running).
+    StopCapture { display_id: u32 },
+    /// Create an additional output: `WxH` physical pixels at fractional `scale`, mapped
+    /// into the layout at offset `(x, y)`. Replies false when the id is taken/reserved or
+    /// the GPU render target cannot be allocated.
+    CreateOutput {
+        id: u32,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        scale: f64,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    /// Destroy a secondary output: its capture ends, its windows relocate to the primary
+    /// output. Replies false for the primary (id 0) or an unknown id.
+    DestroyOutput { id: u32, reply: std::sync::mpsc::Sender<bool> },
+    /// Remap an existing output (the primary included) to layout offset `(x, y)`: the
+    /// Space mapping, the offsets used for absolute input injection and cursor
+    /// compositing, and the windows placed on it all follow, and the output is damaged so
+    /// the next frames render correctly. Replies false for an unknown id.
+    RepositionOutput { id: u32, x: i32, y: i32, reply: std::sync::mpsc::Sender<bool> },
+    /// Reply with every live output as `(id, x, y, width, height, scale, capturing)`.
+    ListOutputs { reply: std::sync::mpsc::Sender<Vec<(u32, i32, i32, i32, i32, f64, bool)>> },
+    /// Move the window with the given id onto output `output_id` (fullscreened there).
+    MoveWindowToOutput { window_id: u32, output_id: u32, reply: std::sync::mpsc::Sender<bool> },
+    /// Reply with every mapped window as `(window_id, title, app_id, output_id)`.
+    ListWindows { reply: std::sync::mpsc::Sender<Vec<(u32, String, String, u32)>> },
     SetCursorCallback(Py<PyAny>),
     SetClipboardCallback(Py<PyAny>),
     /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
     /// `mime` (plus text aliases) to pasting clients.
     SetClipboard { mime: String, data: Vec<u8> },
     KeyboardKey { scancode: u32, state: u32 },
-    /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text); the caller owns
-    /// keysym-to-keycode policy and injects the keycodes it defined via `KeyboardKey`.
+    /// Set the seat's BASE keymap from a full XKB_KEYMAP_FORMAT_TEXT_V1 string. The
+    /// compositor's keymap policy rebuilds on top: overlay binds are re-spliced onto the new
+    /// base (same keycodes) and the combined keymap is applied in one swap.
     SetKeymapString(String),
+    /// Set the seat's BASE layout from RMLVO names (empty strings = xkbcommon defaults);
+    /// replies whether compilation succeeded. Overlay binds rebuild on top as for
+    /// `SetKeymapString`.
+    SetXkbLayout {
+        rules: String,
+        model: String,
+        layout: String,
+        variant: String,
+        options: String,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    /// Resolve keysyms to `(keycode, level)` against the seat keymap, overlay-binding every
+    /// keysym the base cannot produce — ONE keymap swap for the whole batch, and a keycode that
+    /// is currently pressed is never recycled. `(0, 0)` marks an unbindable keysym.
+    BindKeysyms {
+        keysyms: Vec<u32>,
+        reply: std::sync::mpsc::Sender<Vec<(u32, u32)>>,
+    },
+    /// Debug/verification readback: currently pressed xkb keycodes plus the modifier state
+    /// bitmask (1 ctrl, 2 shift, 4 alt, 8 logo, 16 caps, 32 num, 64 altgr, 128 level5).
+    GetKeyboardState {
+        reply: std::sync::mpsc::Sender<(Vec<u32>, u32)>,
+    },
     /// Reply with the smithay keyboard's keymap as an XKB_KEYMAP_FORMAT_TEXT_V1 string so a
     /// consumer (selkies) can build its reverse keysym map from the IDENTICAL keymap.
     GetXkbKeymap { reply: std::sync::mpsc::Sender<String> },
+    /// Ack once every previously queued command has been fully processed (the channel is
+    /// FIFO). The atexit sweep sends StopCapture + Barrier and waits, so the interpreter never
+    /// exits while the calloop thread is still mid-teardown (an NVENC/CUDA session drop racing
+    /// process exit segfaults).
+    Barrier { reply: std::sync::mpsc::Sender<()> },
     PointerMotion { x: f64, y: f64 },
     PointerRelativeMotion { dx: f64, dy: f64 },
     /// `btn` is an evdev `BTN_` code by contract (e.g. 272 = BTN_LEFT, 273 = BTN_RIGHT,
@@ -559,19 +630,29 @@ pub enum ThreadCommand {
     PointerButton { btn: u32, state: u32 },
     PointerAxis { x: f64, y: f64 },
     UpdateCursorConfig { render_on_framebuffer: bool },
-    /// On-demand keyframe request (client reconnect / decoder reset): forces a send and an IDR
-    /// even on a static screen.
-    RequestIdr,
-    /// Live rate-control change for the Wayland calloop thread (parity with the X11 `rate_dirty`
+    /// Recreate the cursor theme handles at a new pixel size — the calloop's compositing
+    /// helper (the burned-in cursor) and, through its job channel, the `wl-cursor` worker's
+    /// (named-cursor PNG delivery). Replies false for a non-positive size.
+    SetCursorSize { size: i32, reply: std::sync::mpsc::Sender<bool> },
+    /// On-demand keyframe request (client reconnect / decoder reset) for one display's
+    /// capture: forces a send and an IDR even on a static screen.
+    RequestIdr { display_id: u32 },
+    /// Live rate-control change for one display's capture (parity with the X11 `rate_dirty`
     /// path). Each field is `None` when that dimension is unchanged.
-    UpdateRate { bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64> },
-    /// Live per-frame tunables (quality / paint-over / streaming / cursor), applied to the
-    /// calloop's settings and mirrored to the readback encode thread — no capture or encoder
-    /// restart.
-    UpdateTunables(LiveTunables),
-    CuScreenshot { resp: std::sync::mpsc::Sender<Vec<u8>> },
+    UpdateRate {
+        display_id: u32,
+        bitrate_kbps: Option<i32>,
+        vbv_multiplier: Option<f64>,
+        fps: Option<f64>,
+    },
+    /// Live per-frame tunables (quality / paint-over / streaming / cursor) for one
+    /// display's capture, mirrored to its readback encode thread — no restart.
+    UpdateTunables { display_id: u32, tunables: LiveTunables },
+    /// One-shot PNG of one output's next rendered frame (0 = primary); an unknown
+    /// display id replies with an error immediately.
+    CuScreenshot { display_id: u32, resp: std::sync::mpsc::Sender<Result<Vec<u8>, String>> },
     CuCursorPosition { resp: std::sync::mpsc::Sender<(f64, f64)> },
-    CuGetInfo { resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
+    CuGetInfo { display_id: u32, resp: std::sync::mpsc::Sender<(i32, i32, f64)> },
 }
 
 /// Read the kernel driver bound to a render node for encoder routing.
@@ -950,6 +1031,8 @@ impl WlEncodeStats {
 /// flow through `controls`; damage and the IDR request arrive per-frame in `WlFrame`.
 struct WlEncodeConfig {
     settings: RustCaptureSettings,
+    /// Output/display id this encode loop serves; keys the recorder's delivery-layer tap.
+    display_id: u32,
     /// GLES readback is RGBA; the pixman framebuffer is BGRA. Selects CSC + encoder input kind.
     use_gpu: bool,
     /// Attempt a HW (NVENC/VAAPI) readback session before falling back to the CPU encoders.
@@ -1118,7 +1201,14 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             }
         }
 
-        let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed);
+        // A recorder connecting counts as a request, so the decision layer sends a
+        // decodable frame even when the screen is static.
+        let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed)
+            || cfg
+                .recording_sink
+                .as_ref()
+                .map(|s| s.should_force_idr())
+                .unwrap_or(false);
 
         let mut out: Vec<EncodedStripe> = Vec::new();
         if let Some(ref mut encoder) = video_encoder {
@@ -1183,7 +1273,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 };
                 match result {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
-                        data,
+                        data: Arc::new(data),
                         data_type: 2,
                         stripe_y_start: 0,
                         stripe_height: height,
@@ -1207,7 +1297,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 let stride = (width * 4) as usize;
                 match enc.encode_host_argb(&f.buf, stride, f.frame_id as u64, force_idr, cfg.use_gpu) {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
-                        data,
+                        data: Arc::new(data),
                         data_type: 2,
                         stripe_y_start: 0,
                         stripe_height: height,
@@ -1241,17 +1331,18 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
 
         let WlFrame { id, buf, .. } = f;
         pool.recycle(id, buf);
+        // An unserved request stays armed: on an infinite GOP an IDR lost to an encode
+        // error or skip would never self-heal.
+        if requested_idr && out.is_empty() {
+            cfg.controls.force_idr.store(true, Ordering::Relaxed);
+        }
         if !out.is_empty() {
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
             if let Some(ref socket) = cfg.recording_sink {
-                for stripe in &out {
-                    let _ = socket.write_encoded_frame(stripe);
-                }
-                if socket.should_force_idr() {
-                    cfg.controls.force_idr.store(true, Ordering::Relaxed);
-                }
+                socket.write_frame(&out, settings.height);
             }
+            crate::recorder::wayland_tap(cfg.display_id, &out);
             let _ = cfg.deliver_tx.send(out);
         }
     }
@@ -1407,6 +1498,1613 @@ fn log_stream_settings(
     println!("{}", log_msg);
 }
 
+/// Tear down a capture's encode/delivery threads and pools, returning any readback
+/// hardware session for in-place reuse by a following start. The encode thread is joined
+/// before the delivery sender drops (it feeds that sender), and the zero-copy session (if
+/// any) is left on the capture for the caller to reuse or drop.
+fn teardown_capture(cap: &mut wayland::frontend::WlCapture) -> Option<GpuEncoder> {
+    if let Some(p) = cap.encode_pool.take() {
+        p.shutdown();
+    }
+    let prior = cap.encode_join.take().and_then(|j| j.join().ok()).flatten();
+    if let Some(tx) = cap.deliver_tx.take() {
+        drop(tx);
+    }
+    if let Some(j) = cap.deliver_join.take() {
+        let _ = j.join();
+    }
+    cap.pending_hw_delivery = None;
+    cap.pending_hw_damage = false;
+    cap.recording_sink = None;
+    prior
+}
+
+/// Stop the capture bound to `display_id`, leaving the output (and every other display's
+/// capture) running.
+fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
+    let Some(idx) = state.node_idx_for_id(display_id) else { return };
+    if let Some(mut cap) = state.output_nodes[idx].capture.take() {
+        println!("[Wayland] Capture loop stopped (display {display_id}).");
+        cap.video_encoder = None;
+        let _ = teardown_capture(&mut cap);
+    }
+    wayland_alive().lock().unwrap().remove(&display_id);
+}
+
+/// Start (or in-place reconfigure) the capture bound to output `display_id`: reprogram the
+/// output's mode/scale/refresh, size the render targets, fullscreen the display's windows at
+/// the new logical size, resolve the encode path (zero-copy vs readback), and spawn the
+/// delivery (and readback-mode encode) threads. The single-display behavior of the former
+/// global StartCapture is preserved exactly for display 0.
+fn start_capture_on_display(
+    state: &mut AppState,
+    display_id: u32,
+    cb: Option<Py<PyAny>>,
+    mut settings: RustCaptureSettings,
+) {
+    use smithay::wayland::fractional_scale::with_fractional_scale;
+
+    // Host-capture mode: connect on first use and point this display's capture
+    // thread at the requested size. The compositor keeps running (CU, clipboard
+    // callbacks, input fallbacks) but its renderer is bypassed.
+    if !settings.wayland_host_display.is_empty() {
+        if state.host.is_none() {
+            // Capture buffers come from the same render node the encoder imports
+            // from, resolved via its live fd (the path string is not retained in
+            // auto mode); each capture thread opens its own device handle.
+            let gbm_path = if state.use_gpu {
+                state.gbm_device.as_ref().and_then(|dev| {
+                    use std::os::fd::{AsFd as _, AsRawFd as _};
+                    let fd = dev.as_fd().as_raw_fd();
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+                })
+            } else {
+                None
+            };
+            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path)
+            {
+                Ok(h) => {
+                    println!(
+                        "[HostCapture] capturing host compositor '{}' ({} outputs).",
+                        settings.wayland_host_display,
+                        h.output_count()
+                    );
+                    state.host = Some(h);
+                }
+                Err(e) => eprintln!(
+                    "[HostCapture] connect '{}' failed: {e}",
+                    settings.wayland_host_display
+                ),
+            }
+        }
+        if let Some(host) = &state.host {
+            // The node's layout offset rides along so the host's heads mirror
+            // selkies' union layout (input coordinates already assume it).
+            if let Some(idx) = state.node_idx_for_id(display_id) {
+                let pos = state.output_nodes[idx].pos;
+                host.set_layout(display_id, pos.0, pos.1);
+            }
+            host.start_capture(display_id, settings.width, settings.height);
+        }
+    }
+
+    let Some(node_idx) = state.node_idx_for_id(display_id) else {
+        eprintln!("[Wayland] StartCapture: no output with display id {display_id}.");
+        return;
+    };
+    let mut node = state.output_nodes.remove(node_idx);
+
+    if state.auto_gpu_selected && settings.encode_node_index < -1 {
+        if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
+            if let Ok(idx) = idx_str.parse::<i32>() {
+                settings.encode_node_index = idx - 128;
+            }
+        }
+    }
+
+    if settings.output_mode == 1 {
+        settings.width &= !1;
+        settings.height &= !1;
+    }
+
+    // Tear down this display's previous capture first; its hardware sessions are the
+    // reuse candidates below (zero-copy inline, readback via the encode config).
+    let mut prior_zero_copy: Option<GpuEncoder> = None;
+    let mut prior_readback_encoder: Option<GpuEncoder> = None;
+    if let Some(mut old) = node.capture.take() {
+        prior_zero_copy = old.video_encoder.take();
+        prior_readback_encoder = teardown_capture(&mut old);
+    }
+
+    // Bind only after the old capture is gone: its sink unlinks the socket path in
+    // Drop, which would strip a fresh bind's filesystem name and leave every later
+    // recorder connect with ENOENT.
+    let recording_sink = crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
+
+    {
+        // Never panic the compositor thread: an output momentarily without a current
+        // mode falls back to the requested geometry so the reconfigure below is a
+        // no-op for size/refresh instead of unwrap-panicking.
+        let target_refresh = (settings.target_fps * 1000.0).round() as i32;
+        let (current_w, current_h, current_refresh) = match node.output.current_mode() {
+            Some(m) => (m.size.w, m.size.h, m.refresh),
+            None => (settings.width, settings.height, target_refresh),
+        };
+        let current_scale = node.output.current_scale().fractional_scale();
+
+        if current_w != settings.width
+            || current_h != settings.height
+            || (current_scale - settings.scale).abs() > 0.001
+            || current_refresh != target_refresh
+        {
+            // Allocate the GPU backing for the new dimensions BEFORE committing
+            // anything: if the driver refuses (VRAM exhaustion, dimensions it will
+            // not back), the whole reconfigure is skipped and the previous mode +
+            // buffers stay live. A failed resize must degrade to "no resize", never
+            // panic the compositor thread.
+            let mut new_offscreen = None;
+            let mut gbm_resize_failed = false;
+            if state.use_gpu {
+                if let Some(gbm) = state.gbm_device.as_mut() {
+                    match gbm.create_buffer_object(
+                        settings.width as u32,
+                        settings.height as u32,
+                        GbmFormat::Argb8888,
+                        BufferObjectFlags::RENDERING,
+                    ) {
+                        Ok(bo) => {
+                            let dmabuf = create_dmabuf_from_bo(&bo);
+                            new_offscreen = Some((bo, dmabuf));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[Wayland] GBM buffer resize to {}x{} failed ({:?}); keeping previous output mode.",
+                                settings.width, settings.height, e
+                            );
+                            gbm_resize_failed = true;
+                        }
+                    }
+                }
+            }
+            if gbm_resize_failed {
+                // The mode commit below is skipped wholesale, so the rest of this
+                // StartCapture (encoder setup, stored settings) must see the
+                // dimensions actually live.
+                settings.width = current_w;
+                settings.height = current_h;
+                settings.scale = current_scale;
+                settings.target_fps = current_refresh as f64 / 1000.0;
+            } else {
+                println!(
+                    "[Wayland] Configuring Output {} ({}): {}x{} @ {:.2} FPS (Scale {:.2})",
+                    display_id, node.output.name(),
+                    settings.width, settings.height, settings.target_fps, settings.scale
+                );
+                let new_mode = OutputMode {
+                    size: (settings.width, settings.height).into(),
+                    refresh: target_refresh,
+                };
+                node.output.change_current_state(
+                    Some(new_mode),
+                    Some(Transform::Normal),
+                    Some(OutputScale::Fractional(settings.scale)),
+                    Some(Point::from(node.pos)),
+                );
+                node.output.set_preferred(new_mode);
+
+                let pixel_count =
+                    (settings.width.max(0) as usize) * (settings.height.max(0) as usize);
+                node.frame_buffer = vec![0u8; pixel_count * 4];
+
+                if let Some(off) = new_offscreen.take() {
+                    node.offscreen_buffer = Some(off);
+                }
+            }
+        }
+
+        let scale = settings.scale.max(0.1);
+        let logical_width = (settings.width as f64 / scale).round() as i32;
+        let logical_height = (settings.height as f64 / scale).round() as i32;
+
+        for window in state.space.elements() {
+            if wayland::frontend::window_output_id(window) != display_id {
+                continue;
+            }
+            if let Some(surface) = window.wl_surface() {
+                node.output.enter(&surface);
+                with_states(&surface, |states| {
+                    with_fractional_scale(states, |fs| {
+                        fs.set_preferred_scale(scale);
+                    });
+                });
+            }
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
+                    state.states.set(State::Fullscreen);
+                    state.states.set(State::Activated);
+                    state.size = Some((logical_width, logical_height).into());
+                });
+                toplevel.send_configure();
+            }
+        }
+    }
+
+    let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
+    let gpu_intent = settings.output_mode == 1 && !settings.use_openh264 && !use_cpu_explicit;
+    if use_cpu_explicit && !(settings.output_mode == 1 && settings.use_openh264) {
+        println!("[Wayland] CPU encoding selected (use_cpu=true or encode_node_index=-1).");
+    }
+
+    let mut different_gpu = false;
+    if gpu_intent {
+        let encode_node_idx = settings.encode_node_index.max(0);
+        if !state.render_node_path.is_empty()
+            && !state.render_node_path.contains(&format!("renderD{}", 128 + encode_node_idx))
+        {
+            different_gpu = true;
+        }
+    }
+
+    let mut video_encoder: Option<GpuEncoder> = None;
+    if gpu_intent && state.use_gpu && !different_gpu {
+        let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
+        println!(
+            "[Wayland] Encode Node Index: {} | Driver: {}",
+            settings.encode_node_index.max(0), encode_driver
+        );
+
+        if encode_driver.contains("nvidia") {
+            let reused = match prior_zero_copy.as_mut() {
+                Some(GpuEncoder::Nvenc(enc)) => match enc.reconfigure_resolution(&settings) {
+                    Ok(()) => {
+                        println!("[Wayland] NVENC session reconfigured in place.");
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
+                        false
+                    }
+                },
+                _ => false,
+            };
+            if reused {
+                video_encoder = prior_zero_copy.take();
+            } else {
+                prior_zero_copy = None;
+                println!("[Wayland] Nvidia Encoder detected. Initializing NVENC...");
+                let egl_display = if let Some(renderer) = state.gles_renderer.as_ref() {
+                    renderer.egl_context().display().get_display_handle().handle
+                } else {
+                    std::ptr::null()
+                };
+
+                match NvencEncoder::new(&settings, egl_display) {
+                    Ok(encoder) => {
+                        video_encoder = Some(GpuEncoder::Nvenc(encoder));
+                        println!("[Wayland] NVENC Encoder initialized successfully.");
+                    }
+                    Err(e) => eprintln!(
+                        "[Wayland] Failed to init NVENC: {}. Falling back to CPU.",
+                        e
+                    ),
+                }
+            }
+        } else {
+            prior_zero_copy = None;
+            println!("[Wayland] Initializing Unified VAAPI Encoder...");
+            if settings.video_fullcolor {
+                println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
+            } else {
+                match VaapiEncoder::new(&settings) {
+                    Ok(encoder) => {
+                        video_encoder = Some(GpuEncoder::Vaapi(encoder));
+                        println!("[Wayland] VAAPI Encoder initialized successfully.");
+                    }
+                    Err(e) => eprintln!(
+                        "[Wayland] Failed to init VAAPI: {}. Falling back to CPU.",
+                        e
+                    ),
+                }
+            }
+        }
+    }
+    drop(prior_zero_copy);
+
+    if different_gpu {
+        println!("[Wayland] Decision: Rendering and Encoding GPUs differ -> Forcing Readback (CPU path for pixels).");
+    }
+    if video_encoder.is_none() {
+        println!("[Wayland] Decision: Readback path (encode thread) active.");
+    } else if !different_gpu {
+        println!("[Wayland] Decision: Zero-Copy path active.");
+    }
+
+    if recording_sink.is_some() && settings.output_mode == 0 {
+        eprintln!(
+            "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
+             The recording socket requires a single H.264 stream. Please set output_mode=1 \
+             on the Python CaptureSettings to produce a recordable output."
+        );
+    }
+
+    // Every display's capture composites its own watermark, uploaded at this output's
+    // scale and placed against this output's frame dimensions.
+    let watermark_output_scale = node.output.current_scale().fractional_scale();
+    node.overlay_state
+        .load_watermark(&settings.watermark_path, watermark_output_scale);
+    if display_id == 0 {
+        state.settings = settings.clone();
+        if state.cursor_callback_set {
+            if let Some(icon) = state.current_cursor_icon.clone() {
+                state.send_cursor_image(&icon);
+            }
+        }
+    }
+    state.render_cursor_on_framebuffer = settings.capture_cursor;
+
+    let mut cap = wayland::frontend::WlCapture {
+        settings: settings.clone(),
+        video_encoder,
+        vaapi_state: StripeState::default(),
+        recording_sink,
+        deliver_tx: None,
+        deliver_join: None,
+        pending_hw_delivery: None,
+        pending_hw_damage: false,
+        encode_pool: None,
+        encode_join: None,
+        encode_controls: Arc::new(WlEncodeControls::new()),
+        encode_stats: Arc::new(WlEncodeStats::new()),
+        pool_last_render: Vec::new(),
+        render_seq: 0,
+        pool_content_gen: Vec::new(),
+        content_gen: 0,
+        frame_counter: 0,
+        pending_force_idr: false,
+        needs_full_render: true,
+        last_tick: None,
+    };
+
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
+        // With no Python callback (internal recorder-owned capture) the delivery thread
+        // only drains the channel: the recorder already consumed the frames at the
+        // delivery-layer tap, upstream of this per-consumer handoff.
+        let join = match cb {
+            Some(cb) => thread::spawn(move || {
+                crate::boost_thread_priority(-10);
+                while let Ok(stripes) = rx.recv() {
+                    if PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
+                    Python::attach(|py| {
+                        for s in stripes {
+                            match Py::new(py, StripeFrame::new_owned_meta(
+                                s.data, s.data_type, s.stripe_y_start,
+                                s.stripe_height, s.frame_id,
+                            )) {
+                                Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
+                                Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
+                            }
+                        }
+                    });
+                }
+            }),
+            None => thread::spawn(move || while rx.recv().is_ok() {}),
+        };
+        cap.deliver_tx = Some(tx);
+        cap.deliver_join = Some(join);
+    }
+
+    if cap.video_encoder.is_none() {
+        if let Some(deliver_tx) = cap.deliver_tx.clone() {
+            let pool = Arc::new(WlFramePool::new(
+                WL_POOL_SURFACES,
+                (settings.width.max(0) as usize) * (settings.height.max(0) as usize) * 4,
+            ));
+            cap.pool_last_render = vec![0; WL_POOL_SURFACES];
+            cap.render_seq = 0;
+            // u64::MAX marks every slot stale so each one is read back before its
+            // first publish, whatever the damage says.
+            cap.pool_content_gen = vec![u64::MAX; WL_POOL_SURFACES];
+            cap.content_gen = 0;
+            let c = &cap.encode_controls;
+            c.bitrate_kbps.store(settings.video_bitrate_kbps, Ordering::Relaxed);
+            c.vbv_mult_milli.store(
+                (settings.video_vbv_multiplier * 1000.0).round() as i32,
+                Ordering::Relaxed,
+            );
+            c.fps_milli.store(
+                (settings.target_fps.max(1.0) * 1000.0) as u64,
+                Ordering::Relaxed,
+            );
+            let cfg = WlEncodeConfig {
+                settings: settings.clone(),
+                display_id,
+                use_gpu: state.use_gpu,
+                try_gpu: gpu_intent && (!state.use_gpu || different_gpu),
+                prior: prior_readback_encoder.take(),
+                recording_sink: cap.recording_sink.clone(),
+                deliver_tx,
+                controls: cap.encode_controls.clone(),
+                stats: cap.encode_stats.clone(),
+            };
+            let pool2 = pool.clone();
+            cap.encode_join = Some(
+                thread::Builder::new()
+                    .name(format!("wl-encode-{display_id}"))
+                    .spawn(move || wayland_encode_loop(&pool2, cfg))
+                    .expect("failed to spawn wl-encode thread"),
+            );
+            cap.encode_pool = Some(pool);
+        }
+    } else {
+        cap.encode_stats.n_stripes.store(1, Ordering::Relaxed);
+        *cap.encode_stats.desc.lock().unwrap() =
+            encoder_desc(&settings, cap.video_encoder.as_ref(), false, true);
+        log_stream_settings(&settings, 1, cap.video_encoder.as_ref(), false);
+    }
+    drop(prior_readback_encoder);
+    // Force the keyframe unconditionally: the damage tracker and offscreen buffer
+    // stay warm across stop/start, so a restarted capture on a static screen
+    // otherwise produces no damage, no first frame, and no IDR in either path.
+    cap.request_idr();
+
+    node.capture = Some(cap);
+    state.output_nodes.insert(node_idx, node);
+    wayland_alive().lock().unwrap().insert(display_id);
+}
+
+/// One output's render + capture tick: composite the elements overlapping this output
+/// (positions made output-local by subtracting its layout origin), track damage, feed the
+/// display's own encode path, and answer a pending screenshot on the primary. Returns true
+/// when the tick was skipped because this display's encode pool was still busy (the caller
+/// then retries shortly instead of waiting a full frame interval).
+/// Stamp the watermark element onto `target` in place — no clear, so the
+/// captured content underneath stays — returning the draw's sync point for the
+/// encoder to wait on.
+fn draw_host_watermark(
+    renderer: &mut GlesRenderer,
+    overlay: &crate::encoders::overlay::OverlayState,
+    target: &mut Dmabuf,
+    size: (i32, i32),
+) -> Result<SyncPoint, String> {
+    let elem = overlay
+        .get_watermark_element(renderer)
+        .ok_or("watermark element unavailable")?;
+    let mut fb = renderer.bind(target).map_err(|e| format!("bind: {e:?}"))?;
+    let mut frame = renderer
+        .render(&mut fb, (size.0, size.1).into(), Transform::Normal)
+        .map_err(|e| format!("render: {e:?}"))?;
+    let dst = elem.geometry(1.0.into());
+    let local = Rectangle::from_size(dst.size);
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+        .map_err(|e| format!("draw: {e:?}"))?;
+    frame.finish().map_err(|e| format!("finish: {e:?}"))
+}
+
+/// Re-compose `src` (the retained host frame) plus the watermark into `target`:
+/// the path a moving watermark needs, since re-drawing over the same retained
+/// buffer would leave trails.
+fn compose_host_watermark(
+    renderer: &mut GlesRenderer,
+    overlay: &crate::encoders::overlay::OverlayState,
+    src: &Dmabuf,
+    target: &mut Dmabuf,
+    size: (i32, i32),
+) -> Result<SyncPoint, String> {
+    let elem = overlay
+        .get_watermark_element(renderer)
+        .ok_or("watermark element unavailable")?;
+    let tex = renderer
+        .import_dmabuf(src, None)
+        .map_err(|e| format!("import: {e:?}"))?;
+    let mut fb = renderer.bind(target).map_err(|e| format!("bind: {e:?}"))?;
+    let full: Rectangle<i32, Physical> = Rectangle::from_size((size.0, size.1).into());
+    let mut frame = renderer
+        .render(&mut fb, (size.0, size.1).into(), Transform::Normal)
+        .map_err(|e| format!("render: {e:?}"))?;
+    frame
+        .render_texture_from_to(
+            &tex,
+            Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
+            full,
+            &[full],
+            // Opaque: the capture format's undefined alpha must not blend, it
+            // would leave the target's previous content (and stamped
+            // watermarks) underneath.
+            &[full],
+            Transform::Normal,
+            1.0,
+            None,
+            &[],
+        )
+        .map_err(|e| format!("texture: {e:?}"))?;
+    let dst = elem.geometry(1.0.into());
+    let local = Rectangle::from_size(dst.size);
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+        .map_err(|e| format!("draw: {e:?}"))?;
+    frame.finish().map_err(|e| format!("finish: {e:?}"))
+}
+
+fn warn_once_host_watermark(e: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("[HostCapture] watermark compositing failed: {e}");
+    }
+}
+
+fn render_node_tick(
+    state: &mut AppState,
+    node: &mut wayland::frontend::OutputNode,
+    is_memory_throttling: bool,
+) -> bool {
+    let take_screenshot = state
+        .pending_screenshot
+        .as_ref()
+        .is_some_and(|(id, _)| *id == node.id);
+    if node.capture.is_none() && !take_screenshot {
+        return false;
+    }
+
+    // Per-display frame pacing under the one shared timer (which fires at the fastest
+    // active capture's rate).
+    if let Some(cap) = node.capture.as_ref() {
+        if !take_screenshot {
+            let fps = (if is_memory_throttling { 5.0 } else { cap.settings.target_fps }).max(1.0);
+            if let Some(last) = cap.last_tick {
+                if last.elapsed().as_secs_f64() < (1.0 / fps) * 0.9 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    let output = node.output.clone();
+    let origin: Point<i32, smithay::utils::Logical> = node.pos.into();
+    let output_scale_val = output.current_scale().fractional_scale();
+    let (width, height) = match node.capture.as_ref() {
+        Some(c) => (c.settings.width, c.settings.height),
+        None => output
+            .current_mode()
+            .map(|m| (m.size.w, m.size.h))
+            .unwrap_or((0, 0)),
+    };
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    if node.frame_buffer.len() < (width as usize) * (height as usize) * 4 {
+        node.frame_buffer = vec![0u8; (width as usize) * (height as usize) * 4];
+    }
+    let logical_w = (width as f64 / output_scale_val).round();
+    let logical_h = (height as f64 / output_scale_val).round();
+
+    // A recorder connecting counts as an IDR request, kept armed across skipped ticks.
+    if let Some(cap) = node.capture.as_mut() {
+        if cap
+            .recording_sink
+            .as_ref()
+            .map(|s| s.should_force_idr())
+            .unwrap_or(false)
+        {
+            cap.request_idr();
+        }
+    }
+    let requested_idr = node.capture.as_ref().map(|c| c.pending_force_idr).unwrap_or(false);
+    // A client keyframe request lands on the hardware path's atomic (RequestIdr sets
+    // it whenever an encode pool exists); host mode consults it — without consuming —
+    // to decide whether a static screen must re-encode its retained frame.
+    let hw_idr_pending = node
+        .capture
+        .as_ref()
+        .map(|c| c.encode_controls.force_idr.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let want_idr_for_host = requested_idr || hw_idr_pending;
+
+    let mut pool_slot: Option<(usize, Vec<u8>)> = None;
+    if let Some(cap) = node.capture.as_ref() {
+        if let Some(ref pool) = cap.encode_pool {
+            if !is_memory_throttling {
+                pool_slot = pool.try_begin();
+                if pool_slot.is_none() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let loc_enum = node
+        .capture
+        .as_ref()
+        .map(|c| c.settings.watermark_location_enum)
+        .unwrap_or(state.settings.watermark_location_enum);
+    node.overlay_state.update_position(width, height, loc_enum);
+
+    if let Some(cap) = node.capture.as_mut() {
+        cap.last_tick = Some(Instant::now());
+    }
+
+    // The cursor is composited only on the output the pointer is on, at that output's
+    // scale; its position is output-local.
+    let pointer_local: Option<Point<f64, smithay::utils::Logical>> = state
+        .seat
+        .get_pointer()
+        .map(|p| p.current_location())
+        .and_then(|pos| {
+            let rect = Rectangle::<f64, smithay::utils::Logical>::new(
+                origin.to_f64(),
+                (logical_w, logical_h).into(),
+            );
+            if rect.contains(pos) {
+                Some(pos - origin.to_f64())
+            } else {
+                None
+            }
+        });
+
+    let mut render_success = false;
+    let mut render_sync = None;
+    let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
+    let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(true);
+
+    // Host-capture mode: the host compositor already blitted this display's frame
+    // into one of our buffers (screencopy); adopt it in place of compositing.
+    let host_mode = state.host.as_ref().map(|h| h.has_output_for(node.id)).unwrap_or(false);
+    if state.host.is_some() && !host_mode {
+        // No host output backs this display (start_capture already warned):
+        // produce nothing rather than the compositor's own empty content.
+        if let Some((id, buf)) = pool_slot.take() {
+            if let Some(cap) = node.capture.as_ref() {
+                if let Some(ref pool) = cap.encode_pool {
+                    pool.cancel(id, buf);
+                }
+            }
+        }
+        return false;
+    }
+    // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
+    let mut host_enc_dmabuf: Option<Dmabuf> = None;
+    if host_mode {
+        const RETAINED_OK: u8 = 0;
+        const RETAINED_NONE: u8 = 1;
+        const RETAINED_MISMATCH: u8 = 2;
+        let host_idx = node.id;
+        let gpu_encoder = node
+            .capture
+            .as_ref()
+            .map(|c| c.video_encoder.is_some())
+            .unwrap_or(false);
+        // The session steps out of `state` while frames are adopted so the
+        // renderer can composite the watermark / serve screenshot readbacks.
+        let host = state.host.take().unwrap();
+        let new_frame = host.try_take_frame(host_idx);
+        let have_new = new_frame.is_some();
+        // Streaming mode wants a constant-rate stream (the client's decoder pipeline
+        // is built for it), so re-encode the retained frame every tick like the
+        // compositor path does. Outside streaming mode, stay damage-driven, waking
+        // only for a pending IDR (a viewer opening its keyframe gate), a screenshot
+        // request, or a bouncing watermark that must keep moving.
+        let streaming = node
+            .capture
+            .as_ref()
+            .map(|c| c.settings.video_streaming_mode)
+            .unwrap_or(false);
+        let wm_active = node.overlay_state.is_active();
+        let wm_animated = wm_active && node.overlay_state.is_animated();
+        if !have_new && !want_idr_for_host && !streaming && !take_screenshot && !wm_animated {
+            if let Some((id, buf)) = pool_slot.take() {
+                if let Some(cap) = node.capture.as_ref() {
+                    if let Some(ref pool) = cap.encode_pool {
+                        pool.cancel(id, buf);
+                    }
+                }
+            }
+            state.host = Some(host);
+            return false;
+        }
+        if let Some(f) = new_frame {
+            host.retain_frame(host_idx, f);
+        }
+        // Consume the (new or prior) retained frame's content into the pool slot /
+        // GPU dmabuf. The frame stays retained for the next IDR. The CPU path
+        // blends the watermark in place; the GPU path composites it below. Damage
+        // is the fresh blit's; a re-encode of retained content has none of its own.
+        let mut wm_drawn = false;
+        let outcome = host.with_retained(host_idx, |r| {
+            let Some(f) = r else { return RETAINED_NONE };
+            damage_rects = if have_new { f.damage.clone() } else { Vec::new() };
+            if let Some(cpu) = f.cpu.as_ref() {
+                if gpu_encoder {
+                    return RETAINED_MISMATCH; // software frames, GPU encoder
+                }
+                if let Some((_, ref mut buf)) = pool_slot {
+                    cpu.write_bgra(f.width, f.height, buf);
+                    if wm_active {
+                        node.overlay_state.blend_bgra(buf, (f.width as usize) * 4, f.width, f.height);
+                        wm_drawn = true;
+                    }
+                }
+                cpu.write_bgra(f.width, f.height, &mut node.frame_buffer);
+                if wm_active {
+                    node.overlay_state
+                        .blend_bgra(&mut node.frame_buffer, (f.width as usize) * 4, f.width, f.height);
+                }
+            } else if let Some(dmabuf) = f.dmabuf.as_ref() {
+                if !gpu_encoder {
+                    return RETAINED_MISMATCH; // GPU frames, CPU encoder
+                }
+                host_enc_dmabuf = Some(dmabuf.clone());
+            }
+            RETAINED_OK
+        });
+        // GPU path: composite the watermark and serve screenshot readbacks with
+        // the renderer. A bouncing watermark re-composes retained content into
+        // this display's offscreen target every tick (drawing in place would
+        // trail); anchored watermarks are stamped once onto each fresh blit and
+        // ride along with retained re-encodes.
+        if let Some(src) = host_enc_dmabuf.clone() {
+            if wm_active {
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    if wm_animated {
+                        if let Some((_, target)) = node.offscreen_buffer.as_mut() {
+                            match compose_host_watermark(
+                                renderer,
+                                &node.overlay_state,
+                                &src,
+                                target,
+                                (width, height),
+                            ) {
+                                Ok(sync) => {
+                                    render_sync = Some(sync);
+                                    host_enc_dmabuf = Some(target.clone());
+                                    wm_drawn = true;
+                                }
+                                Err(e) => warn_once_host_watermark(&e),
+                            }
+                        }
+                    } else if have_new {
+                        let mut target = src.clone();
+                        match draw_host_watermark(
+                            renderer,
+                            &node.overlay_state,
+                            &mut target,
+                            (width, height),
+                        ) {
+                            Ok(sync) => {
+                                render_sync = Some(sync);
+                                wm_drawn = true;
+                            }
+                            Err(e) => warn_once_host_watermark(&e),
+                        }
+                    }
+                }
+            }
+            if take_screenshot {
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    let mut shot = host_enc_dmabuf.clone().unwrap_or(src);
+                    match renderer.bind(&mut shot) {
+                        Ok(fb) => {
+                            let rect = Rectangle::new((0, 0).into(), (width, height).into());
+                            match renderer.copy_framebuffer(&fb, rect, Fourcc::Abgr8888) {
+                                Ok(mapping) => match renderer.map_texture(&mapping) {
+                                    Ok(data) => {
+                                        let n = data.len().min(node.frame_buffer.len());
+                                        node.frame_buffer[..n].copy_from_slice(&data[..n]);
+                                    }
+                                    Err(e) => eprintln!("[HostCapture] screenshot map: {e:?}"),
+                                },
+                                Err(e) => eprintln!("[HostCapture] screenshot copy: {e:?}"),
+                            }
+                        }
+                        Err(e) => eprintln!("[HostCapture] screenshot bind: {e:?}"),
+                    };
+                }
+            }
+        }
+        if wm_drawn {
+            if let Some(rect) = node.overlay_state.damage_rect(width, height) {
+                damage_rects.push(rect);
+            }
+        }
+        state.host = Some(host);
+        if outcome != RETAINED_OK {
+            if outcome == RETAINED_MISMATCH {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[HostCapture] host frame type and encoder mismatch \
+                         (GPU host needs a GPU encoder; software host needs a CPU encoder)."
+                    );
+                }
+            }
+            if let Some((id, buf)) = pool_slot.take() {
+                if let Some(cap) = node.capture.as_ref() {
+                    if let Some(ref pool) = cap.encode_pool {
+                        pool.cancel(id, buf);
+                    }
+                }
+            }
+            return false;
+        }
+        render_success = true;
+    }
+
+    if !host_mode && state.use_gpu {
+        if let Some(renderer) = state.gles_renderer.as_mut() {
+            let mut cap = node.capture.as_mut();
+            if let Some((_bo, dmabuf)) = node.offscreen_buffer.as_mut() {
+                let render_age = if node.overlay_state.is_animated() || needs_full { 0 } else { 1 };
+                match renderer.bind(dmabuf) {
+                    Ok(mut frame) => {
+                        let mut elements: Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> = Vec::new();
+
+                        if state.render_cursor_on_framebuffer {
+                            if let Some(pos) = pointer_local {
+                                let scale = Scale::from(output_scale_val);
+
+                                if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
+                                    let name = wayland::frontend::cursor_icon_to_str(icon);
+                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                    if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
+                                        if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                            elements.push(CompositionElements::Cursor(elem));
+                                        }
+                                    }
+                                } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
+                                     let phys_pos = pos.to_physical(scale);
+                                     let elem_result = with_states(surface, |states| {
+                                         WaylandSurfaceRenderElement::from_surface(renderer, surface, states, phys_pos, 1.0, smithay::backend::renderer::element::Kind::Cursor)
+                                     });
+                                     if let Ok(Some(cursor_elem)) = elem_result {
+                                         elements.push(CompositionElements::Surface(cursor_elem));
+                                     }
+                                } else if state.current_cursor_icon.is_none() {
+                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                    let image = state.cursor_helper.get_image(output_scale_val.round() as u32, time);
+                                    if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                        elements.push(CompositionElements::Cursor(elem));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(elem) = node.overlay_state.get_watermark_element(renderer) {
+                            elements.push(CompositionElements::Cursor(elem));
+                        }
+
+                        {
+                            let layer_map = layer_map_for_output(&output);
+
+                            let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                for surface in layer_map.layers().rev() {
+                                    let current_layer = surface.layer();
+                                    if current_layer == target_layer {
+                                        if let Some(geo) = layer_map.layer_geometry(surface) {
+                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                WaylandSurfaceRenderElement::from_surface(
+                                                    renderer, surface.wl_surface(), states,
+                                                    geo.loc.to_physical_precise_round(output_scale_val), 1.0,
+                                                    smithay::backend::renderer::element::Kind::Unspecified
+                                                )
+                                            });
+                                            if let Ok(Some(e)) = elem {
+                                                elements.push(CompositionElements::Surface(e));
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
+                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
+                        }
+
+                        for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
+                            let window_loc = state.space.element_location(window).unwrap_or_default() - origin;
+
+                            if let Some(surface) = window.wl_surface() {
+                                let popups = PopupManager::popups_for_surface(&surface);
+                                for (popup, location) in popups {
+                                    let popup_surface = popup.wl_surface();
+                                    let popup_pos = window_loc + location;
+                                    let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
+                                        WaylandSurfaceRenderElement::from_surface(
+                                            renderer,
+                                            popup_surface,
+                                            states,
+                                            popup_pos.to_physical_precise_round(output_scale_val),
+                                            1.0,
+                                            smithay::backend::renderer::element::Kind::Unspecified
+                                        )
+                                    });
+                                    if let Ok(Some(e)) = elem {
+                                        elements.push(CompositionElements::Surface(e));
+                                    }
+                                }
+                            }
+
+                            elements.extend(window.render_elements(renderer, window_loc.to_physical_precise_round(output_scale_val), Scale::from(output_scale_val), 1.0).into_iter().map(CompositionElements::Space));
+                        }
+
+                        {
+                            let layer_map = layer_map_for_output(&output);
+
+                            let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                for surface in layer_map.layers() {
+                                    let current_layer = surface.layer();
+                                    if current_layer == target_layer {
+                                        if let Some(geo) = layer_map.layer_geometry(surface) {
+                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                WaylandSurfaceRenderElement::from_surface(
+                                                    renderer, surface.wl_surface(), states,
+                                                    geo.loc.to_physical_precise_round(output_scale_val), 1.0,
+                                                    smithay::backend::renderer::element::Kind::Unspecified
+                                                )
+                                            });
+                                            if let Ok(Some(e)) = elem {
+                                                elements.push(CompositionElements::Surface(e));
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
+                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
+                        }
+                        match node.damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
+                            Ok(result) => {
+                                render_success = true;
+                                if let Some(damage) = result.damage {
+                                    damage_rects = damage.clone();
+                                }
+                                render_sync = Some(result.sync);
+                                if let Some(c) = cap.as_deref_mut() {
+                                    c.needs_full_render = false;
+                                }
+                            },
+                            Err(e) => eprintln!("Render error: {:?}", e)
+                        }
+                        if let Some(c) = cap.as_deref_mut() {
+                            if !damage_rects.is_empty() {
+                                c.content_gen += 1;
+                            }
+                            if let Some((id, ref mut buf)) = pool_slot {
+                                // No-damage ticks skip the readback, so a pooled buffer can
+                                // lag the offscreen target whenever the encoder held the
+                                // other slot across a tick; one catch-up readback keeps
+                                // every published buffer current.
+                                if render_success && c.pool_content_gen[id] != c.content_gen {
+                                    let _ = renderer.with_context(|gl| unsafe {
+                                        gl.ReadPixels(
+                                            0,
+                                            0,
+                                            width,
+                                            height,
+                                            smithay::backend::renderer::gles::ffi::RGBA,
+                                            smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                            buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                        );
+                                    });
+                                    c.pool_content_gen[id] = c.content_gen;
+                                }
+                            }
+                        }
+                        if pool_slot.is_none() && take_screenshot {
+                            let _ = renderer.with_context(|gl| unsafe {
+                                gl.ReadPixels(
+                                    0,
+                                    0,
+                                    width,
+                                    height,
+                                    smithay::backend::renderer::gles::ffi::RGBA,
+                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
+                                    node.frame_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                                );
+                            });
+                        }
+                    },
+                    Err(e) => eprintln!("Failed to bind buffer: {:?}", e)
+                }
+            }
+        }
+    } else if !host_mode {
+        if let Some(renderer) = state.pixman_renderer.as_mut() {
+            let mut cap = node.capture.as_mut();
+            let (ptr, buf_age) = match pool_slot {
+                Some((id, ref mut buf)) => {
+                    let age = cap
+                        .as_ref()
+                        .map(|c| {
+                            if c.pool_last_render[id] == 0 {
+                                0
+                            } else {
+                                (c.render_seq + 1 - c.pool_last_render[id]) as usize
+                            }
+                        })
+                        .unwrap_or(0);
+                    (buf.as_mut_ptr() as *mut u32, age)
+                }
+                None => (node.frame_buffer.as_mut_ptr() as *mut u32, 0),
+            };
+            let mut image = unsafe {
+                pixman::Image::from_raw_mut(pixman::FormatCode::A8R8G8B8, width as usize, height as usize, ptr, (width as usize) * 4, false).expect("Failed to create pixman image")
+            };
+                        match renderer.bind(&mut image) {
+                        Ok(mut frame) => {
+                            let mut elements: Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>> = Vec::new();
+
+                            if state.render_cursor_on_framebuffer {
+                                if let Some(pos) = pointer_local {
+                                    let scale = Scale::from(output_scale_val);
+
+                                    if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
+                                        let name = wayland::frontend::cursor_icon_to_str(icon);
+                                        let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                        if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
+                                            if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                                elements.push(CompositionElements::Cursor(elem));
+                                            }
+                                        }
+                                    } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
+                                         let phys_pos = pos.to_physical(scale);
+                                         let elem_result = with_states(surface, |states| {
+                                             WaylandSurfaceRenderElement::from_surface(renderer, surface, states, phys_pos, 1.0, smithay::backend::renderer::element::Kind::Cursor)
+                                         });
+                                         if let Ok(Some(cursor_elem)) = elem_result {
+                                             elements.push(CompositionElements::Surface(cursor_elem));
+                                         }
+                                    } else if state.current_cursor_icon.is_none() {
+                                        let time = Duration::from_millis(state.clock.now().as_millis() as u64);
+                                        let image = state.cursor_helper.get_image(output_scale_val.round() as u32, time);
+                                        if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                            elements.push(CompositionElements::Cursor(elem));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(elem) = node.overlay_state.get_watermark_element(renderer) {
+                                elements.push(CompositionElements::Cursor(elem));
+                            }
+
+                            {
+                                let layer_map = layer_map_for_output(&output);
+
+                                let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                    for surface in layer_map.layers() {
+                                        let current_layer = surface.layer();
+                                        if current_layer == target_layer {
+                                            if let Some(geo) = layer_map.layer_geometry(surface) {
+                                                let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                    WaylandSurfaceRenderElement::from_surface(
+                                                        renderer, surface.wl_surface(), states,
+                                                        geo.loc.to_physical_precise_round(output_scale_val), 1.0,
+                                                        smithay::backend::renderer::element::Kind::Unspecified
+                                                    )
+                                                });
+                                                if let Ok(Some(e)) = elem {
+                                                    elements.push(CompositionElements::Surface(e));
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+
+                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
+                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
+                            }
+
+                            for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
+                                let loc = state.space.element_location(window).unwrap_or_default() - origin;
+
+                                if let Some(surface) = window.wl_surface() {
+                                    let popups = PopupManager::popups_for_surface(&surface);
+                                    for (popup, location) in popups {
+                                        let popup_surface = popup.wl_surface(); {
+                                            let popup_pos = loc + location;
+                                            let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
+                                                WaylandSurfaceRenderElement::from_surface(
+                                                    renderer,
+                                                    popup_surface,
+                                                    states,
+                                                    popup_pos.to_physical_precise_round(output_scale_val),
+                                                    1.0,
+                                                    smithay::backend::renderer::element::Kind::Unspecified
+                                                )
+                                            });
+                                            if let Ok(Some(e)) = elem {
+                                                elements.push(CompositionElements::Surface(e));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(output_scale_val), Scale::from(output_scale_val), 1.0).into_iter().map(CompositionElements::Space));
+                            }
+
+                            {
+                                let layer_map = layer_map_for_output(&output);
+
+                                let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
+                                    for surface in layer_map.layers() {
+                                        let current_layer = surface.layer();
+                                        if current_layer == target_layer {
+                                            if let Some(geo) = layer_map.layer_geometry(surface) {
+                                                let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                                                    WaylandSurfaceRenderElement::from_surface(
+                                                        renderer, surface.wl_surface(), states,
+                                                        geo.loc.to_physical_precise_round(output_scale_val), 1.0,
+                                                        smithay::backend::renderer::element::Kind::Unspecified
+                                                    )
+                                                });
+                                                if let Ok(Some(e)) = elem {
+                                                    elements.push(CompositionElements::Surface(e));
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+
+                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
+                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
+                            }
+
+                    let render_age = if node.overlay_state.is_animated() || needs_full { 0 } else { buf_age };
+                    match node.damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
+                        Ok(result) => {
+                            render_success = true;
+                            if let Some(c) = cap.as_deref_mut() {
+                                c.needs_full_render = false;
+                            }
+                            if let Some(damage) = result.damage { damage_rects = damage.clone(); }
+                        },
+                        Err(e) => eprintln!("Render error: {:?}", e)
+                    }
+                    if let Some(c) = cap.as_deref_mut() {
+                        c.render_seq += 1;
+                        if render_success {
+                            if let Some((id, _)) = pool_slot {
+                                c.pool_last_render[id] = c.render_seq;
+                            }
+                        }
+                    }
+                },
+                Err(e) => eprintln!("Failed to bind pixman image: {:?}", e)
+            }
+        }
+    }
+
+    if render_success {
+        let time = state.clock.now();
+        for window in state.space.elements_for_output(&output).cloned().collect::<Vec<_>>() {
+            window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+        }
+
+        if let Some(cap) = node.capture.as_mut() {
+            if is_memory_throttling {
+                if cap.encode_pool.is_none() {
+                    cap.frame_counter = cap.frame_counter.wrapping_add(1);
+                }
+            } else if cap.encode_pool.is_some() {
+                if take_screenshot {
+                    if let Some((_, ref buf)) = pool_slot {
+                        let n = buf.len().min(node.frame_buffer.len());
+                        node.frame_buffer[..n].copy_from_slice(&buf[..n]);
+                    }
+                }
+                if let Some((id, buf)) = pool_slot.take() {
+                    let is_animated = node.overlay_state.is_animated();
+                    cap.encode_pool.as_ref().unwrap().publish(WlFrame {
+                        id,
+                        buf,
+                        frame_id: cap.frame_counter,
+                        damage: std::mem::take(&mut damage_rects),
+                        is_animated,
+                    });
+                    cap.frame_counter = cap.frame_counter.wrapping_add(1);
+                }
+            } else if let Some(ref mut encoder) = cap.video_encoder {
+                // Deliver the parked frame (if any) first, WITHOUT blocking: this runs
+                // on the calloop thread, and a blocking send would freeze
+                // input/command/Wayland dispatch for as long as the Python consumer
+                // stalls. While a frame stays parked, no new frame is encoded — an
+                // encoded frame joins the H.264 reference chain and can never be
+                // dropped — and the tick's damage is latched so the pause never loses
+                // a change.
+                let slot_free = match cap.pending_hw_delivery.take() {
+                    None => true,
+                    Some(pending) => match cap.deliver_tx.as_ref() {
+                        None => true,
+                        Some(tx) => match tx.try_send(pending) {
+                            Ok(()) => true,
+                            Err(std::sync::mpsc::TrySendError::Full(p)) => {
+                                cap.pending_hw_delivery = Some(p);
+                                false
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => true,
+                        },
+                    },
+                };
+                if !slot_free {
+                    if !damage_rects.is_empty() {
+                        cap.pending_hw_damage = true;
+                    }
+                } else {
+                let is_animated = node.overlay_state.is_animated();
+                let had_damage = !damage_rects.is_empty()
+                    || std::mem::take(&mut cap.pending_hw_damage);
+                let decision = crate::pipeline::decide_hw_fullframe(
+                    &mut cap.vaapi_state,
+                    &cap.settings,
+                    cap.frame_counter,
+                    had_damage,
+                    is_animated,
+                    requested_idr,
+                );
+                let send_frame = decision.send;
+                let force_idr = decision.force_idr;
+                let target_qp = decision.target_qp;
+
+                let mut frame_out = false;
+                if send_frame {
+                    if let Some(sync) = render_sync.take() {
+                        let _ = sync.wait();
+                    }
+                    // Host-capture frames encode from the buffer the host blitted
+                    // into; otherwise from this display's own composited buffer.
+                    let enc_dmabuf: Option<Dmabuf> = host_enc_dmabuf
+                        .clone()
+                        .or_else(|| node.offscreen_buffer.as_ref().map(|(_, d)| d.clone()));
+                    let result = match encoder {
+                        GpuEncoder::Nvenc(enc) => {
+                            if let Some(ref dmabuf) = enc_dmabuf {
+                                enc.encode(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
+                            } else {
+                                Err("NVENC ZeroCopy requires offscreen buffer (GPU context)".to_string())
+                            }
+                        },
+                        GpuEncoder::Vaapi(enc) => {
+                            if let Some(ref dmabuf) = enc_dmabuf {
+                                enc.encode_dmabuf(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
+                            } else {
+                                Err("Vaapi ZeroCopy requires offscreen buffer (GPU context)".to_string())
+                            }
+                        }
+                    };
+
+                    if let Ok(data) = result {
+                        if !data.is_empty() {
+                            frame_out = true;
+                            cap.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
+                            cap.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref tx) = cap.deliver_tx {
+                                let stripes = vec![EncodedStripe {
+                                    data: Arc::new(data), data_type: 2, stripe_y_start: 0,
+                                    stripe_height: height, frame_id: cap.frame_counter as i32,
+                                }];
+                                if let Some(ref socket) = cap.recording_sink {
+                                    socket.write_frame(&stripes, height);
+                                }
+                                crate::recorder::wayland_tap(node.id, &stripes);
+                                // Non-blocking: a full slot parks the frame (delivered
+                                // ahead of any new encode above).
+                                match tx.try_send(stripes) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Full(s)) => {
+                                        cap.pending_hw_delivery = Some(s);
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                                }
+                            }
+                        }
+                    } else if let Err(e) = result {
+                        eprintln!("HW Encode Error: {}", e);
+                    }
+                }
+                // An unserved request stays armed: on an infinite GOP an IDR lost to an
+                // encode error would never self-heal.
+                cap.pending_force_idr = requested_idr && !frame_out;
+                cap.frame_counter = cap.frame_counter.wrapping_add(1);
+                }
+            }
+        }
+        if take_screenshot {
+            if let Some((_, resp)) = state.pending_screenshot.take() {
+                if !node.frame_buffer.is_empty() {
+                    let w = width as u32;
+                    let h = height as u32;
+                    let png = if state.use_gpu {
+                        crate::computer_use::encode_png_rgba(&node.frame_buffer, w, h)
+                    } else {
+                        let mut rgba = node.frame_buffer.clone();
+                        for px in rgba.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
+                        crate::computer_use::encode_png_rgba(&rgba, w, h)
+                    };
+                    match png {
+                        Ok(data) => { let _ = resp.send(Ok(data)); }
+                        Err(e) => {
+                            let _ = resp.send(Err(format!("PNG encode error: {e}")));
+                            eprintln!("[ComputerUse] PNG encode error: {}", e);
+                        }
+                    }
+                } else {
+                    let _ = resp.send(Err("Screenshot render produced no pixels".to_string()));
+                }
+            }
+        }
+    }
+    if let Some((id, buf)) = pool_slot.take() {
+        if let Some(cap) = node.capture.as_ref() {
+            if let Some(ref pool) = cap.encode_pool {
+                pool.cancel(id, buf);
+            }
+        }
+    }
+    false
+}
+
+/// True when the rectangles `(x, y, w, h)` overlap: strict interior intersection, so
+/// touching edges do not count and empty (non-positive-dimension) rectangles never
+/// overlap anything. Arithmetic is widened so extreme coordinates cannot wrap.
+fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ax, ay, aw, ah) = (a.0 as i64, a.1 as i64, a.2 as i64, a.3 as i64);
+    let (bx, by, bw, bh) = (b.0 as i64, b.1 as i64, b.2 as i64, b.3 as i64);
+    aw > 0 && ah > 0 && bw > 0 && bh > 0
+        && ax < bx + bw && bx < ax + aw
+        && ay < by + bh && by < ay + ah
+}
+
+/// The first live output (excluding `skip_id`) whose rectangle overlaps a candidate
+/// placement, as `(id, flavor, rect)`. Both rectangle flavors are checked — logical
+/// (Space layout, scale-divided) and physical (mode pixels at the same origin) — because
+/// input injection and cursor compositing key off the physical rects while window layout
+/// keys off the logical ones, and neither may overlap.
+fn find_output_overlap(
+    nodes: &[wayland::frontend::OutputNode],
+    skip_id: Option<u32>,
+    logical: (i32, i32, i32, i32),
+    physical: (i32, i32, i32, i32),
+) -> Option<(u32, &'static str, (i32, i32, i32, i32))> {
+    for n in nodes {
+        if Some(n.id) == skip_id {
+            continue;
+        }
+        if let Some(geo) = n.logical_geometry() {
+            let other = (geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
+            if rects_overlap(logical, other) {
+                return Some((n.id, "logical", other));
+            }
+        }
+        if let Some(mode) = n.output.current_mode() {
+            let other = (n.pos.0, n.pos.1, mode.size.w, mode.size.h);
+            if rects_overlap(physical, other) {
+                return Some((n.id, "physical", other));
+            }
+        }
+    }
+    None
+}
+
+/// Create an additional output mapped into the layout at `(x, y)`. Fails (false) on a
+/// duplicate id, non-positive geometry/scale, a rectangle overlapping a live output, or a
+/// GPU render-target allocation failure. Only Create/Reposition placements are validated:
+/// a capture reconfigure (StartCapture on an existing output) resizes UNVALIDATED, so
+/// keeping a multi-step relayout overlap-free at every step is the caller's ordering
+/// responsibility.
+fn create_output_on(
+    state: &mut AppState,
+    id: u32,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    scale: f64,
+) -> bool {
+    if state.node_idx_for_id(id).is_some() || width <= 0 || height <= 0 || scale <= 0.0 {
+        return false;
+    }
+    let logical_size = (
+        (width as f64 / scale).round() as i32,
+        (height as f64 / scale).round() as i32,
+    );
+    if let Some((oid, flavor, other)) = find_output_overlap(
+        &state.output_nodes,
+        None,
+        (x, y, logical_size.0, logical_size.1),
+        (x, y, width, height),
+    ) {
+        eprintln!(
+            "[Wayland] CreateOutput {id}: rejected, {flavor} rect {}x{}+{x}+{y} overlaps output {oid} at {}x{}+{}+{}.",
+            if flavor == "logical" { logical_size.0 } else { width },
+            if flavor == "logical" { logical_size.1 } else { height },
+            other.2, other.3, other.0, other.1,
+        );
+        return false;
+    }
+    let output = Output::new(
+        format!("HEADLESS-{}", id + 1),
+        PhysicalProperties {
+            size: (width, height).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Pixelflux".into(),
+            model: "Virtual".into(),
+            serial_number: format!("{:03}", id + 1),
+        },
+    );
+    let mode = OutputMode { size: (width, height).into(), refresh: 60_000 };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(OutputScale::Fractional(scale)),
+        Some((x, y).into()),
+    );
+    output.set_preferred(mode);
+    let mut offscreen = None;
+    if state.use_gpu {
+        let Some(gbm) = state.gbm_device.as_mut() else { return false };
+        match gbm.create_buffer_object(
+            width as u32,
+            height as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::RENDERING,
+        ) {
+            Ok(bo) => {
+                let dmabuf = create_dmabuf_from_bo(&bo);
+                offscreen = Some((bo, dmabuf));
+            }
+            Err(e) => {
+                eprintln!("[Wayland] CreateOutput {id}: GBM allocation {width}x{height} failed ({e:?}).");
+                return false;
+            }
+        }
+    }
+    state.space.map_output(&output, (x, y));
+    let global = output.create_global::<AppState>(&state.dh);
+    let damage_tracker = OutputDamageTracker::from_output(&output);
+    if let Some(host) = state.host.as_ref() {
+        host.set_layout(id, x, y);
+    }
+    println!("[Wayland] Output {id} created: {width}x{height} @ ({x}, {y}) scale {scale:.2}.");
+    state.output_nodes.push(wayland::frontend::OutputNode {
+        id,
+        output,
+        global,
+        pos: (x, y),
+        damage_tracker,
+        frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
+        offscreen_buffer: offscreen,
+        overlay_state: OverlayState::default(),
+        capture: None,
+    });
+    // A nested session opens one host toplevel per screen and stacks the extras
+    // on an existing output until a display exists for them: hand the newest
+    // stacked window to the new output.
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for w in state.space.elements() {
+        let oid = wayland::frontend::window_output_id(w);
+        match counts.iter_mut().find(|(o, _)| *o == oid) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((oid, 1)),
+        }
+    }
+    let adopt = state
+        .space
+        .elements()
+        .filter(|w| {
+            let oid = wayland::frontend::window_output_id(w);
+            counts.iter().any(|(o, c)| *o == oid && *c >= 2)
+        })
+        .max_by_key(|w| wayland::frontend::window_meta(w).map(|m| m.id).unwrap_or(0))
+        .cloned();
+    if let Some(window) = adopt {
+        state.place_window_on_output(&window, id);
+        println!(
+            "[Wayland] Output {id}: adopted stacked window {}.",
+            wayland::frontend::window_meta(&window).map(|m| m.id).unwrap_or(0)
+        );
+    }
+    true
+}
+
+/// Move an existing output (the primary included) to layout offset `(x, y)`. The output's
+/// advertised position, its Space mapping, and the windows placed on it (mapped at the
+/// output's origin — window positions are output-relative under forced fullscreen) all
+/// follow, so absolute input injection and cursor compositing — both keyed off `node.pos` —
+/// resolve against the new layout immediately. A destination overlapping another live
+/// output is refused (false). As with `CreateOutput`, only the placement itself is
+/// validated: a capture reconfigure (StartCapture on an existing output) resizes
+/// UNVALIDATED, so keeping a multi-step relayout overlap-free at every step is the
+/// caller's ordering responsibility.
+fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
+    let Some(idx) = state.node_idx_for_id(id) else { return false };
+    let output = state.output_nodes[idx].output.clone();
+    if state.output_nodes[idx].pos == (x, y) {
+        return true;
+    }
+    let logical_size = state.output_nodes[idx]
+        .logical_geometry()
+        .map(|g| (g.size.w, g.size.h))
+        .unwrap_or((0, 0));
+    let physical_size = output.current_mode().map(|m| (m.size.w, m.size.h)).unwrap_or((0, 0));
+    if let Some((oid, flavor, other)) = find_output_overlap(
+        &state.output_nodes,
+        Some(id),
+        (x, y, logical_size.0, logical_size.1),
+        (x, y, physical_size.0, physical_size.1),
+    ) {
+        eprintln!(
+            "[Wayland] RepositionOutput {id}: rejected, {flavor} rect {}x{}+{x}+{y} overlaps output {oid} at {}x{}+{}+{}.",
+            if flavor == "logical" { logical_size.0 } else { physical_size.0 },
+            if flavor == "logical" { logical_size.1 } else { physical_size.1 },
+            other.2, other.3, other.0, other.1,
+        );
+        return false;
+    }
+    state.output_nodes[idx].pos = (x, y);
+    if let Some(host) = state.host.as_ref() {
+        host.set_layout(id, x, y);
+    }
+    output.change_current_state(None, None, None, Some((x, y).into()));
+    state.space.map_output(&output, (x, y));
+    let windows: Vec<smithay::desktop::Window> = state
+        .space
+        .elements()
+        .filter(|w| wayland::frontend::window_output_id(w) == id)
+        .cloned()
+        .collect();
+    for window in &windows {
+        state.space.map_element(window.clone(), (x, y), false);
+    }
+    if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+        cap.needs_full_render = true;
+    }
+    println!("[Wayland] Output {id} repositioned to ({x}, {y}).");
+    true
+}
+
+/// Destroy a secondary output: end its capture, relocate its windows onto the primary
+/// output, unmap it from the space, and retract its global. The primary (id 0) is refused.
+fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
+    if id == 0 {
+        return false;
+    }
+    let Some(_) = state.node_idx_for_id(id) else { return false };
+    stop_capture_on_display(state, id);
+    if let Some(host) = state.host.as_ref() {
+        host.idle_output(id);
+    }
+    wayland_owners().lock().unwrap().remove(&id);
+    // Relocate while the node is still registered so output leave/enter both resolve.
+    let windows: Vec<smithay::desktop::Window> = state
+        .space
+        .elements()
+        .filter(|w| wayland::frontend::window_output_id(w) == id)
+        .cloned()
+        .collect();
+    for window in &windows {
+        state.place_window_on_output(window, 0);
+    }
+    for w in &state.pending_windows {
+        if let Some(meta) = wayland::frontend::window_meta(w) {
+            if meta.output.load(Ordering::Relaxed) == id {
+                meta.output.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+    let idx = state.node_idx_for_id(id).unwrap();
+    let node = state.output_nodes.remove(idx);
+    state.space.unmap_output(&node.output);
+    state.dh.remove_global::<AppState>(node.global);
+    println!(
+        "[Wayland] Output {id} destroyed; {} window(s) relocated to primary.",
+        windows.len()
+    );
+    true
+}
+
 /// The main execution loop of the Wayland backend.
 ///
 /// This function is the central nervous system of the backend. It runs on its own thread and owns
@@ -1418,25 +3116,31 @@ fn log_stream_settings(
 ///    GBM/EGL hardware acceleration on the resolved DRM render node, falling back to software
 ///    rendering (Pixman) when no node is usable.
 /// 2. **State management**: constructs and holds the `AppState` — the Wayland globals (compositor,
-///    seat, SHM, shell, dmabuf, selections, and the rest), the single virtual `HEADLESS-1` output,
-///    the frame buffer and encode pools, and the window / cursor / encode bookkeeping.
+///    seat, SHM, shell, dmabuf, selections, and the rest) plus the output registry: the primary
+///    virtual `HEADLESS-1` output at layout (0, 0), extended at runtime by CreateOutput with
+///    additional outputs at their layout offsets, each `OutputNode` owning its damage tracker,
+///    render targets, and (at most one) capture pipeline.
 /// 3. **Event dispatch**:
-///    - **Command channel**: control messages from the Python thread — start/stop, input injection,
-///      keymap and clipboard operations, live rate / tunable changes, and the computer-use queries.
+///    - **Command channel**: control messages from the Python thread — per-display start/stop,
+///      output lifecycle (create/destroy/list/move-window), input injection routed across the
+///      output layout, keymap and clipboard operations, live rate / tunable changes, and the
+///      computer-use queries.
 ///    - **Wayland socket**: accepts client connections and drives the compositor protocol.
-/// 4. **StartCapture reconfigure**: reprograms the virtual output's mode / scale / refresh, resizes
-///    the framebuffer and offscreen GBM buffer, and fullscreens mapped toplevels. The encode device
-///    is resolved here: an operator's explicit `encode_node_index` (-1 software, >= 0 a device)
-///    always wins, and only the unset `-2` sentinel is filled from the auto-picked render node.
-///    H.264 output masks the dimensions even, because 4:2:0 needs even width and height.
+/// 4. **StartCapture reconfigure** (per display): reprograms that output's mode / scale / refresh,
+///    resizes its framebuffer and offscreen GBM buffer, and fullscreens the toplevels placed on
+///    it. The encode device is resolved here: an operator's explicit `encode_node_index`
+///    (-1 software, >= 0 a device) always wins, and only the unset `-2` sentinel is filled from
+///    the auto-picked render node. H.264 output masks the dimensions even, because 4:2:0 needs
+///    even width and height.
 /// 5. **Encode-path choice + render loop**: only a same-GPU GLES session encodes zero-copy on this
 ///    calloop thread, because the dmabuf and its EGL context are calloop-affine; every readback
 ///    flavor (OpenH264, striped x264/JPEG, Pixman, or a cross-GPU hardware encoder) builds its
-///    encoders on the dedicated encode thread instead. A high-frequency timer composites the mapped
-///    windows plus cursor and watermark, applies the shared paint-over / recovery-IDR policy, and
-///    delivers the encoded stripes back to Python through the frame callback. The zero-copy encode
-///    waits the GL render fence first, so a hardware encoder reading the dmabuf through CUDA/VA
-///    never maps a half-rasterized (torn) frame.
+///    encoders on that display's dedicated encode thread instead. A shared timer (paced at the
+///    fastest active capture) renders each capturing output — its windows, popups and layers made
+///    output-local, the cursor only on the pointer's output — applies the shared paint-over /
+///    recovery-IDR policy per display, and delivers each display's encoded stripes through its own
+///    frame callback. The zero-copy encode waits the GL render fence first, so a hardware encoder
+///    reading the dmabuf through CUDA/VA never maps a half-rasterized (torn) frame.
 /// 6. **Thread lifecycle**: the Python frame callback runs on a dedicated delivery thread so its
 ///    GIL never stalls calloop input / control dispatch, and in readback mode the encoders run on
 ///    the `wl-encode` thread. On a restart or stop the encode thread is torn down before the
@@ -1445,6 +3149,7 @@ fn log_stream_settings(
 ///    interpreter.
 fn run_wayland_thread(
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
+    wake_rx: smithay::reexports::calloop::channel::Channel<()>,
     command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     initial_width: i32,
     initial_height: i32,
@@ -1562,7 +3267,7 @@ fn run_wayland_thread(
     let layer_shell_state = WlrLayerShellState::new::<AppState>(&dh);
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
     let data_control_state = DataControlState::new::<AppState, _>(&dh, None, |_| true);
-    let virtual_keyboard_state = VirtualKeyboardManagerState::new::<AppState, _>(&dh, |_client| true);
+    let _vk_global = dh.create_global::<AppState, ZwpVirtualKeyboardManagerV1, _>(1, ());
     let pointer_warp_state = PointerWarpManager::new::<AppState>(&dh);
     let relative_pointer_state = RelativePointerManagerState::new::<AppState>(&dh);
     let pointer_constraints_state = PointerConstraintsState::new::<AppState>(&dh);
@@ -1599,64 +3304,60 @@ fn run_wayland_thread(
         data_control_state,
         dh: dh.clone(),
         seat,
-        virtual_keyboard_state,
         pointer_warp_state,
         relative_pointer_state,
         pointer_constraints_state,
-        outputs: Vec::new(),
+        output_nodes: Vec::new(),
         pending_windows: Vec::new(),
         foreign_toplevel_list,
         xdg_decoration_state,
         xdg_activation_state,
         primary_selection_state,
         popups,
-        frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
         gles_renderer,
         pixman_renderer,
         gbm_device: gbm_device_raw,
-        offscreen_buffer,
-        is_capturing: false,
         settings: RustCaptureSettings {
             width,
             height,
             ..RustCaptureSettings::default()
         },
-        callback: None,
-        cursor_callback: None,
+        cursor_callback_set: false,
+        cursor_tx: wayland::cursor::spawn_cursor_worker(cursor_size),
         clipboard_callback: None,
         pending_clipboard_read: None,
+        current_selection_mime: None,
         last_log_time: Instant::now(),
         start_time: Instant::now(),
         clock: Clock::new(),
-        frame_counter: 0,
-        pending_force_idr: false,
-        needs_full_render: true,
         use_gpu,
-        video_encoder: None,
-        vaapi_state: StripeState::default(),
         cursor_helper: Cursor::load(cursor_size),
-        overlay_state: OverlayState::default(),
+        keymap_policy: wayland::keymap::KeymapPolicy::empty(),
+        host: None,
         current_cursor_icon: None,
         cursor_buffer: None,
-        cursor_cache: std::collections::HashMap::new(),
         render_cursor_on_framebuffer: false,
         render_node_path,
         auto_gpu_selected,
-        recording_sink: None,
-        deliver_tx: None,
-        deliver_join: None,
-        pending_hw_delivery: None,
-        pending_hw_damage: false,
-        encode_pool: None,
-        encode_join: None,
-        encode_controls: Arc::new(WlEncodeControls::new()),
-        encode_stats: Arc::new(WlEncodeStats::new()),
-        pool_last_render: Vec::new(),
-        render_seq: 0,
-        pool_content_gen: Vec::new(),
-        content_gen: 0,
         pending_screenshot: None,
+        command_rx: None,
     };
+    // Seed the keymap policy with the seat's initial keymap so overlay binds splice onto
+    // the exact text clients received.
+    {
+        let initial_keymap = if let Some(kb) = state.seat.get_keyboard() {
+            kb.with_xkb_state(&mut state, |context| match context.xkb().lock() {
+                Ok(guard) => {
+                    let keymap = unsafe { guard.keymap() };
+                    keymap.get_as_string(smithay::input::keyboard::xkb::KEYMAP_FORMAT_TEXT_V1)
+                }
+                Err(_) => String::new(),
+            })
+        } else {
+            String::new()
+        };
+        state.keymap_policy.rebuild_base(initial_keymap);
+    }
 
     let output = Output::new(
         "HEADLESS-1".into(),
@@ -1682,388 +3383,128 @@ fn run_wayland_thread(
         refresh: 60_000,
     });
     state.space.map_output(&output, (0, 0));
-    state.outputs.push(output.clone());
-    let _global = output.create_global::<AppState>(&dh);
-    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    let global = output.create_global::<AppState>(&dh);
+    let damage_tracker = OutputDamageTracker::from_output(&output);
+    state.output_nodes.push(wayland::frontend::OutputNode {
+        id: 0,
+        output,
+        global,
+        pos: (0, 0),
+        damage_tracker,
+        frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
+        offscreen_buffer,
+        overlay_state: OverlayState::default(),
+        capture: None,
+    });
 
-    event_loop
-        .handle()
-        .insert_source(command_rx, move |event, _, state| {
-            match event {
-                CalloopEvent::Msg(ThreadCommand::StartCapture(cb, mut settings)) => {
-                    if state.auto_gpu_selected && settings.encode_node_index < -1 {
-                        if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
-                            if let Ok(idx) = idx_str.parse::<i32>() {
-                                settings.encode_node_index = idx - 128;
-                            }
-                        }
-                    }
+    /// Apply every queued control command in FIFO order. Sends wake the loop through the
+    /// separate wake channel, and the render tick ALSO drains before starting its work, so
+    /// queued input is applied ahead of a long render/encode instead of waiting it out.
+    fn drain_thread_commands(state: &mut AppState) {
+        let Some(rx) = state.command_rx.take() else { return };
+        while let Ok(cmd) = rx.try_recv() {
+            handle_thread_command(state, cmd);
+        }
+        state.command_rx = Some(rx);
+    }
 
-                    if settings.output_mode == 1 {
-                        settings.width &= !1;
-                        settings.height &= !1;
-                    }
-
-                    state.recording_sink =
-                        crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
-
-                    if let Some(output) = state.outputs.first() {
-                        let current_mode = output.current_mode().unwrap();
-                        let current_w = current_mode.size.w;
-                        let current_h = current_mode.size.h;
-                        let current_scale = output.current_scale().fractional_scale();
-                        let current_refresh = current_mode.refresh;
-                        let target_refresh = (settings.target_fps * 1000.0).round() as i32;
-
-                        let scale = settings.scale.max(0.1);
-                        let logical_width = (settings.width as f64 / scale).round() as i32;
-                        let logical_height = (settings.height as f64 / scale).round() as i32;
-
-                        if current_w != settings.width
-                            || current_h != settings.height
-                            || (current_scale - settings.scale).abs() > 0.001
-                            || current_refresh != target_refresh
-                        {
-                            // Allocate the GPU backing for the new dimensions BEFORE
-                            // committing anything: if the driver refuses (VRAM
-                            // exhaustion, dimensions it will not back), the whole
-                            // reconfigure is skipped and the previous mode + buffers
-                            // stay live. A failed resize must degrade to "no resize",
-                            // never panic the compositor thread — that would drop
-                            // every Wayland client with no recovery short of a
-                            // process restart. (The INITIAL allocation path already
-                            // degrades gracefully, to the software renderer.)
-                            let mut new_offscreen = None;
-                            let mut gbm_resize_failed = false;
-                            if state.use_gpu {
-                                if let Some(gbm) = state.gbm_device.as_mut() {
-                                    match gbm.create_buffer_object(
-                                        settings.width as u32,
-                                        settings.height as u32,
-                                        GbmFormat::Argb8888,
-                                        BufferObjectFlags::RENDERING,
-                                    ) {
-                                        Ok(bo) => {
-                                            let dmabuf = create_dmabuf_from_bo(&bo);
-                                            new_offscreen = Some((bo, dmabuf));
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[Wayland] GBM buffer resize to {}x{} failed ({:?}); keeping previous output mode.",
-                                                settings.width, settings.height, e
-                                            );
-                                            gbm_resize_failed = true;
-                                        }
-                                    }
-                                }
-                            }
-                            if gbm_resize_failed {
-                                // The mode commit below is skipped wholesale, so the
-                                // rest of this StartCapture (encoder setup, stored
-                                // settings) must also see the dimensions that are
-                                // actually live — otherwise the encoder and the
-                                // still-old buffers disagree on frame geometry.
-                                settings.width = current_w;
-                                settings.height = current_h;
-                                settings.scale = current_scale;
-                                settings.target_fps = current_refresh as f64 / 1000.0;
-                            } else {
-                                println!(
-                                    "[Wayland] Configuring Output: {}x{} @ {:.2} FPS (Scale {:.2})",
-                                    settings.width, settings.height, settings.target_fps, settings.scale
-                                );
-                                let new_mode = OutputMode {
-                                    size: (settings.width, settings.height).into(),
-                                    refresh: target_refresh,
-                                };
-                                output.change_current_state(
-                                    Some(new_mode),
-                                    Some(Transform::Normal),
-                                    Some(OutputScale::Fractional(settings.scale)),
-                                    Some((0, 0).into()),
-                                );
-                                output.set_preferred(new_mode);
-
-                                let pixel_count =
-                                    (settings.width.max(0) as usize) * (settings.height.max(0) as usize);
-                                state.frame_buffer = vec![0u8; pixel_count * 4];
-
-                                if let Some(off) = new_offscreen.take() {
-                                    state.offscreen_buffer = Some(off);
-                                }
-                            }
-                        }
-
-                        for window in state.space.elements() {
-                            if let Some(surface) = window.wl_surface() {
-                                output.enter(&surface);
-                                with_states(&surface, |states| {
-                                    smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
-                                        fs.set_preferred_scale(scale);
-                                    });
-                                });
-                            }
-                            if let Some(toplevel) = window.toplevel() {
-                                toplevel.with_pending_state(|state| {
-                                    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-                                    state.states.set(State::Fullscreen);
-                                    state.states.set(State::Activated);
-                                    state.size = Some((logical_width, logical_height).into());
-                                });
-                                toplevel.send_configure();
-                            }
-                        }
-                    }
-
-                    let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
-                    let gpu_intent =
-                        settings.output_mode == 1 && !settings.use_openh264 && !use_cpu_explicit;
-                    if use_cpu_explicit && !(settings.output_mode == 1 && settings.use_openh264) {
-                        println!("[Wayland] CPU encoding selected (use_cpu=true or encode_node_index=-1).");
-                    }
-
-                    let mut different_gpu = false;
-                    if gpu_intent {
-                        let encode_node_idx = settings.encode_node_index.max(0);
-                        if !state.render_node_path.is_empty()
-                            && !state.render_node_path.contains(&format!("renderD{}", 128 + encode_node_idx))
-                        {
-                            different_gpu = true;
-                        }
-                    }
-
-                    if gpu_intent && state.use_gpu && !different_gpu {
-                        let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
-                        println!(
-                            "[Wayland] Encode Node Index: {} | Driver: {}",
-                            settings.encode_node_index.max(0), encode_driver
-                        );
-
-                        if encode_driver.contains("nvidia") {
-                            let reused = match state.video_encoder.as_mut() {
-                                Some(GpuEncoder::Nvenc(enc)) => {
-                                    match enc.reconfigure_resolution(&settings) {
-                                        Ok(()) => {
-                                            println!("[Wayland] NVENC session reconfigured in place.");
-                                            true
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
-                                            false
-                                        }
-                                    }
-                                }
-                                _ => false,
-                            };
-                            if !reused {
-                                state.video_encoder = None;
-                                println!("[Wayland] Nvidia Encoder detected. Initializing NVENC...");
-                                let egl_display = if let Some(renderer) = state.gles_renderer.as_ref() {
-                                    renderer.egl_context().display().get_display_handle().handle
-                                } else {
-                                    std::ptr::null()
-                                };
-
-                                match NvencEncoder::new(&settings, egl_display) {
-                                    Ok(encoder) => {
-                                        state.video_encoder = Some(GpuEncoder::Nvenc(encoder));
-                                        println!("[Wayland] NVENC Encoder initialized successfully.");
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[Wayland] Failed to init NVENC: {}. Falling back to CPU.",
-                                        e
-                                    ),
-                                }
-                            }
-                        } else {
-                            state.video_encoder = None;
-                            println!("[Wayland] Initializing Unified VAAPI Encoder...");
-                            if settings.video_fullcolor {
-                                println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-                            } else {
-                                match VaapiEncoder::new(&settings) {
-                                    Ok(encoder) => {
-                                        state.video_encoder = Some(GpuEncoder::Vaapi(encoder));
-                                        println!(
-                                            "[Wayland] VAAPI Encoder initialized successfully."
-                                        );
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[Wayland] Failed to init VAAPI: {}. Falling back to CPU.",
-                                        e
-                                    ),
-                                }
-                            }
-                        }
-                    } else {
-                        state.video_encoder = None;
-                    }
-
-                    if different_gpu {
-                        println!("[Wayland] Decision: Rendering and Encoding GPUs differ -> Forcing Readback (CPU path for pixels).");
-                    }
-                    if state.video_encoder.is_none() {
-                        println!("[Wayland] Decision: Readback path (encode thread) active.");
-                    } else if !different_gpu {
-                        println!("[Wayland] Decision: Zero-Copy path active.");
-                    }
-
-                    if state.recording_sink.is_some() && settings.output_mode == 0 {
-                        eprintln!(
-                            "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
-                             The recording socket requires a single H.264 stream. Please set output_mode=1 \
-                             on the Python CaptureSettings to produce a recordable output."
-                        );
-                    }
-
-                    let watermark_output_scale = state
-                        .outputs
-                        .first()
-                        .map(|o| o.current_scale().fractional_scale())
-                        .unwrap_or(1.0);
-                    state
-                        .overlay_state
-                        .load_watermark(&settings.watermark_path, watermark_output_scale);
-                    state.callback = Some(cb);
-                    state.is_capturing = true;
-                    WAYLAND_CAPTURE_ALIVE.store(true, Ordering::Release);
-                    state.render_cursor_on_framebuffer = settings.capture_cursor;
-                    state.settings = settings.clone();
-                    state.encode_stats.frames.store(0, Ordering::Relaxed);
-                    state.encode_stats.stripes.store(0, Ordering::Relaxed);
-                    state.last_log_time = Instant::now();
-                    state.frame_counter = 0;
-                    state.pending_force_idr = false;
-                    state.vaapi_state = StripeState::default();
-                    if state.cursor_callback.is_some() {
-                        if let Some(icon) = state.current_cursor_icon.clone() {
-                            state.send_cursor_image(&icon);
-                        }
-                    }
-                    if let Some(p) = state.encode_pool.take() { p.shutdown(); }
-                    let prior_readback_encoder = state
-                        .encode_join
-                        .take()
-                        .and_then(|j| j.join().ok())
-                        .flatten();
-                    if let Some(tx) = state.deliver_tx.take() { drop(tx); }
-                    if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
-                    state.pending_hw_delivery = None;
-                    state.pending_hw_damage = false;
-                    if let Some(cb) = state.callback.take() {
-                        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
-                        let join = thread::spawn(move || {
-                            crate::boost_thread_priority(-10);
-                            while let Ok(stripes) = rx.recv() {
-                                if PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
-                                Python::attach(|py| {
-                                    for s in stripes {
-                                        match Py::new(py, StripeFrame::new_owned_meta(
-                                            s.data, s.data_type, s.stripe_y_start,
-                                            s.stripe_height, s.frame_id,
-                                        )) {
-                                            Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
-                                            Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        state.deliver_tx = Some(tx);
-                        state.deliver_join = Some(join);
-                    }
-
-                    if state.video_encoder.is_none() {
-                        if let Some(ref deliver_tx) = state.deliver_tx {
-                            let pool = Arc::new(WlFramePool::new(
-                                WL_POOL_SURFACES,
-                                (settings.width.max(0) as usize) * (settings.height.max(0) as usize) * 4,
-                            ));
-                            state.pool_last_render = vec![0; WL_POOL_SURFACES];
-                            state.render_seq = 0;
-                            // u64::MAX marks every slot stale so each one is read back
-                            // before its first publish, whatever the damage says.
-                            state.pool_content_gen = vec![u64::MAX; WL_POOL_SURFACES];
-                            state.content_gen = 0;
-                            let c = &state.encode_controls;
-                            c.bitrate_kbps.store(settings.video_bitrate_kbps, Ordering::Relaxed);
-                            c.vbv_mult_milli.store(
-                                (settings.video_vbv_multiplier * 1000.0).round() as i32,
-                                Ordering::Relaxed,
-                            );
-                            c.fps_milli.store(
-                                (settings.target_fps.max(1.0) * 1000.0) as u64,
-                                Ordering::Relaxed,
-                            );
-                            c.rate_dirty.store(false, Ordering::Relaxed);
-                            c.force_idr.store(false, Ordering::Relaxed);
-                            // Also drop any leftover LiveTunables snapshot: UpdateTunables
-                            // sets it even when no encode thread is consuming (zero-copy
-                            // mode, or after StopCapture), and without this reset the new
-                            // encode thread's first frame would apply that stale snapshot
-                            // OVER the fresh StartCapture settings just established.
-                            c.tunables_dirty.store(false, Ordering::Relaxed);
-                            *c.tunables.lock().unwrap() = None;
-                            let cfg = WlEncodeConfig {
-                                settings: settings.clone(),
-                                use_gpu: state.use_gpu,
-                                try_gpu: gpu_intent && (!state.use_gpu || different_gpu),
-                                prior: prior_readback_encoder,
-                                recording_sink: state.recording_sink.clone(),
-                                deliver_tx: deliver_tx.clone(),
-                                controls: state.encode_controls.clone(),
-                                stats: state.encode_stats.clone(),
-                            };
-                            let pool2 = pool.clone();
-                            state.encode_join = Some(
-                                thread::Builder::new()
-                                    .name("wl-encode".into())
-                                    .spawn(move || wayland_encode_loop(&pool2, cfg))
-                                    .expect("failed to spawn wl-encode thread"),
-                            );
-                            state.encode_pool = Some(pool);
-                        }
-                    } else {
-                        state.encode_stats.n_stripes.store(1, Ordering::Relaxed);
-                        *state.encode_stats.desc.lock().unwrap() =
-                            encoder_desc(&settings, state.video_encoder.as_ref(), false, true);
-                        log_stream_settings(&settings, 1, state.video_encoder.as_ref(), false);
-                    }
-                    // Force the keyframe on the now-active path (as RequestIdr does),
-                    // unconditionally: the damage tracker and offscreen buffer stay
-                    // warm across StopCapture/StartCapture, so a restarted capture on
-                    // a static screen otherwise produces no damage, no first frame,
-                    // and no IDR in either the striped or the zero-copy path (a
-                    // stop+start encoder switch froze until the next screen damage).
-                    if state.encode_pool.is_some() {
-                        state.encode_controls.force_idr.store(true, Ordering::Relaxed);
-                    } else {
-                        state.pending_force_idr = true;
-                    }
-                    state.needs_full_render = true;
+    fn handle_thread_command(state: &mut AppState, cmd: ThreadCommand) {
+            match cmd {
+                ThreadCommand::StartCapture { display_id, callback, settings } => {
+                    start_capture_on_display(state, display_id, callback, settings);
                 }
-                CalloopEvent::Msg(ThreadCommand::StopCapture) => {
-                    println!("[Wayland] Capture loop stopped.");
-                    state.is_capturing = false;
-                    WAYLAND_CAPTURE_ALIVE.store(false, Ordering::Release);
-                    state.callback = None;
-                    state.cursor_callback = None;
-                    state.clipboard_callback = None;
-                    state.video_encoder = None;
-                    state.vaapi_state = StripeState::default();
-                    if let Some(p) = state.encode_pool.take() { p.shutdown(); }
-                    if let Some(j) = state.encode_join.take() { let _ = j.join(); }
-                    state.recording_sink = None;
-                    *state.encode_stats.desc.lock().unwrap() = String::new();
-                    if let Some(tx) = state.deliver_tx.take() { drop(tx); }
-                    if let Some(j) = state.deliver_join.take() { let _ = j.join(); }
-                    state.pending_hw_delivery = None;
-                    state.pending_hw_damage = false;
+                ThreadCommand::StopCapture { display_id } => {
+                    // Cursor and clipboard callbacks deliberately SURVIVE StopCapture:
+                    // captures cycle on client disconnects and setting restarts, and a
+                    // copy or cursor change during that gap must still reach Python.
+                    // PY_SHUTDOWN gates every use against a finalizing interpreter.
+                    stop_capture_on_display(state, display_id);
                 }
-                CalloopEvent::Msg(ThreadCommand::SetClipboardCallback(cb)) => {
+                ThreadCommand::CreateOutput { id, width, height, x, y, scale, reply } => {
+                    let _ = reply.send(create_output_on(state, id, width, height, x, y, scale));
+                }
+                ThreadCommand::DestroyOutput { id, reply } => {
+                    let _ = reply.send(destroy_output_on(state, id));
+                }
+                ThreadCommand::RepositionOutput { id, x, y, reply } => {
+                    let _ = reply.send(reposition_output_on(state, id, x, y));
+                }
+                ThreadCommand::ListOutputs { reply } => {
+                    let list = state
+                        .output_nodes
+                        .iter()
+                        .map(|n| {
+                            let (w, h) = n
+                                .output
+                                .current_mode()
+                                .map(|m| (m.size.w, m.size.h))
+                                .unwrap_or((0, 0));
+                            (
+                                n.id,
+                                n.pos.0,
+                                n.pos.1,
+                                w,
+                                h,
+                                n.output.current_scale().fractional_scale(),
+                                n.capture.is_some(),
+                            )
+                        })
+                        .collect();
+                    let _ = reply.send(list);
+                }
+                ThreadCommand::MoveWindowToOutput { window_id, output_id, reply } => {
+                    let window = state
+                        .space
+                        .elements()
+                        .find(|w| {
+                            wayland::frontend::window_meta(w)
+                                .map(|m| m.id == window_id)
+                                .unwrap_or(false)
+                        })
+                        .cloned();
+                    let ok = match window {
+                        Some(w) => state.place_window_on_output(&w, output_id),
+                        None => false,
+                    };
+                    let _ = reply.send(ok);
+                }
+                ThreadCommand::ListWindows { reply } => {
+                    use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+                    let mut list = Vec::new();
+                    for window in state.space.elements() {
+                        let Some(meta) = wayland::frontend::window_meta(window) else { continue };
+                        let (title, app_id) = window
+                            .toplevel()
+                            .map(|tl| {
+                                with_states(tl.wl_surface(), |states| {
+                                    states
+                                        .data_map
+                                        .get::<XdgToplevelSurfaceData>()
+                                        .map(|d| {
+                                            let a = d.lock().unwrap();
+                                            (
+                                                a.title.clone().unwrap_or_default(),
+                                                a.app_id.clone().unwrap_or_default(),
+                                            )
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .unwrap_or_default();
+                        list.push((meta.id, title, app_id, meta.output.load(Ordering::Relaxed)));
+                    }
+                    let _ = reply.send(list);
+                }
+                ThreadCommand::SetClipboardCallback(cb) => {
                     state.clipboard_callback = Some(cb);
+                    // Re-stage a read of the CURRENT selection so a copy made before this
+                    // callback was (re)armed is delivered rather than lost; the post-dispatch
+                    // drain performs the read (a compositor-owned selection is skipped there).
+                    if let Some(mime) = state.current_selection_mime.clone() {
+                        state.pending_clipboard_read = Some(mime);
+                    }
                 }
-                CalloopEvent::Msg(ThreadCommand::SetClipboard { mime, data }) => {
+                ThreadCommand::SetClipboard { mime, data } => {
                     let mimes: Vec<String> = if mime.starts_with("text/plain") {
                         ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
                          "STRING", "TEXT"].iter().map(|s| s.to_string()).collect()
@@ -2076,14 +3517,28 @@ fn run_wayland_thread(
                         mimes,
                         std::sync::Arc::new((mime, data)),
                     );
+                    // The selection is compositor-owned now; a later SetClipboardCallback
+                    // must not try to re-read a client source that no longer holds it.
+                    state.current_selection_mime = None;
                 }
-                CalloopEvent::Msg(ThreadCommand::SetCursorCallback(cb)) => {
-                    state.cursor_callback = Some(cb);
+                ThreadCommand::SetCursorCallback(cb) => {
+                    let _ = state.cursor_tx.send(CursorJob::SetCallback(cb));
+                    state.cursor_callback_set = true;
                     if let Some(icon) = state.current_cursor_icon.clone() {
                         state.send_cursor_image(&icon);
+                    } else {
+                        // No client has set a cursor yet. The render path treats
+                        // None as the default theme cursor, so the first consumer
+                        // must receive that same sprite instead of a blank pointer
+                        // until the first client cursor event.
+                        state.send_cursor_image(&CursorImageStatus::Named(Default::default()));
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::KeyboardKey { scancode, state: key_state_val }) => {
+                ThreadCommand::KeyboardKey { scancode, state: key_state_val } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.key(scancode, key_state_val > 0);
+                        return;
+                    }
                     let key_state = if key_state_val > 0 { KeyState::Pressed } else { KeyState::Released };
                     let serial = next_serial();
                     let time = wayland_time();
@@ -2093,14 +3548,57 @@ fn run_wayland_thread(
                         });
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::SetKeymapString(text)) => {
-                    if let Some(keyboard) = state.seat.get_keyboard() {
-                        if let Err(e) = keyboard.set_keymap_from_string(state, text) {
-                            eprintln!("[Wayland] keymap swap failed: {e:?}");
+                ThreadCommand::SetKeymapString(text) => {
+                    // Validate before mutating the policy so a bad string leaves the seat
+                    // keymap untouched.
+                    if crate::wayland::keymap::compile_keymap(&text).is_none() {
+                        eprintln!("[Wayland] set_keymap_string: keymap failed to compile; keeping current keymap.");
+                    } else {
+                        state.keymap_policy.rebuild_base(text);
+                        state.apply_keymap_policy();
+                    }
+                }
+                ThreadCommand::SetXkbLayout { rules, model, layout, variant, options, reply } => {
+                    match crate::wayland::keymap::compile_rmlvo(&rules, &model, &layout, &variant, &options) {
+                        Some(text) => {
+                            state.keymap_policy.rebuild_base(text);
+                            state.apply_keymap_policy();
+                            let _ = reply.send(true);
+                        }
+                        None => {
+                            eprintln!("[Wayland] set_xkb_layout: RMLVO ({rules:?}, {model:?}, {layout:?}, {variant:?}, {options:?}) failed to compile.");
+                            let _ = reply.send(false);
                         }
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::GetXkbKeymap { reply }) => {
+                ThreadCommand::BindKeysyms { keysyms, reply } => {
+                    let _ = reply.send(state.bind_keysyms(&keysyms));
+                }
+                ThreadCommand::GetKeyboardState { reply } => {
+                    let (pressed, mods) = state
+                        .seat
+                        .get_keyboard()
+                        .map(|kb| {
+                            let pressed: Vec<u32> =
+                                kb.pressed_keys().iter().map(|c| c.raw()).collect();
+                            let m = kb.modifier_state();
+                            let mask = (m.ctrl as u32)
+                                | (m.shift as u32) << 1
+                                | (m.alt as u32) << 2
+                                | (m.logo as u32) << 3
+                                | (m.caps_lock as u32) << 4
+                                | (m.num_lock as u32) << 5
+                                | (m.iso_level3_shift as u32) << 6
+                                | (m.iso_level5_shift as u32) << 7;
+                            (pressed, mask)
+                        })
+                        .unwrap_or_default();
+                    let _ = reply.send((pressed, mods));
+                }
+                ThreadCommand::Barrier { reply } => {
+                    let _ = reply.send(());
+                }
+                ThreadCommand::GetXkbKeymap { reply } => {
                     let mut keymap_str = String::new();
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         keymap_str = keyboard.with_xkb_state(state, |context| {
@@ -2117,35 +3615,48 @@ fn run_wayland_thread(
                     }
                     let _ = reply.send(keymap_str);
                 }
-                CalloopEvent::Msg(ThreadCommand::PointerMotion { x, y }) => {
+                ThreadCommand::PointerMotion { x, y } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_motion_abs(x, y);
+                        return;
+                    }
                     let serial = next_serial();
                     let time = wayland_time();
-                    let scale = state.settings.scale;
-                    let logical_w = (state.settings.width as f64 / scale).floor();
-                    let logical_h = (state.settings.height as f64 / scale).floor();
-                    let logical_x = (x / scale).max(0.0).min(logical_w - 1.0);
-                    let logical_y = (y / scale).max(0.0).min(logical_h - 1.0);
+                    // (x, y) are physical union-layout coordinates: each output occupies
+                    // the physical rectangle at its layout offset, and the point maps
+                    // through the CONTAINING output's scale (clamped into the nearest
+                    // output when outside all of them).
+                    let p = state.layout_physical_to_logical(x, y);
 
                     if let Some(pointer) = state.seat.get_pointer() {
-                        let p = Point::<f64, smithay::utils::Logical>::from((logical_x, logical_y));
-                        let mut under = None;
-
-                        if let Some(output) = state.outputs.first() {
-                            let layer_map = layer_map_for_output(output);
-                            let pointer_pos = p.to_i32_round();
-
+                        // Layer surfaces live on the output under the point; their
+                        // geometry is output-local, so hit-test with the local point and
+                        // report the global location.
+                        let layer_hit = |state: &AppState, layers: &[smithay::wayland::shell::wlr_layer::Layer]| {
+                            let idx = state.node_idx_under(p)?;
+                            let node = &state.output_nodes[idx];
+                            let origin = Point::<i32, smithay::utils::Logical>::from(node.pos);
+                            let local = (p - origin.to_f64()).to_i32_round();
+                            let layer_map = layer_map_for_output(&node.output);
                             for layer in layer_map.layers().rev() {
-                                let state_layer = layer.layer();
-                                if state_layer == smithay::wayland::shell::wlr_layer::Layer::Overlay || state_layer == smithay::wayland::shell::wlr_layer::Layer::Top {
+                                if layers.contains(&layer.layer()) {
                                     if let Some(bbox) = layer_map.layer_geometry(layer) {
-                                        if bbox.contains(pointer_pos) {
-                                            under = Some((FocusTarget::LayerSurface(layer.clone()), bbox.loc.to_f64()));
-                                            break;
+                                        if bbox.contains(local) {
+                                            return Some((
+                                                FocusTarget::LayerSurface(layer.clone()),
+                                                (bbox.loc + origin).to_f64(),
+                                            ));
                                         }
                                     }
                                 }
                             }
-                        }
+                            None
+                        };
+
+                        let mut under = layer_hit(state, &[
+                            smithay::wayland::shell::wlr_layer::Layer::Overlay,
+                            smithay::wayland::shell::wlr_layer::Layer::Top,
+                        ]);
 
                         if under.is_none() {
                             under = state.space.element_under(p).map(|(window, loc)| {
@@ -2154,44 +3665,26 @@ fn run_wayland_thread(
                         }
 
                         if under.is_none() {
-                            if let Some(output) = state.outputs.first() {
-                                let layer_map = layer_map_for_output(output);
-                                let pointer_pos = p.to_i32_round();
-
-                                for layer in layer_map.layers().rev() {
-                                    let state_layer = layer.layer();
-                                    if state_layer == smithay::wayland::shell::wlr_layer::Layer::Bottom || state_layer == smithay::wayland::shell::wlr_layer::Layer::Background {
-                                        if let Some(bbox) = layer_map.layer_geometry(layer) {
-                                            if bbox.contains(pointer_pos) {
-                                                under = Some((FocusTarget::LayerSurface(layer.clone()), bbox.loc.to_f64()));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            under = layer_hit(state, &[
+                                smithay::wayland::shell::wlr_layer::Layer::Bottom,
+                                smithay::wayland::shell::wlr_layer::Layer::Background,
+                            ]);
                         }
 
                         pointer.motion(state, under, &MotionEvent { location: p, serial, time });
                         pointer.frame(state);
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::PointerRelativeMotion { dx, dy }) => {
+                ThreadCommand::PointerRelativeMotion { dx, dy } => {
                     let utime = wayland_utime();
                     let time = wayland_time();
                     let serial = next_serial();
 
                     if let Some(pointer) = state.seat.get_pointer() {
                         let current_pos = pointer.current_location();
-                        
-                        let scale = state.settings.scale;
-                        let max_w = (state.settings.width as f64 / scale).floor() - 1.0;
-                        let max_h = (state.settings.height as f64 / scale).floor() - 1.0;
-
-                        let new_x = (current_pos.x + dx).max(0.0).min(max_w);
-                        let new_y = (current_pos.y + dy).max(0.0).min(max_h);
-                        
-                        let new_pos = Point::<f64, smithay::utils::Logical>::from((new_x, new_y));
+                        let new_pos = state.clamp_logical(
+                            (current_pos.x + dx, current_pos.y + dy).into(),
+                        );
 
                         let under = state.space.element_under(new_pos).map(|(window, loc)| {
                             (FocusTarget::Window(window.clone()), loc.to_f64())
@@ -2217,7 +3710,11 @@ fn run_wayland_thread(
                         pointer.frame(state);
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::PointerButton { btn, state: btn_state_val }) => {
+                ThreadCommand::PointerButton { btn, state: btn_state_val } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_button(btn, btn_state_val > 0);
+                        return;
+                    }
                     let serial = next_serial();
                     let time = wayland_time();
                     let button_state = if btn_state_val > 0 { smithay::backend::input::ButtonState::Pressed } else { smithay::backend::input::ButtonState::Released };
@@ -2239,7 +3736,11 @@ fn run_wayland_thread(
                         pointer.frame(state);
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::PointerAxis { x, y }) => {
+                ThreadCommand::PointerAxis { x, y } => {
+                    if let Some(host) = state.host.as_ref() {
+                        host.pointer_axis(x, y);
+                        return;
+                    }
                     let time = wayland_time();
                     
                     if let Some(pointer) = state.seat.get_pointer() {
@@ -2265,66 +3766,120 @@ fn run_wayland_thread(
                         }
                     }
                 }
-                CalloopEvent::Msg(ThreadCommand::UpdateCursorConfig { render_on_framebuffer }) => {
+                ThreadCommand::UpdateCursorConfig { render_on_framebuffer } => {
                     state.render_cursor_on_framebuffer = render_on_framebuffer;
                 }
-                CalloopEvent::Msg(ThreadCommand::RequestIdr) => {
-                    if state.encode_pool.is_some() {
-                        state.encode_controls.force_idr.store(true, Ordering::Relaxed);
+                ThreadCommand::SetCursorSize { size, reply } => {
+                    if size <= 0 {
+                        let _ = reply.send(false);
                     } else {
-                        state.pending_force_idr = true;
+                        state.cursor_helper = Cursor::load(size);
+                        let _ = state.cursor_tx.send(CursorJob::SetSize(size));
+                        // The burned-in cursor changed size; force a repaint everywhere so
+                        // a static screen doesn't keep showing the old sprite.
+                        for node in state.output_nodes.iter_mut() {
+                            if let Some(cap) = node.capture.as_mut() {
+                                cap.needs_full_render = true;
+                            }
+                        }
+                        let _ = reply.send(true);
                     }
-                    state.needs_full_render = true;
                 }
-                CalloopEvent::Msg(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps }) => {
-                    if let Some(b) = bitrate_kbps { state.settings.video_bitrate_kbps = b; }
-                    if let Some(v) = vbv_multiplier { state.settings.video_vbv_multiplier = v; }
-                    if let Some(f) = fps { if f > 0.0 { state.settings.target_fps = f; } }
-                    if let Some(GpuEncoder::Nvenc(enc)) = state.video_encoder.as_mut() {
-                        enc.reconfigure_rate(&state.settings);
+                ThreadCommand::RequestIdr { display_id } => {
+                    if let Some(idx) = state.node_idx_for_id(display_id) {
+                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                            cap.request_idr();
+                        }
                     }
-                    if let Some(GpuEncoder::Vaapi(enc)) = state.video_encoder.as_mut() {
-                        enc.reconfigure_rate(&state.settings);
-                    }
-                    let c = &state.encode_controls;
-                    c.bitrate_kbps.store(state.settings.video_bitrate_kbps, Ordering::Relaxed);
-                    c.vbv_mult_milli.store(
-                        (state.settings.video_vbv_multiplier * 1000.0).round() as i32,
-                        Ordering::Relaxed,
-                    );
-                    c.fps_milli.store(
-                        (state.settings.target_fps.max(1.0) * 1000.0) as u64,
-                        Ordering::Relaxed,
-                    );
-                    c.rate_dirty.store(true, Ordering::Release);
                 }
-                CalloopEvent::Msg(ThreadCommand::UpdateTunables(t)) => {
-                    t.apply_to(&mut state.settings);
+                ThreadCommand::UpdateRate { display_id, bitrate_kbps, vbv_multiplier, fps } => {
+                    if let Some(idx) = state.node_idx_for_id(display_id) {
+                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                            if let Some(b) = bitrate_kbps { cap.settings.video_bitrate_kbps = b; }
+                            if let Some(v) = vbv_multiplier { cap.settings.video_vbv_multiplier = v; }
+                            if let Some(f) = fps { if f > 0.0 { cap.settings.target_fps = f; } }
+                            if let Some(GpuEncoder::Nvenc(enc)) = cap.video_encoder.as_mut() {
+                                enc.reconfigure_rate(&cap.settings);
+                            }
+                            if let Some(GpuEncoder::Vaapi(enc)) = cap.video_encoder.as_mut() {
+                                enc.reconfigure_rate(&cap.settings);
+                            }
+                            let c = &cap.encode_controls;
+                            c.bitrate_kbps.store(cap.settings.video_bitrate_kbps, Ordering::Relaxed);
+                            c.vbv_mult_milli.store(
+                                (cap.settings.video_vbv_multiplier * 1000.0).round() as i32,
+                                Ordering::Relaxed,
+                            );
+                            c.fps_milli.store(
+                                (cap.settings.target_fps.max(1.0) * 1000.0) as u64,
+                                Ordering::Relaxed,
+                            );
+                            c.rate_dirty.store(true, Ordering::Release);
+                            if display_id == 0 {
+                                state.settings.video_bitrate_kbps = cap.settings.video_bitrate_kbps;
+                                state.settings.video_vbv_multiplier = cap.settings.video_vbv_multiplier;
+                                state.settings.target_fps = cap.settings.target_fps;
+                            }
+                        }
+                    }
+                }
+                ThreadCommand::UpdateTunables { display_id, tunables: t } => {
                     state.render_cursor_on_framebuffer = t.capture_cursor;
-                    *state.encode_controls.tunables.lock().unwrap() = Some(t);
-                    state.encode_controls.tunables_dirty.store(true, Ordering::Release);
+                    if display_id == 0 {
+                        t.apply_to(&mut state.settings);
+                    }
+                    if let Some(idx) = state.node_idx_for_id(display_id) {
+                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                            t.apply_to(&mut cap.settings);
+                            *cap.encode_controls.tunables.lock().unwrap() = Some(t);
+                            cap.encode_controls.tunables_dirty.store(true, Ordering::Release);
+                        }
+                    }
                 }
-                CalloopEvent::Msg(ThreadCommand::CuScreenshot { resp }) => {
-                    state.pending_screenshot = Some(resp);
+                ThreadCommand::CuScreenshot { display_id, resp } => {
+                    if state.node_idx_for_id(display_id).is_some() {
+                        state.pending_screenshot = Some((display_id, resp));
+                    } else {
+                        let _ = resp.send(Err(format!("Unknown display: {display_id}")));
+                    }
                 }
-                CalloopEvent::Msg(ThreadCommand::CuCursorPosition { resp }) => {
+                ThreadCommand::CuCursorPosition { resp } => {
                     let pos = state.seat.get_pointer()
                         .map(|p| p.current_location())
                         .unwrap_or_else(|| (0.0f64, 0.0f64).into());
-                    let scale = state.settings.scale;
-                    let fb_x = pos.x * scale;
-                    let fb_y = pos.y * scale;
-                    let _ = resp.send((fb_x, fb_y));
+                    let _ = resp.send(state.layout_logical_to_physical(pos));
                 }
-                CalloopEvent::Msg(ThreadCommand::CuGetInfo { resp }) => {
-                    let _ = resp.send((
-                        state.settings.width,
-                        state.settings.height,
-                        state.settings.scale,
-                    ));
+                ThreadCommand::CuGetInfo { display_id, resp } => {
+                    let info = state
+                        .node_idx_for_id(display_id)
+                        .map(|idx| {
+                            let node = &state.output_nodes[idx];
+                            match node.capture.as_ref() {
+                                Some(c) => (c.settings.width, c.settings.height, c.settings.scale),
+                                None => node
+                                    .output
+                                    .current_mode()
+                                    .map(|m| {
+                                        (
+                                            m.size.w,
+                                            m.size.h,
+                                            node.output.current_scale().fractional_scale(),
+                                        )
+                                    })
+                                    .unwrap_or((0, 0, 0.0)),
+                            }
+                        })
+                        .unwrap_or((0, 0, 0.0));
+                    let _ = resp.send(info);
                 }
-                CalloopEvent::Closed => {}
             }
+    }
+
+    state.command_rx = Some(command_rx);
+    event_loop
+        .handle()
+        .insert_source(wake_rx, |_, _, state| {
+            drain_thread_commands(state);
         })
         .unwrap();
 
@@ -2332,6 +3887,7 @@ fn run_wayland_thread(
     let socket_name = source.socket_name().to_string_lossy().into_owned();
     println!("[Wayland] Socket listening on: {:?}", socket_name);
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    publish_socket_name(&socket_name);
 
     event_loop
         .handle()
@@ -2350,12 +3906,23 @@ fn run_wayland_thread(
     event_loop
         .handle()
         .insert_source(timer, move |_, _, state| {
+            // Apply queued commands (input above all) BEFORE the render/encode work: a
+            // command that raced the timer wakeup would otherwise wait out the whole tick.
+            drain_thread_commands(state);
             let loop_start_time = Instant::now();
             state.space.refresh();
 
             let current_rss = get_process_rss_bytes();
             let shm_usage = get_shm_usage_bytes();
-            let memory_threshold = calculate_memory_threshold(state.settings.width, state.settings.height);
+            // The threshold follows the largest active capture (fallback: primary settings).
+            let (max_w, max_h) = state
+                .output_nodes
+                .iter()
+                .filter_map(|n| n.capture.as_ref().map(|c| (c.settings.width, c.settings.height)))
+                .fold((state.settings.width, state.settings.height), |acc, (w, h)| {
+                    (acc.0.max(w), acc.1.max(h))
+                });
+            let memory_threshold = calculate_memory_threshold(max_w, max_h);
 
             if current_rss > memory_threshold || shm_usage > (4 * 1024 * 1024 * 1024) {
                 if !is_memory_throttling {
@@ -2369,552 +3936,79 @@ fn run_wayland_thread(
             let now = Instant::now();
             let elapsed = now.duration_since(state.last_log_time).as_secs_f64();
             if elapsed >= 1.0 {
-                let frames = state.encode_stats.frames.swap(0, Ordering::Relaxed);
-                let stripes = state.encode_stats.stripes.swap(0, Ordering::Relaxed);
-                if state.is_capturing && state.settings.debug_logging {
-                    let actual_fps = frames as f64 / elapsed;
-                    let stripes_per_sec = stripes as f64 / elapsed;
-                    let mode_str = state.encode_stats.desc.lock().unwrap().clone();
-                    let n_stripes = state.encode_stats.n_stripes.load(Ordering::Relaxed);
+                for node in &state.output_nodes {
+                    let Some(cap) = node.capture.as_ref() else { continue };
+                    let frames = cap.encode_stats.frames.swap(0, Ordering::Relaxed);
+                    let stripes = cap.encode_stats.stripes.swap(0, Ordering::Relaxed);
+                    if cap.settings.debug_logging {
+                        let actual_fps = frames as f64 / elapsed;
+                        let stripes_per_sec = stripes as f64 / elapsed;
+                        let mode_str = cap.encode_stats.desc.lock().unwrap().clone();
+                        let n_stripes = cap.encode_stats.n_stripes.load(Ordering::Relaxed);
 
-                    let rss_mb = current_rss / 1024 / 1024;
-                    let shm_mb = shm_usage / 1024 / 1024;
-                    let throttle_warn = if is_memory_throttling { " [THROTTLED]" } else { "" };
+                        let rss_mb = current_rss / 1024 / 1024;
+                        let shm_mb = shm_usage / 1024 / 1024;
+                        let throttle_warn = if is_memory_throttling { " [THROTTLED]" } else { "" };
 
-                    println!("Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2} Mem: {}MB SHM: {}MB{}",
-                        state.settings.width, state.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec, rss_mb, shm_mb, throttle_warn);
+                        println!("Display: {} Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2} Mem: {}MB SHM: {}MB{}",
+                            node.id, cap.settings.width, cap.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec, rss_mb, shm_mb, throttle_warn);
+                    }
                 }
                 state.last_log_time = now;
             }
 
-            if !state.is_capturing && state.pending_screenshot.is_none() {
+            let any_capturing = state.output_nodes.iter().any(|n| n.capture.is_some());
+            if !any_capturing && state.pending_screenshot.is_none() {
+                // No render/encode work, but committed clients still need their
+                // frame callbacks: a vsynced client (FIFO Vulkan present, games, a
+                // nested compositor's own clients) otherwise blocks in its swap
+                // until a viewer attaches — apps appear frozen whenever nobody is
+                // watching.
+                let time = state.clock.now();
+                for node in &state.output_nodes {
+                    for window in state
+                        .space
+                        .elements_for_output(&node.output)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                    {
+                        window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
+                            Some(node.output.clone())
+                        });
+                    }
+                }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
-            let requested_idr = state.pending_force_idr;
-
-            let mut pool_slot: Option<(usize, Vec<u8>)> = None;
-            if let Some(ref pool) = state.encode_pool {
-                if !is_memory_throttling {
-                    pool_slot = pool.try_begin();
-                    if pool_slot.is_none() {
-                        return TimeoutAction::ToDuration(Duration::from_millis(1));
-                    }
+            // Render every output that needs it. The nodes are taken out of the state so
+            // each per-output render can borrow the shared renderer/space alongside its
+            // own damage tracker and buffers.
+            let mut nodes = std::mem::take(&mut state.output_nodes);
+            let mut any_pool_busy = false;
+            for node in nodes.iter_mut() {
+                if render_node_tick(state, node, is_memory_throttling) {
+                    any_pool_busy = true;
                 }
             }
+            state.output_nodes = nodes;
 
-            state.overlay_state.update_position(
-                state.settings.width,
-                state.settings.height,
-                state.settings.watermark_location_enum,
-            );
-
-            let mut render_success = false;
-            let mut render_sync = None;
-            let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
-            let width = state.settings.width;
-            let height = state.settings.height;
-
-            if let Some(output) = state.outputs.first().cloned() {
-                let render_age = if state.overlay_state.is_animated() || state.needs_full_render { 0 } else { 1 };
-                if state.use_gpu {
-                    if let Some(renderer) = state.gles_renderer.as_mut() {
-                        if let Some((_bo, dmabuf)) = state.offscreen_buffer.as_mut() {
-                            match renderer.bind(dmabuf) {
-                                Ok(mut frame) => {
-                                    let mut elements: Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> = Vec::new();
-
-                                    if state.render_cursor_on_framebuffer {
-                                        if let Some(pointer) = state.seat.get_pointer() {
-                                            let pos = pointer.current_location();
-                                            let output_scale_val = output.current_scale().fractional_scale();
-                                            let scale = Scale::from(output_scale_val);
-
-                                            if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
-                                                let name = wayland::frontend::cursor_icon_to_str(icon);
-                                                let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                                if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
-                                                    if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
-                                                        elements.push(CompositionElements::Cursor(elem));
-                                                    }
-                                                }
-                                            } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
-                                                 let phys_pos = pos.to_physical(scale);
-                                                 let elem_result = with_states(surface, |states| {
-                                                     WaylandSurfaceRenderElement::from_surface(renderer, surface, states, phys_pos, 1.0, smithay::backend::renderer::element::Kind::Cursor)
-                                                 });
-                                                 if let Ok(Some(cursor_elem)) = elem_result {
-                                                     elements.push(CompositionElements::Surface(cursor_elem));
-                                                 }
-                                            } else if state.current_cursor_icon.is_none() {
-                                                let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                                let image = state.cursor_helper.get_image(output_scale_val.round() as u32, time);
-                                                if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
-                                                    elements.push(CompositionElements::Cursor(elem));
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(elem) = state.overlay_state.get_watermark_element(renderer) {
-                                        elements.push(CompositionElements::Cursor(elem));
-                                    }
-
-                                    {
-                                        let layer_map = layer_map_for_output(&output);
-
-                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                            for surface in layer_map.layers().rev() {
-                                                let current_layer = surface.layer();
-                                                if current_layer == target_layer {
-                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                            WaylandSurfaceRenderElement::from_surface(
-                                                                renderer, surface.wl_surface(), states,
-                                                                geo.loc.to_physical_precise_round(1), 1.0,
-                                                                smithay::backend::renderer::element::Kind::Unspecified
-                                                            )
-                                                        });
-                                                        if let Ok(Some(e)) = elem {
-                                                            elements.push(CompositionElements::Surface(e));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
-                                    }
-
-                                    for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
-                                        let window_loc = state.space.element_location(window).unwrap_or_default();
-
-                                        if let Some(surface) = window.wl_surface() {
-                                            let popups = PopupManager::popups_for_surface(&surface);
-                                            for (popup, location) in popups {
-                                                let popup_surface = popup.wl_surface();
-                                                let popup_pos = window_loc + location;
-                                                let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
-                                                    WaylandSurfaceRenderElement::from_surface(
-                                                        renderer,
-                                                        popup_surface,
-                                                        states,
-                                                        popup_pos.to_physical_precise_round(1),
-                                                        1.0,
-                                                        smithay::backend::renderer::element::Kind::Unspecified
-                                                    )
-                                                });
-                                                if let Ok(Some(e)) = elem {
-                                                    elements.push(CompositionElements::Surface(e));
-                                                }
-                                            }
-                                        }
-
-                                        elements.extend(window.render_elements(renderer, window_loc.to_physical_precise_round(1), Scale::from(1.0), 1.0).into_iter().map(CompositionElements::Space));
-                                    }
-
-                                    {
-                                        let layer_map = layer_map_for_output(&output);
-
-                                        let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                            for surface in layer_map.layers() {
-                                                let current_layer = surface.layer();
-                                                if current_layer == target_layer {
-                                                    if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                        let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                            WaylandSurfaceRenderElement::from_surface(
-                                                                renderer, surface.wl_surface(), states,
-                                                                geo.loc.to_physical_precise_round(1), 1.0,
-                                                                smithay::backend::renderer::element::Kind::Unspecified
-                                                            )
-                                                        });
-                                                        if let Ok(Some(e)) = elem {
-                                                            elements.push(CompositionElements::Surface(e));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        };
-
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
-                                        draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
-                                    }
-                                    match damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
-                                        Ok(result) => {
-                                            render_success = true;
-                                            if let Some(damage) = result.damage {
-                                                damage_rects = damage.clone();
-                                            }
-                                            render_sync = Some(result.sync);
-                                            state.needs_full_render = false;
-                                        },
-                                        Err(e) => eprintln!("Render error: {:?}", e)
-                                    }
-                                    if !damage_rects.is_empty() {
-                                        state.content_gen += 1;
-                                    }
-                                    if let Some((id, ref mut buf)) = pool_slot {
-                                        // No-damage ticks skip the readback, so a pooled
-                                        // buffer can lag the offscreen target whenever the
-                                        // encoder held the other slot across a tick. Publishing
-                                        // a lagging buffer would let a paint-over / burst /
-                                        // recovery send re-encode pre-damage pixels; one
-                                        // catch-up readback keeps every published buffer
-                                        // current while idle readbacks stay skipped.
-                                        if render_success && state.pool_content_gen[id] != state.content_gen {
-                                            let _ = renderer.with_context(|gl| unsafe {
-                                                gl.ReadPixels(
-                                                    0,
-                                                    0,
-                                                    width,
-                                                    height,
-                                                    smithay::backend::renderer::gles::ffi::RGBA,
-                                                    smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
-                                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                                                );
-                                            });
-                                            state.pool_content_gen[id] = state.content_gen;
-                                        }
-                                    } else if state.pending_screenshot.is_some() {
-                                        let _ = renderer.with_context(|gl| unsafe {
-                                            gl.ReadPixels(
-                                                0,
-                                                0,
-                                                width,
-                                                height,
-                                                smithay::backend::renderer::gles::ffi::RGBA,
-                                                smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
-                                                state.frame_buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                                            );
-                                        });
-                                    }
-                                },
-                                Err(e) => eprintln!("Failed to bind buffer: {:?}", e)
-                            }
-                        }
-                    }
-                } else {
-                    if let Some(renderer) = state.pixman_renderer.as_mut() {
-                        let (ptr, buf_age) = match pool_slot {
-                            Some((id, ref mut buf)) => {
-                                let age = if state.pool_last_render[id] == 0 {
-                                    0
-                                } else {
-                                    (state.render_seq + 1 - state.pool_last_render[id]) as usize
-                                };
-                                (buf.as_mut_ptr() as *mut u32, age)
-                            }
-                            None => (state.frame_buffer.as_mut_ptr() as *mut u32, 0),
-                        };
-                        let mut image = unsafe {
-                            pixman::Image::from_raw_mut(pixman::FormatCode::A8R8G8B8, width as usize, height as usize, ptr, (width as usize) * 4, false).expect("Failed to create pixman image")
-                        };
-                                    match renderer.bind(&mut image) {
-                                    Ok(mut frame) => {
-                                        let mut elements: Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>> = Vec::new();
-
-                                        if state.render_cursor_on_framebuffer {
-                                            if let Some(pointer) = state.seat.get_pointer() {
-                                                let pos = pointer.current_location();
-                                                let output_scale_val = output.current_scale().fractional_scale();
-                                                let scale = Scale::from(output_scale_val);
-
-                                                if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
-                                                    let name = wayland::frontend::cursor_icon_to_str(icon);
-                                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                                    if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
-                                                        if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
-                                                            elements.push(CompositionElements::Cursor(elem));
-                                                        }
-                                                    }
-                                                } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
-                                                     let phys_pos = pos.to_physical(scale);
-                                                     let elem_result = with_states(surface, |states| {
-                                                         WaylandSurfaceRenderElement::from_surface(renderer, surface, states, phys_pos, 1.0, smithay::backend::renderer::element::Kind::Cursor)
-                                                     });
-                                                     if let Ok(Some(cursor_elem)) = elem_result {
-                                                         elements.push(CompositionElements::Surface(cursor_elem));
-                                                     }
-                                                } else if state.current_cursor_icon.is_none() {
-                                                    let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                                    let image = state.cursor_helper.get_image(output_scale_val.round() as u32, time);
-                                                    if let Some(elem) = state.overlay_state.get_cursor_element(renderer, image, pos.to_i32_round()) {
-                                                        elements.push(CompositionElements::Cursor(elem));
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(elem) = state.overlay_state.get_watermark_element(renderer) {
-                                            elements.push(CompositionElements::Cursor(elem));
-                                        }
-
-                                        {
-                                            let layer_map = layer_map_for_output(&output);
-
-                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                                for surface in layer_map.layers() {
-                                                    let current_layer = surface.layer();
-                                                    if current_layer == target_layer {
-                                                        if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                                WaylandSurfaceRenderElement::from_surface(
-                                                                    renderer, surface.wl_surface(), states,
-                                                                    geo.loc.to_physical_precise_round(1), 1.0,
-                                                                    smithay::backend::renderer::element::Kind::Unspecified
-                                                                )
-                                                            });
-                                                            if let Ok(Some(e)) = elem {
-                                                                elements.push(CompositionElements::Surface(e));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            };
-
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
-                                        }
-
-                                        for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
-                                            let loc = state.space.element_location(window).unwrap_or_default();
-                                            
-                                            if let Some(surface) = window.wl_surface() {
-                                                let popups = PopupManager::popups_for_surface(&surface);
-                                                for (popup, location) in popups {
-                                                    let popup_surface = popup.wl_surface(); {
-                                                        let popup_pos = loc + location;
-                                                        let elem = smithay::wayland::compositor::with_states(popup_surface, |states| {
-                                                            WaylandSurfaceRenderElement::from_surface(
-                                                                renderer,
-                                                                popup_surface,
-                                                                states,
-                                                                popup_pos.to_physical_precise_round(1),
-                                                                1.0,
-                                                                smithay::backend::renderer::element::Kind::Unspecified
-                                                            )
-                                                        });
-                                                        if let Ok(Some(e)) = elem {
-                                                            elements.push(CompositionElements::Surface(e));
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            elements.extend(window.render_elements(renderer, loc.to_physical_precise_round(1), Scale::from(1.0), 1.0).into_iter().map(CompositionElements::Space));
-                                        }
-
-                                        {
-                                            let layer_map = layer_map_for_output(&output);
-
-                                            let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                                for surface in layer_map.layers() {
-                                                    let current_layer = surface.layer();
-                                                    if current_layer == target_layer {
-                                                        if let Some(geo) = layer_map.layer_geometry(surface) {
-                                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                                WaylandSurfaceRenderElement::from_surface(
-                                                                    renderer, surface.wl_surface(), states,
-                                                                    geo.loc.to_physical_precise_round(1), 1.0,
-                                                                    smithay::backend::renderer::element::Kind::Unspecified
-                                                                )
-                                                            });
-                                                            if let Ok(Some(e)) = elem {
-                                                                elements.push(CompositionElements::Surface(e));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            };
-
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
-                                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
-                                        }
-
-                                let render_age = if state.overlay_state.is_animated() || state.needs_full_render { 0 } else { buf_age };
-                                match damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
-                                    Ok(result) => {
-                                        render_success = true;
-                                        state.needs_full_render = false;
-                                        if let Some(damage) = result.damage { damage_rects = damage.clone(); }
-                                    },
-                                    Err(e) => eprintln!("Render error: {:?}", e)
-                                }
-                                state.render_seq += 1;
-                                if render_success {
-                                    if let Some((id, _)) = pool_slot {
-                                        state.pool_last_render[id] = state.render_seq;
-                                    }
-                                }
-                            },
-                            Err(e) => eprintln!("Failed to bind pixman image: {:?}", e)
-                        }
-                    }
-                }
-
-                if render_success {
-                    let time = state.clock.now();
-                    for window in state.space.elements() {
-                        window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
-                    }
-
-                    if is_memory_throttling {
-                        if state.encode_pool.is_none() {
-                            state.frame_counter = state.frame_counter.wrapping_add(1);
-                        }
-                    } else if state.encode_pool.is_some() {
-                        if state.pending_screenshot.is_some() {
-                            if let Some((_, ref buf)) = pool_slot {
-                                let n = buf.len().min(state.frame_buffer.len());
-                                state.frame_buffer[..n].copy_from_slice(&buf[..n]);
-                            }
-                        }
-                        if let Some((id, buf)) = pool_slot.take() {
-                            let is_animated = state.overlay_state.is_animated();
-                            state.encode_pool.as_ref().unwrap().publish(WlFrame {
-                                id,
-                                buf,
-                                frame_id: state.frame_counter,
-                                damage: std::mem::take(&mut damage_rects),
-                                is_animated,
-                            });
-                            state.frame_counter = state.frame_counter.wrapping_add(1);
-                        }
-                    } else if let Some(ref mut encoder) = state.video_encoder {
-                        // Deliver the parked frame (if any) first, WITHOUT blocking:
-                        // this runs on the calloop thread, and a blocking send would
-                        // freeze input/command/Wayland dispatch for as long as the
-                        // Python consumer stalls (the readback path offloads its
-                        // sends to the wl-encode thread for exactly this reason).
-                        // While a frame stays parked, no new frame is encoded — an
-                        // encoded frame joins the H.264 reference chain and can
-                        // never be dropped — and the tick's damage is latched so
-                        // the pause never loses a change.
-                        let slot_free = match state.pending_hw_delivery.take() {
-                            None => true,
-                            Some(pending) => match state.deliver_tx.as_ref() {
-                                None => true,
-                                Some(tx) => match tx.try_send(pending) {
-                                    Ok(()) => true,
-                                    Err(std::sync::mpsc::TrySendError::Full(p)) => {
-                                        state.pending_hw_delivery = Some(p);
-                                        false
-                                    }
-                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => true,
-                                },
-                            },
-                        };
-                        if !slot_free {
-                            if !damage_rects.is_empty() {
-                                state.pending_hw_damage = true;
-                            }
-                        } else {
-                        let is_animated = state.overlay_state.is_animated();
-                        let had_damage = !damage_rects.is_empty()
-                            || std::mem::take(&mut state.pending_hw_damage);
-                        let decision = crate::pipeline::decide_hw_fullframe(
-                            &mut state.vaapi_state,
-                            &state.settings,
-                            state.frame_counter,
-                            had_damage,
-                            is_animated,
-                            requested_idr,
-                        );
-                        let send_frame = decision.send;
-                        let force_idr = decision.force_idr;
-                        let target_qp = decision.target_qp;
-
-                        if send_frame {
-                            if let Some(sync) = render_sync.take() {
-                                let _ = sync.wait();
-                            }
-                            let force_idr_for_recording = state
-                                .recording_sink
-                                .as_ref()
-                                .map(|s| s.should_force_idr())
-                                .unwrap_or(false);
-                            let force_idr = force_idr || force_idr_for_recording;
-                            let result = match encoder {
-                                GpuEncoder::Nvenc(enc) => {
-                                    if let Some((_, ref dmabuf)) = state.offscreen_buffer {
-                                        enc.encode(dmabuf, state.frame_counter as u64, target_qp, force_idr)
-                                    } else {
-                                        Err("NVENC ZeroCopy requires offscreen buffer (GPU context)".to_string())
-                                    }
-                                },
-                                GpuEncoder::Vaapi(enc) => {
-                                    if let Some((_, ref dmabuf)) = state.offscreen_buffer {
-                                        enc.encode_dmabuf(dmabuf, state.frame_counter as u64, target_qp, force_idr)
-                                    } else {
-                                        Err("Vaapi ZeroCopy requires offscreen buffer (GPU context)".to_string())
-                                    }
-                                }
-                            };
-
-                            if let Ok(data) = result {
-                                if !data.is_empty() {
-                                    state.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
-                                    state.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(ref tx) = state.deliver_tx {
-                                        let stripes = vec![EncodedStripe {
-                                            data, data_type: 2, stripe_y_start: 0,
-                                            stripe_height: height, frame_id: state.frame_counter as i32,
-                                        }];
-                                        if let Some(ref socket) = state.recording_sink {
-                                            for stripe in &stripes {
-                                                let _ = socket.write_encoded_frame(stripe);
-                                            }
-                                        }
-                                        // Non-blocking: a full slot parks the frame
-                                        // (delivered ahead of any new encode above).
-                                        match tx.try_send(stripes) {
-                                            Ok(()) => {}
-                                            Err(std::sync::mpsc::TrySendError::Full(s)) => {
-                                                state.pending_hw_delivery = Some(s);
-                                            }
-                                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
-                                        }
-                                    }
-                                }
-                            } else if let Err(e) = result {
-                                eprintln!("HW Encode Error: {}", e);
-                            }
-                        }
-                        state.pending_force_idr = false;
-                        state.frame_counter = state.frame_counter.wrapping_add(1);
-                        }
-                    }
-                    if let Some(resp) = state.pending_screenshot.take() {
-                        if !state.frame_buffer.is_empty() {
-                            let w = state.settings.width as u32;
-                            let h = state.settings.height as u32;
-                            let png = if state.use_gpu {
-                                crate::computer_use::encode_png_rgba(&state.frame_buffer, w, h)
-                            } else {
-                                let mut rgba = state.frame_buffer.clone();
-                                for px in rgba.chunks_exact_mut(4) {
-                                    px.swap(0, 2);
-                                }
-                                crate::computer_use::encode_png_rgba(&rgba, w, h)
-                            };
-                            match png {
-                                Ok(data) => { let _ = resp.send(data); }
-                                Err(e) => { let _ = resp.send(Vec::new()); eprintln!("[ComputerUse] PNG encode error: {}", e); }
-                            }
-                        } else {
-                            let _ = resp.send(Vec::new());
-                        }
-                    }
-                }
-            }
-            if let Some((id, buf)) = pool_slot.take() {
-                if let Some(ref pool) = state.encode_pool {
-                    pool.cancel(id, buf);
-                }
+            if any_pool_busy {
+                return TimeoutAction::ToDuration(Duration::from_millis(1));
             }
             let work_elapsed = loop_start_time.elapsed();
-            let fps = (if is_memory_throttling { 5.0 } else { state.settings.target_fps }).max(1.0);
+            let max_fps = state
+                .output_nodes
+                .iter()
+                .filter_map(|n| n.capture.as_ref().map(|c| c.settings.target_fps))
+                .fold(0.0f64, f64::max);
+            let fps = (if is_memory_throttling {
+                5.0
+            } else if max_fps > 0.0 {
+                max_fps
+            } else {
+                state.settings.target_fps
+            })
+            .max(1.0);
             let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
             let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };
@@ -2930,17 +4024,8 @@ fn run_wayland_thread(
         })
         .unwrap();
 
-    if let Ok(port_str) = std::env::var("PIXELFLUX_CU") {
-        if let Ok(port) = port_str.parse::<u16>() {
-            println!("[ComputerUse] Starting server on port {} (PIXELFLUX_CU={})", port, port);
-            let cu_tx = command_tx.clone();
-            thread::spawn(move || {
-                crate::computer_use::run_cu_server(cu_tx, port);
-            });
-        } else {
-            println!("[ComputerUse] Invalid PIXELFLUX_CU value: '{}' - expected a port number", port_str);
-        }
-    }
+    crate::computer_use::register_wayland_backend(command_tx.clone());
+    crate::computer_use::spawn_cu_from_env();
 
     event_loop.run(None, &mut state, |state| {
         state.process_pending_clipboard_read();
@@ -2954,7 +4039,7 @@ fn run_wayland_thread(
 /// four stripe-metadata ints as Python attributes.
 #[pyclass]
 struct StripeFrame {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     #[pyo3(get, set)]
     data_type: i32,
     #[pyo3(get, set)]
@@ -2966,10 +4051,10 @@ struct StripeFrame {
 }
 
 impl StripeFrame {
-    /// Hot-path constructor: MOVES the encoded buffer in (no copy) and carries stripe
+    /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
-    fn new_owned_meta(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
+    fn new_owned_meta(data: Arc<Vec<u8>>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
         Self { data, data_type, stripe_y_start, stripe_height, frame_id }
     }
 }
@@ -2981,7 +4066,7 @@ impl StripeFrame {
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
     fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
-        Self { data, data_type, stripe_y_start, stripe_height, frame_id }
+        Self { data: Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id }
     }
 
     fn __len__(&self) -> usize {
@@ -3022,6 +4107,18 @@ impl StripeFrame {
 #[pyclass]
 struct WaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+    /// Wakes the calloop after each command send: the command channel itself is drained in
+    /// place by the compositor thread (render tick and wake handler), not registered as its
+    /// own source, so input never waits behind an in-flight render tick's timer wakeup.
+    wake_tx: smithay::reexports::calloop::channel::Sender<()>,
+}
+
+impl WaylandBackend {
+    fn send(&self, cmd: ThreadCommand) -> Result<(), String> {
+        self.tx.send(cmd).map_err(|e| e.to_string())?;
+        let _ = self.wake_tx.send(());
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -3040,61 +4137,155 @@ impl WaylandBackend {
         cursor_size: i32,
     ) -> Self {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
+        let (wake_tx, wake_rx) = smithay::reexports::calloop::channel::channel();
         let cu_tx = tx.clone();
         thread::spawn(move || {
             crate::boost_thread_priority(-15);
-            run_wayland_thread(rx, cu_tx, width, height, dri_node, auto_gpu_selected, cursor_size);
+            run_wayland_thread(rx, wake_rx, cu_tx, width, height, dri_node, auto_gpu_selected, cursor_size);
         });
-        WaylandBackend { tx }
+        WaylandBackend { tx, wake_tx }
     }
 
-    /// Begin a capture with the given frame callback and settings.
+    /// Begin a capture with the given frame callback and settings. The target display is
+    /// the settings' `display_id` attribute (absent = 0, the primary); each display id runs
+    /// at most one capture, independent of every other display's.
     ///
     /// Issuing the start also clears the interpreter-teardown gate: starting from Python proves the
     /// interpreter is live again after a manual atexit sweep.
     fn start_capture(&self, callback: Py<PyAny>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let rust_settings = extract_settings(settings)?;
+        let display_id = read_display_id(settings);
 
         PY_SHUTDOWN.store(false, Ordering::Relaxed);
-        self.tx
-            .send(ThreadCommand::StartCapture(callback, rust_settings))
+        self.send(ThreadCommand::StartCapture { display_id, callback: Some(callback), settings: rust_settings })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to send start command: {}", e)))?;
         Ok(())
     }
 
-    fn stop_capture(&self) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::StopCapture)
+    /// Stop the capture bound to `display_id` (default: the primary display).
+    #[pyo3(signature = (display_id = 0))]
+    fn stop_capture(&self, display_id: u32) -> PyResult<()> {
+        self.send(ThreadCommand::StopCapture { display_id })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to send stop command: {}", e)))?;
         Ok(())
     }
 
+    /// Create an additional output (`WxH` physical pixels at fractional `scale`) mapped into
+    /// the layout at offset `(x, y)`; `id` is the display key used by every per-display API.
+    /// False when the id is taken, the geometry/scale is invalid, the rectangle overlaps a
+    /// live output, or the GPU render target cannot be allocated. Capture reconfigures
+    /// (`start_capture` on an existing output) resize without this validation, so a
+    /// multi-step relayout must stay overlap-free at every step by caller ordering.
+    #[pyo3(signature = (id, width, height, x = 0, y = 0, scale = 1.0))]
+    fn create_output(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        scale: f64,
+    ) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::CreateOutput { id, width, height, x, y, scale, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create output: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Destroy a secondary output: its capture ends cleanly and its windows relocate to the
+    /// primary output. False for the primary (id 0) or an unknown id.
+    fn destroy_output(&self, py: Python<'_>, id: u32) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::DestroyOutput { id, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to destroy output: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Move an existing output (the primary, id 0, included) to layout offset `(x, y)`;
+    /// its windows, absolute input injection, and cursor compositing follow. False for an
+    /// unknown id or a destination overlapping a live output. Capture reconfigures
+    /// (`start_capture` on an existing output) resize without this validation, so a
+    /// multi-step relayout must stay overlap-free at every step by caller ordering.
+    fn reposition_output(&self, py: Python<'_>, id: u32, x: i32, y: i32) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::RepositionOutput { id, x, y, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to reposition output: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Every live output as `(id, x, y, width, height, scale, capturing)` — width/height in
+    /// physical pixels, `(x, y)` the layout offset.
+    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<(u32, i32, i32, i32, i32, f64, bool)>> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ThreadCommand::ListOutputs { reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to list outputs: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or_default())
+    }
+
+    /// Move the window with the given id onto output `output_id`, fullscreened at that
+    /// output's logical size. False for an unknown window or output id.
+    fn move_window_to_output(&self, py: Python<'_>, window_id: u32, output_id: u32) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::MoveWindowToOutput { window_id, output_id, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to move window: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Every mapped window as `(window_id, title, app_id, output_id)`.
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32)>> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ThreadCommand::ListWindows { reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to list windows: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or_default())
+    }
+
     fn set_cursor_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::SetCursorCallback(callback))
+        self.send(ThreadCommand::SetCursorCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor callback: {}", e)))?;
         Ok(())
     }
 
+    /// Recreate the cursor theme at `size` pixels — no restart: subsequent named-cursor
+    /// callbacks and the burned-in cursor overlay render at the new size. False for a
+    /// non-positive size.
+    fn set_cursor_size(&self, py: Python<'_>, size: i32) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::SetCursorSize { size, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor size: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
     /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
     fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::SetClipboardCallback(callback))
+        self.send(ThreadCommand::SetClipboardCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard callback: {}", e)))?;
         Ok(())
     }
 
     /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
     fn set_clipboard(&self, mime: String, data: Vec<u8>) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::SetClipboard { mime, data })
+        self.send(ThreadCommand::SetClipboard { mime, data })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard: {}", e)))?;
         Ok(())
     }
 
     fn inject_key(&self, scancode: u32, state: u32) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::KeyboardKey { scancode, state })
+        self.send(ThreadCommand::KeyboardKey { scancode, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject key: {}", e)))?;
         Ok(())
     }
@@ -3103,8 +4294,7 @@ impl WaylandBackend {
     /// owns keysym-to-keycode policy: define keycodes here, then press them via
     /// `inject_key`. Ordered with key events on the one compositor channel.
     fn set_keymap_string(&self, text: String) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::SetKeymapString(text))
+        self.send(ThreadCommand::SetKeymapString(text))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set keymap: {}", e)))?;
         Ok(())
     }
@@ -3117,8 +4307,7 @@ impl WaylandBackend {
     /// and an empty string is returned when the keymap cannot be read in time.
     fn get_xkb_keymap_string(&self, py: Python<'_>) -> PyResult<String> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<String>();
-        self.tx
-            .send(ThreadCommand::GetXkbKeymap { reply: reply_tx })
+        self.send(ThreadCommand::GetXkbKeymap { reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request keymap: {}", e)))?;
         let result = py.detach(move || reply_rx.recv_timeout(Duration::from_secs(2)));
         match result {
@@ -3128,36 +4317,31 @@ impl WaylandBackend {
     }
 
     fn inject_mouse_move(&self, x: f64, y: f64) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::PointerMotion { x, y })
+        self.send(ThreadCommand::PointerMotion { x, y })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject motion: {}", e)))?;
         Ok(())
     }
 
     fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::PointerRelativeMotion { dx, dy })
+        self.send(ThreadCommand::PointerRelativeMotion { dx, dy })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject relative motion: {}", e)))?;
         Ok(())
     }
 
     fn inject_mouse_button(&self, btn: u32, state: u32) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::PointerButton { btn, state })
+        self.send(ThreadCommand::PointerButton { btn, state })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject button: {}", e)))?;
         Ok(())
     }
 
     fn inject_mouse_scroll(&self, x: f64, y: f64) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::PointerAxis { x, y })
+        self.send(ThreadCommand::PointerAxis { x, y })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject axis: {}", e)))?;
         Ok(())
     }
 
     fn set_cursor_rendering(&self, enabled: bool) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::UpdateCursorConfig { render_on_framebuffer: enabled })
+        self.send(ThreadCommand::UpdateCursorConfig { render_on_framebuffer: enabled })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor config: {}", e)))?;
         Ok(())
     }
@@ -3166,29 +4350,98 @@ impl WaylandBackend {
     /// or a decoder reset can resume immediately. With the default infinite GOP this
     /// is the only recovery path, so every consumer that can lose decoder state must
     /// call it. No-op cost on the JPEG/software path (keyframes are N/A).
-    fn request_idr_frame(&self) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::RequestIdr)
+    #[pyo3(signature = (display_id = 0))]
+    fn request_idr_frame(&self, display_id: u32) -> PyResult<()> {
+        self.send(ThreadCommand::RequestIdr { display_id })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to request IDR: {}", e)))?;
         Ok(())
     }
 
-    /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the running capture.
-    fn update_rate(&self, bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64>) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::UpdateRate { bitrate_kbps, vbv_multiplier, fps })
+    /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the given display's
+    /// running capture.
+    #[pyo3(signature = (bitrate_kbps = None, vbv_multiplier = None, fps = None, display_id = 0))]
+    fn update_rate(&self, bitrate_kbps: Option<i32>, vbv_multiplier: Option<f64>, fps: Option<f64>, display_id: u32) -> PyResult<()> {
+        self.send(ThreadCommand::UpdateRate { display_id, bitrate_kbps, vbv_multiplier, fps })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to update rate: {}", e)))?;
         Ok(())
+    }
+
+    /// Set the seat's BASE xkb layout from RMLVO names at runtime (empty strings select the
+    /// xkbcommon defaults). Returns whether the layout compiled and was applied; overlay binds
+    /// rebuild on top with their keycodes unchanged.
+    #[pyo3(signature = (layout, variant = String::new(), options = String::new(), model = String::new(), rules = String::new()))]
+    fn set_xkb_layout(
+        &self,
+        py: Python<'_>,
+        layout: String,
+        variant: String,
+        options: String,
+        model: String,
+        rules: String,
+    ) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::SetXkbLayout { rules, model, layout, variant, options, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set layout: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Resolve `keysyms` to `(keycode, level)` pairs against the seat keymap, overlay-binding
+    /// every keysym the base cannot produce. Binding N new keysyms costs ONE keymap swap, and a
+    /// keycode currently held down is never rebound. `(0, 0)` marks an unbindable keysym.
+    fn bind_keysyms(&self, py: Python<'_>, keysyms: Vec<u32>) -> PyResult<Vec<(u32, u32)>> {
+        let n = keysyms.len();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Vec<(u32, u32)>>();
+        self.send(ThreadCommand::BindKeysyms { keysyms, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to bind keysyms: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or_else(|_| vec![(0, 0); n]))
+    }
+
+    /// Debug/verification readback of the seat keyboard: `(pressed_keycodes, modifier_mask)`
+    /// with mask bits 1 ctrl, 2 shift, 4 alt, 8 logo, 16 caps, 32 num, 64 altgr, 128 level5.
+    fn get_keyboard_state(&self, py: Python<'_>) -> PyResult<(Vec<u32>, u32)> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(Vec<u32>, u32)>();
+        self.send(ThreadCommand::GetKeyboardState { reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to read keyboard state: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or_default())
+    }
+
+    /// The capture geometry actually live on the given display: `(width, height, scale)` in
+    /// physical pixels. Reflects any degrade a `start_capture` performed (H.264 even-masking,
+    /// GBM allocation failure keeping the previous mode), and the command channel is FIFO, so
+    /// calling this after `start_capture` returns what that start realized.
+    #[pyo3(signature = (display_id = 0))]
+    fn get_realized_geometry(&self, py: Python<'_>, display_id: u32) -> PyResult<(i32, i32, f64)> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(i32, i32, f64)>();
+        self.send(ThreadCommand::CuGetInfo { display_id, resp: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to read geometry: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or((0, 0, 0.0)))
     }
 }
 
 impl WaylandBackend {
-    fn update_tunables(&self, t: LiveTunables) -> PyResult<()> {
-        self.tx
-            .send(ThreadCommand::UpdateTunables(t))
+    fn update_tunables(&self, display_id: u32, t: LiveTunables) -> PyResult<()> {
+        self.send(ThreadCommand::UpdateTunables { display_id, tunables: t })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to update tunables: {}", e)))?;
         Ok(())
     }
+}
+
+/// The optional `display_id` attribute on a settings object (absent/invalid = 0, the
+/// primary display).
+fn read_display_id(settings: &Bound<'_, PyAny>) -> u32 {
+    settings
+        .getattr("display_id")
+        .ok()
+        .and_then(|v| v.extract::<u32>().ok())
+        .unwrap_or(0)
 }
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -3210,7 +4463,7 @@ fn stripe_frame_from_buffer(
     stripe_height: i32,
     frame_id: i32,
 ) -> StripeFrame {
-    StripeFrame::new_owned_meta(data, data_type, stripe_y_start, stripe_height, frame_id)
+    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id)
 }
 
 /// Capture configuration read by `start_capture` (each field by attribute name via
@@ -3218,6 +4471,8 @@ fn stripe_frame_from_buffer(
 /// can stash extra attributes not listed here.
 #[pyclass(dict)]
 struct CaptureSettings {
+    /// Wayland display key this capture binds to (0 = primary output); ignored on X11.
+    #[pyo3(get, set)] display_id: u32,
     #[pyo3(get, set)] capture_width: i32,
     #[pyo3(get, set)] capture_height: i32,
     #[pyo3(get, set)] scale: f64,
@@ -3263,6 +4518,8 @@ struct CaptureSettings {
     #[pyo3(get, set)] use_wayland: Py<PyAny>,
     /// H.264 recording tap: a Unix socket path to bind, or empty for none.
     #[pyo3(get, set)] recording_socket: Py<PyAny>,
+    /// Wayland display of an EXTERNAL compositor to capture (host-capture mode).
+    #[pyo3(get, set)] wayland_host_display: Py<PyAny>,
     /// Compositor cursor-theme size in pixels; <=0 keeps the theme default (24).
     #[pyo3(get, set)] cursor_size: i32,
     /// Longest cursor edge the X11 out-of-band cursor callback delivers; larger
@@ -3275,6 +4532,7 @@ impl CaptureSettings {
     #[new]
     fn new(py: Python<'_>) -> Self {
         Self {
+            display_id: 0,
             capture_width: 1920, capture_height: 1080, scale: 1.0, capture_x: 0, capture_y: 0,
             target_fps: 60.0, jpeg_quality: 85, paint_over_jpeg_quality: 95,
             use_paint_over_quality: false, paint_over_trigger_frames: 10,
@@ -3289,13 +4547,42 @@ impl CaptureSettings {
             auto_adjust_screen_capture_size: false, omit_stripe_headers: false,
             encode_node_path: py.None(),
             render_node_path: py.None(), auto_gpu: py.None(), use_wayland: py.None(),
-            recording_socket: py.None(), cursor_size: -1, cursor_size_cap: 32,
+            recording_socket: py.None(), wayland_host_display: py.None(),
+            cursor_size: -1, cursor_size_cap: 32,
         }
     }
 }
 
 /// Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
 static WAYLAND_BACKEND: OnceLock<Mutex<Option<Py<WaylandBackend>>>> = OnceLock::new();
+/// The compositor's auto-picked socket name (e.g. "wayland-1"), published by the compositor
+/// thread once its listening socket exists. `ListeningSocketSource::new_auto` binds the first
+/// FREE wayland-N, which need not match any configured index — consumers must read the real
+/// name from here instead of assuming one.
+static WAYLAND_SOCKET_NAME: Mutex<Option<String>> = Mutex::new(None);
+static WAYLAND_SOCKET_CV: Condvar = Condvar::new();
+
+fn publish_socket_name(name: &str) {
+    *WAYLAND_SOCKET_NAME.lock().unwrap() = Some(name.to_string());
+    WAYLAND_SOCKET_CV.notify_all();
+}
+
+/// Wait (bounded) for the compositor thread to publish its socket name.
+fn wait_socket_name(timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut g = WAYLAND_SOCKET_NAME.lock().unwrap();
+    loop {
+        if let Some(name) = g.as_ref() {
+            return Some(name.clone());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let (gg, _) = WAYLAND_SOCKET_CV.wait_timeout(g, deadline - now).unwrap();
+        g = gg;
+    }
+}
 /// Cursor callback registered before the backend exists (selkies registers it pre-start);
 /// applied when the backend is created, which is deferred to capture start so the real
 /// render node (not a placeholder) reaches the compositor.
@@ -3304,16 +4591,25 @@ static PENDING_CURSOR_CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
 /// threads must never attach to a finalizing interpreter (aborts the process pre-3.13).
 /// Cleared by a fresh capture start (only a live interpreter can start one).
 pub(crate) static PY_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// ScreenCapture id that owns the active shared Wayland capture (0 = none). Only the owner may
-/// stop it, so an input-only or stale instance can't tear down a live capture.
-static WAYLAND_OWNER: AtomicU64 = AtomicU64::new(0);
-/// Real Wayland capture liveness (StartCapture -> true, StopCapture -> false), mirrored
-/// from AppState.is_capturing so the Python-facing is_capturing() reports whether the
-/// pipeline is actually running, not merely which ScreenCapture owns the backend.
-static WAYLAND_CAPTURE_ALIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Hands each `ScreenCapture` a unique, monotonic id — the token `WAYLAND_OWNER` compares to
-/// decide which instance is allowed to stop the one shared compositor capture. Starts at 1 so 0 can
+/// Per-display capture ownership: display id -> the ScreenCapture id that owns that
+/// display's capture. Only the owner may stop it, so an input-only or stale instance can't
+/// tear down a live capture.
+static WAYLAND_OWNERS: OnceLock<Mutex<std::collections::HashMap<u32, u64>>> = OnceLock::new();
+
+fn wayland_owners() -> &'static Mutex<std::collections::HashMap<u32, u64>> {
+    WAYLAND_OWNERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Display ids whose capture pipeline is actually running (StartCapture inserts,
+/// StopCapture/DestroyOutput remove), so the Python-facing is_capturing() reports pipeline
+/// liveness, not merely which ScreenCapture owns the backend.
+static WAYLAND_ALIVE_DISPLAYS: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+
+fn wayland_alive() -> &'static Mutex<std::collections::HashSet<u32>> {
+    WAYLAND_ALIVE_DISPLAYS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+/// Hands each `ScreenCapture` a unique, monotonic id — the token `WAYLAND_OWNERS` compares to
+/// decide which instance is allowed to stop a display's capture. Starts at 1 so 0 can
 /// mean "no owner".
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 /// Registry of every live X11 capture's `Controls`, so the atexit sweep can flag them all to
@@ -3357,22 +4653,23 @@ pub(crate) fn boost_thread_priority(nice: libc::c_int) {
 /// Forward a live rate change to the shared Wayland backend (no-op if none is running).
 fn wayland_update_rate(
     py: Python<'_>,
+    display_id: u32,
     bitrate_kbps: Option<i32>,
     vbv_multiplier: Option<f64>,
     fps: Option<f64>,
 ) {
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
-            let _ = be.bind(py).borrow().update_rate(bitrate_kbps, vbv_multiplier, fps);
+            let _ = be.bind(py).borrow().update_rate(bitrate_kbps, vbv_multiplier, fps, display_id);
         }
     }
 }
 
 /// Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
-fn wayland_update_tunables(py: Python<'_>, t: LiveTunables) {
+fn wayland_update_tunables(py: Python<'_>, display_id: u32, t: LiveTunables) {
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
-            let _ = be.bind(py).borrow().update_tunables(t);
+            let _ = be.bind(py).borrow().update_tunables(display_id, t);
         }
     }
 }
@@ -3457,6 +4754,14 @@ fn want_wayland(settings: &Bound<'_, PyAny>) -> bool {
 struct ScState {
     /// 0 = idle, 1 = X11, 2 = Wayland.
     backend: u8,
+    /// This capture holds one reference on the shared X11 cursor monitor. Set in
+    /// the same locked section as `backend = 1` and TAKEN in the same locked
+    /// section a stop reads the backend, so acquire/release pair exactly per
+    /// capture — inferring the reference from `backend` alone would let a stop
+    /// that interleaves with a start release a reference not yet taken (leaking
+    /// the monitor once the acquire lands). The GIL happens to serialize that
+    /// window today; the pairing must not depend on it.
+    cursor_ref: bool,
     controls: Option<Arc<crate::x11::Controls>>,
     handle: Option<thread::JoinHandle<()>>,
     cap_thread_id: Option<thread::ThreadId>,
@@ -3477,6 +4782,8 @@ struct ScState {
     /// self-joining.
     deliver_handle: Option<thread::JoinHandle<()>>,
     deliver_thread_id: Option<thread::ThreadId>,
+    /// The Wayland display id this instance's capture is bound to (backend == 2).
+    wl_display: u32,
 }
 
 /// Unified capture handle exposed to Python. Drives the X11 capture directly or delegates to the
@@ -3499,7 +4806,7 @@ impl ScreenCapture {
     /// GIL across the joins would deadlock. A re-entrant stop arriving on the capture, encode, or
     /// deliver thread cannot join itself, so it detaches and lets the threads exit on the stop flag.
     fn stop_internal(&self, py: Python<'_>) -> PyResult<()> {
-        let (handle, deliver_handle, same_thread, backend, controls) = {
+        let (handle, deliver_handle, same_thread, backend, controls, wl_display, cursor_ref) = {
             let mut st = self.inner.lock().unwrap();
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
@@ -3519,27 +4826,37 @@ impl ScreenCapture {
             let handle = st.handle.take();
             let deliver_handle = st.deliver_handle.take();
             let backend = st.backend;
+            let cursor_ref = std::mem::take(&mut st.cursor_ref);
+            let wl_display = st.wl_display;
             st.backend = 0;
             st.cap_thread_id = None;
             st.encode_thread_id = None;
             st.encode_tid_rx = None;
             st.deliver_thread_id = None;
-            (handle, deliver_handle, same, backend, controls)
+            st.wl_display = 0;
+            (handle, deliver_handle, same, backend, controls, wl_display, cursor_ref)
         };
         if let Some(c) = &controls {
             live_x11().lock().unwrap().retain(|x| !Arc::ptr_eq(x, c));
         }
-        if backend == 1 {
+        if cursor_ref {
             crate::x11::cursor::release(py);
         }
         if backend == 2 {
-            if WAYLAND_OWNER
-                .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
+            let did = wl_display;
+            let owned = {
+                let mut owners = wayland_owners().lock().unwrap();
+                if owners.get(&did) == Some(&self.id) {
+                    owners.remove(&did);
+                    true
+                } else {
+                    false
+                }
+            };
+            if owned {
                 if let Some(slot) = WAYLAND_BACKEND.get() {
                     if let Some(be) = slot.lock().unwrap().as_ref() {
-                        let _ = be.bind(py).borrow().stop_capture();
+                        let _ = be.bind(py).borrow().stop_capture(did);
                     }
                 }
             }
@@ -3574,6 +4891,7 @@ impl ScreenCapture {
             id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
             inner: Mutex::new(ScState {
                 backend: 0,
+                cursor_ref: false,
                 controls: None,
                 handle: None,
                 cap_thread_id: None,
@@ -3581,6 +4899,7 @@ impl ScreenCapture {
                 encode_tid_rx: None,
                 deliver_handle: None,
                 deliver_thread_id: None,
+                wl_display: 0,
             }),
         }
     }
@@ -3602,10 +4921,14 @@ impl ScreenCapture {
         callback: Py<PyAny>,
         settings: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        let display_id = read_display_id(settings);
         let live_wayland_restart = want_wayland(settings)
-            && self.inner.lock().unwrap().backend == 2
-            && WAYLAND_OWNER.load(Ordering::Relaxed) == self.id
-            && WAYLAND_CAPTURE_ALIVE.load(Ordering::Acquire);
+            && {
+                let st = self.inner.lock().unwrap();
+                st.backend == 2 && st.wl_display == display_id
+            }
+            && wayland_owners().lock().unwrap().get(&display_id) == Some(&self.id)
+            && wayland_alive().lock().unwrap().contains(&display_id);
         if !live_wayland_restart {
             self.stop_internal(py)?;
         }
@@ -3637,8 +4960,12 @@ impl ScreenCapture {
                 cursor_size,
             )?;
             be.bind(py).borrow().start_capture(callback, settings)?;
-            WAYLAND_OWNER.store(self.id, Ordering::Relaxed);
-            self.inner.lock().unwrap().backend = 2;
+            wayland_owners().lock().unwrap().insert(display_id, self.id);
+            {
+                let mut st = self.inner.lock().unwrap();
+                st.backend = 2;
+                st.wl_display = display_id;
+            }
             return Ok(());
         }
 
@@ -3767,8 +5094,12 @@ impl ScreenCapture {
                 None
             }
         };
+        // Take the monitor reference BEFORE publishing the capture: a stop that
+        // observes this capture must always find the reference it is to release.
+        crate::x11::cursor::acquire(cursor_cap);
         let mut st = self.inner.lock().unwrap();
         st.backend = 1;
+        st.cursor_ref = true;
         st.controls = Some(controls);
         st.handle = Some(handle);
         st.cap_thread_id = tid;
@@ -3777,7 +5108,6 @@ impl ScreenCapture {
         st.deliver_handle = Some(deliver_handle);
         st.deliver_thread_id = Some(deliver_thread_id);
         drop(st);
-        crate::x11::cursor::acquire(cursor_cap);
         Ok(())
     }
 
@@ -3786,9 +5116,9 @@ impl ScreenCapture {
     }
 
     fn request_idr_frame(&self, py: Python<'_>) -> PyResult<()> {
-        let (backend, controls) = {
+        let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
-            (st.backend, st.controls.clone())
+            (st.backend, st.controls.clone(), st.wl_display)
         };
         match backend {
             1 => {
@@ -3799,7 +5129,7 @@ impl ScreenCapture {
             2 => {
                 if let Some(slot) = WAYLAND_BACKEND.get() {
                     if let Some(be) = slot.lock().unwrap().as_ref() {
-                        let _ = be.bind(py).borrow().request_idr_frame();
+                        let _ = be.bind(py).borrow().request_idr_frame(did);
                     }
                 }
             }
@@ -3813,9 +5143,9 @@ impl ScreenCapture {
     /// On the X11 path the dirty flag is Release-published after the payload store, so the encode
     /// thread's Acquire read can never observe the flag set against a stale bitrate.
     fn update_video_bitrate(&self, py: Python<'_>, kbps: i32) -> PyResult<()> {
-        let (backend, controls) = {
+        let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
-            (st.backend, st.controls.clone())
+            (st.backend, st.controls.clone(), st.wl_display)
         };
         match backend {
             1 => {
@@ -3824,16 +5154,16 @@ impl ScreenCapture {
                     c.rate_dirty.store(true, Ordering::Release);
                 }
             }
-            2 => wayland_update_rate(py, Some(kbps), None, None),
+            2 => wayland_update_rate(py, did, Some(kbps), None, None),
             _ => {}
         }
         Ok(())
     }
 
     fn update_framerate(&self, py: Python<'_>, fps: f64) -> PyResult<()> {
-        let (backend, controls) = {
+        let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
-            (st.backend, st.controls.clone())
+            (st.backend, st.controls.clone(), st.wl_display)
         };
         match backend {
             1 => {
@@ -3842,7 +5172,7 @@ impl ScreenCapture {
                     c.rate_dirty.store(true, Ordering::Release);
                 }
             }
-            2 => wayland_update_rate(py, None, None, Some(fps)),
+            2 => wayland_update_rate(py, did, None, None, Some(fps)),
             _ => {}
         }
         Ok(())
@@ -3850,9 +5180,9 @@ impl ScreenCapture {
 
     /// Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
     fn update_vbv_multiplier(&self, py: Python<'_>, multiplier: f64) -> PyResult<()> {
-        let (backend, controls) = {
+        let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
-            (st.backend, st.controls.clone())
+            (st.backend, st.controls.clone(), st.wl_display)
         };
         match backend {
             1 => {
@@ -3862,7 +5192,7 @@ impl ScreenCapture {
                     c.rate_dirty.store(true, Ordering::Release);
                 }
             }
-            2 => wayland_update_rate(py, None, Some(multiplier), None),
+            2 => wayland_update_rate(py, did, None, Some(multiplier), None),
             _ => {}
         }
         Ok(())
@@ -3874,9 +5204,9 @@ impl ScreenCapture {
     fn update_tunables(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let rs = extract_settings(settings)?;
         let t = LiveTunables::from_settings(&rs);
-        let (backend, controls) = {
+        let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
-            (st.backend, st.controls.clone())
+            (st.backend, st.controls.clone(), st.wl_display)
         };
         match backend {
             1 => {
@@ -3887,7 +5217,7 @@ impl ScreenCapture {
                 }
                 crate::x11::cursor::set_size_cap(rs.cursor_size_cap);
             }
-            2 => wayland_update_tunables(py, t),
+            2 => wayland_update_tunables(py, did, t),
             _ => {}
         }
         Ok(())
@@ -3924,8 +5254,8 @@ impl ScreenCapture {
                 .as_ref()
                 .map(|c| !c.stop.load(Ordering::Relaxed))
                 .unwrap_or(false),
-            2 => WAYLAND_OWNER.load(Ordering::Relaxed) == self.id
-                && WAYLAND_CAPTURE_ALIVE.load(Ordering::Acquire),
+            2 => wayland_owners().lock().unwrap().get(&st.wl_display) == Some(&self.id)
+                && wayland_alive().lock().unwrap().contains(&st.wl_display),
             _ => false,
         }
     }
@@ -3935,6 +5265,88 @@ impl ScreenCapture {
     }
     fn set_keymap_string(&self, py: Python<'_>, text: String) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_string(text))
+    }
+    /// Compositor apps run under (a nested labwc/kwin session pixelflux captures),
+    /// the target for Computer-Use text injection; selkies resolves it and hands it
+    /// over. Empty clears it. Stored process-wide since the CU server is per-process.
+    fn set_app_wayland_display(&self, display: String) {
+        crate::computer_use::set_app_wayland_display(
+            if display.is_empty() { None } else { Some(display) },
+        );
+    }
+    /// Type `text` through `display`'s zwp_virtual_keyboard_manager_v1 as a one-shot
+    /// client: selkies' text-injection path, targeting whichever compositor the apps
+    /// live under (the nested session's, or pixelflux's own in a direct session).
+    /// Blocking; releases the GIL for the duration. Raises
+    /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
+    fn type_text_wayland(&self, py: Python<'_>, display: String, text: String) -> PyResult<()> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::vkclient::type_text_to(&path, &text)
+        })
+        .map_err(|e: String| {
+            if e.contains("zwp_virtual_keyboard_manager_v1") {
+                VirtualKeyboardUnavailable::new_err(e)
+            } else {
+                pyo3::exceptions::PyRuntimeError::new_err(e)
+            }
+        })
+    }
+    /// Mimes the app compositor's current selection offers (empty = nothing copied).
+    fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
+        py.detach(move || {
+            crate::wayland::dcclient::list_types(&app_socket_path(&display)?)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// The app compositor selection's payload for `mime`, or None when nothing is
+    /// copied or the selection does not offer that mime.
+    fn clipboard_read_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        mime: String,
+    ) -> PyResult<Option<Py<pyo3::types::PyBytes>>> {
+        let data = py
+            .detach(move || crate::wayland::dcclient::read(&app_socket_path(&display)?, &mime))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(data.map(|d| pyo3::types::PyBytes::new(py, &d).unbind()))
+    }
+    /// Take the app compositor's selection, serving `entries` (mime, bytes) to
+    /// every paster from a background thread until another client copies.
+    fn clipboard_write_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::write(&app_socket_path(&display)?, entries))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Drop the app compositor's selection.
+    fn clipboard_clear_app(&self, py: Python<'_>, display: String) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::clear(&app_socket_path(&display)?))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Invoke `callback(mimes: list[str])` from a background thread on every
+    /// selection change in the app compositor (including the one current at call
+    /// time). A second watch for the same display replaces the first.
+    fn clipboard_watch_app(
+        &self,
+        py: Python<'_>,
+        display: String,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        py.detach(move || crate::wayland::dcclient::watch(&app_socket_path(&display)?, callback))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Stop the selection watch for `display` (no-op without one).
+    fn clipboard_unwatch_app(&self, py: Python<'_>, display: String) {
+        let _ = py.detach(move || {
+            crate::wayland::dcclient::unwatch(&app_socket_path(&display)?);
+            Ok::<(), String>(())
+        });
     }
     fn inject_mouse_move(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_move(x, y))
@@ -4004,6 +5416,93 @@ impl ScreenCapture {
             )),
         }
     }
+    /// Set the seat's BASE xkb layout from RMLVO names; false when no backend runs or the
+    /// layout fails to compile.
+    #[pyo3(signature = (layout, variant = String::new(), options = String::new(), model = String::new(), rules = String::new()))]
+    fn set_xkb_layout(
+        &self,
+        py: Python<'_>,
+        layout: String,
+        variant: String,
+        options: String,
+        model: String,
+        rules: String,
+    ) -> PyResult<bool> {
+        wayland_backend_running(py).map_or(Ok(false), |be| {
+            be.bind(py).borrow().set_xkb_layout(py, layout, variant, options, model, rules)
+        })
+    }
+    /// Resolve keysyms to `(keycode, level)` with batched overlay binding (one keymap swap
+    /// per call, held keycodes never rebound); all `(0, 0)` when no backend runs.
+    fn bind_keysyms(&self, py: Python<'_>, keysyms: Vec<u32>) -> PyResult<Vec<(u32, u32)>> {
+        let n = keysyms.len();
+        wayland_backend_running(py)
+            .map_or(Ok(vec![(0, 0); n]), |be| be.bind(py).borrow().bind_keysyms(py, keysyms))
+    }
+    /// Seat keyboard readback: `(pressed_keycodes, modifier_mask)`; empty when no backend runs.
+    fn get_keyboard_state(&self, py: Python<'_>) -> PyResult<(Vec<u32>, u32)> {
+        wayland_backend_running(py)
+            .map_or(Ok((Vec::new(), 0)), |be| be.bind(py).borrow().get_keyboard_state(py))
+    }
+    /// The capture geometry actually live on the given display `(width, height, scale)`;
+    /// `(0, 0, 0.0)` when no backend runs.
+    #[pyo3(signature = (display_id = 0))]
+    fn get_realized_geometry(&self, py: Python<'_>, display_id: u32) -> PyResult<(i32, i32, f64)> {
+        wayland_backend_running(py)
+            .map_or(Ok((0, 0, 0.0)), |be| be.bind(py).borrow().get_realized_geometry(py, display_id))
+    }
+    /// Create an additional Wayland output (see `WaylandBackend.create_output`); false when
+    /// no backend runs.
+    #[pyo3(signature = (id, width, height, x = 0, y = 0, scale = 1.0))]
+    fn create_output(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        scale: f64,
+    ) -> PyResult<bool> {
+        wayland_backend_running(py).map_or(Ok(false), |be| {
+            be.bind(py).borrow().create_output(py, id, width, height, x, y, scale)
+        })
+    }
+    /// Destroy a secondary Wayland output; false when no backend runs.
+    fn destroy_output(&self, py: Python<'_>, id: u32) -> PyResult<bool> {
+        wayland_backend_running(py)
+            .map_or(Ok(false), |be| be.bind(py).borrow().destroy_output(py, id))
+    }
+    /// Move a Wayland output (the primary included) to layout offset `(x, y)`; false when
+    /// no backend runs or the id is unknown.
+    fn reposition_output(&self, py: Python<'_>, id: u32, x: i32, y: i32) -> PyResult<bool> {
+        wayland_backend_running(py)
+            .map_or(Ok(false), |be| be.bind(py).borrow().reposition_output(py, id, x, y))
+    }
+    /// Recreate the Wayland cursor theme at `size` pixels (named-cursor callbacks and the
+    /// burned-in overlay); false when no backend runs or the size is non-positive.
+    fn set_cursor_size(&self, py: Python<'_>, size: i32) -> PyResult<bool> {
+        wayland_backend_running(py)
+            .map_or(Ok(false), |be| be.bind(py).borrow().set_cursor_size(py, size))
+    }
+    /// Every live Wayland output as `(id, x, y, width, height, scale, capturing)`; empty
+    /// when no backend runs.
+    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<(u32, i32, i32, i32, i32, f64, bool)>> {
+        wayland_backend_running(py)
+            .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_outputs(py))
+    }
+    /// Move a window onto an output (fullscreened there); false when no backend runs.
+    fn move_window_to_output(&self, py: Python<'_>, window_id: u32, output_id: u32) -> PyResult<bool> {
+        wayland_backend_running(py).map_or(Ok(false), |be| {
+            be.bind(py).borrow().move_window_to_output(py, window_id, output_id)
+        })
+    }
+    /// Every mapped window as `(window_id, title, app_id, output_id)`; empty when no
+    /// backend runs.
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32)>> {
+        wayland_backend_running(py)
+            .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_windows(py))
+    }
 }
 
 /// Best-effort teardown: flag the capture thread to exit without joining.
@@ -4021,11 +5520,96 @@ impl Drop for ScreenCapture {
     }
 }
 
+/// Build a Python dict from a recorder status snapshot (one shape for status and stop).
+fn recording_status_dict(py: Python<'_>, s: &crate::recorder::RecordingStatus) -> PyResult<Py<PyAny>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("active", s.active)?;
+    d.set_item("path", &s.path)?;
+    d.set_item("backend", s.backend)?;
+    d.set_item("mode", s.mode)?;
+    d.set_item("frames", s.frames)?;
+    d.set_item("sync_frames", s.sync_frames)?;
+    d.set_item("dropped", s.dropped)?;
+    d.set_item("skipped_non_h264", s.skipped_non_h264)?;
+    d.set_item("bytes", s.bytes)?;
+    d.set_item("duration_s", s.duration_s)?;
+    d.set_item("width", s.width)?;
+    d.set_item("height", s.height)?;
+    d.set_item("error", s.error.as_deref())?;
+    Ok(d.into_any().unbind())
+}
+
+/// Start the built-in MP4 recorder. Works with no capture and no client running: the
+/// recorder owns an independent capture (X11 root, or a Wayland output of the in-process
+/// compositor) and taps a live streaming session instead of restarting it. `settings` is an
+/// optional `CaptureSettings` for a recorder-owned capture (H.264 only; `display_id`
+/// selects the Wayland output); when omitted, `PIXELFLUX_RECORD_*` environment variables
+/// and full-screen defaults apply.
+#[pyfunction]
+#[pyo3(signature = (path, settings = None))]
+fn start_recording(
+    py: Python<'_>,
+    path: String,
+    settings: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let mut opts = crate::recorder::RecordOptions::from_env(path);
+    if let Some(s) = settings {
+        let rs = extract_settings(s)?;
+        if rs.output_mode != 1 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "recording requires H.264 capture settings (output_mode=1); JPEG cannot be recorded",
+            ));
+        }
+        opts.display_id = read_display_id(s);
+        if let Some(explicit) = s
+            .getattr("use_wayland")
+            .ok()
+            .and_then(|v| v.extract::<bool>().ok())
+        {
+            opts.backend = Some(if explicit {
+                crate::recorder::PreferredBackend::Wayland
+            } else {
+                crate::recorder::PreferredBackend::X11
+            });
+        }
+        // Explicit settings are authoritative over the env knobs they subsume.
+        opts.fps = 0.0;
+        opts.bitrate_kbps = 0;
+        opts.capture = Some(rs);
+    }
+    let status = py
+        .detach(|| crate::recorder::start(opts))
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+    recording_status_dict(py, &status)
+}
+
+/// Stop the active recording, finalize the MP4, and return the final status dict. Raises
+/// when no recording is active or nothing recordable was captured.
+#[pyfunction]
+fn stop_recording(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let status = py
+        .detach(crate::recorder::stop)
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+    recording_status_dict(py, &status)
+}
+
+/// Status of the live recording (or the last finished one); `None` if this process has
+/// never recorded.
+#[pyfunction]
+fn recording_status(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    match crate::recorder::status() {
+        Some(s) => recording_status_dict(py, &s),
+        None => Ok(py.None()),
+    }
+}
+
 /// Bring the Wayland compositor socket up before any capture so apps launched early can
 /// connect (sets WAYLAND_DISPLAY for children of this process). Idempotent; the running
 /// backend keeps its node/dimensions on later calls. `render_node` is an explicit
 /// /dev/dri/renderD* path; `auto_gpu` is a truthy string or vendor/driver token; empty
-/// values mean software rendering.
+/// values mean software rendering. Returns the compositor's actual socket name (the
+/// auto-picked `wayland-N`, which need not match any configured index); empty string only
+/// if the socket did not come up in time.
 #[pyfunction]
 #[pyo3(signature = (width = 0, height = 0, render_node = String::new(), auto_gpu = String::new(), cursor_size = -1))]
 fn ensure_wayland_display(
@@ -4035,9 +5619,19 @@ fn ensure_wayland_display(
     render_node: String,
     auto_gpu: String,
     cursor_size: i32,
-) -> PyResult<()> {
-    ensure_wayland_backend(py, width, height, render_node, auto_gpu, String::new(), cursor_size)
-        .map(|_| ())
+) -> PyResult<String> {
+    ensure_wayland_backend(py, width, height, render_node, auto_gpu, String::new(), cursor_size)?;
+    Ok(py
+        .detach(|| wait_socket_name(Duration::from_secs(5)))
+        .unwrap_or_default())
+}
+
+/// The running compositor's Wayland socket name (e.g. "wayland-1"), or None when no
+/// compositor thread has been started (this never creates one).
+#[pyfunction]
+fn get_wayland_display_name(py: Python<'_>) -> Option<String> {
+    wayland_backend_running(py)?;
+    py.detach(|| wait_socket_name(Duration::from_secs(2)))
 }
 
 /// Stop every live capture (registered with atexit) before interpreter finalization.
@@ -4051,6 +5645,9 @@ fn ensure_wayland_display(
 #[pyfunction]
 fn _stop_all_captures(py: Python<'_>) {
     PY_SHUTDOWN.store(true, Ordering::Relaxed);
+    // Finalize any active recording first so its last buffered MP4 sample is flushed and
+    // its own capture (if any) is stopped through the normal path.
+    py.detach(crate::recorder::finalize_on_exit);
     *PENDING_CURSOR_CALLBACK.lock().unwrap() = None;
     crate::x11::cursor::shutdown();
     if let Some(slot) = LIVE_X11.get() {
@@ -4060,16 +5657,52 @@ fn _stop_all_captures(py: Python<'_>) {
     }
     if let Some(slot) = WAYLAND_BACKEND.get() {
         if let Some(be) = slot.lock().unwrap().as_ref() {
-            let _ = be.bind(py).borrow().stop_capture();
+            let be = be.bind(py).borrow();
+            let mut displays: Vec<u32> =
+                wayland_alive().lock().unwrap().iter().copied().collect();
+            if !displays.contains(&0) {
+                displays.push(0);
+            }
+            for did in displays {
+                let _ = be.stop_capture(did);
+            }
+            // Wait (bounded) until the calloop finished processing the stops: dropping a
+            // hardware encoder session (NVENC/CUDA) mid-process-exit segfaults, so the
+            // interpreter must not finalize while that teardown is still running.
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+            if be.send(ThreadCommand::Barrier { reply: ack_tx }).is_ok() {
+                let _ = py.detach(move || ack_rx.recv_timeout(Duration::from_secs(2)));
+            }
         }
     }
-    WAYLAND_OWNER.store(0, Ordering::Relaxed);
-    WAYLAND_CAPTURE_ALIVE.store(false, Ordering::Relaxed);
+    wayland_owners().lock().unwrap().clear();
+    wayland_alive().lock().unwrap().clear();
     py.detach(|| std::thread::sleep(Duration::from_millis(50)));
 }
 
 /// The `pixelflux` Python module: registers the exported classes and functions, and hooks
 /// `_stop_all_captures` into `atexit` so every live capture is stopped before interpreter shutdown.
+/// Socket path for a Wayland display name, with the ABI methods' error shape.
+fn app_socket_path(display: &str) -> Result<String, String> {
+    crate::wayland::wlclient::socket_path(display)
+        .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())
+}
+
+pyo3::create_exception!(
+    pixelflux,
+    VirtualKeyboardUnavailable,
+    pyo3::exceptions::PyRuntimeError,
+    "The target compositor does not advertise zwp_virtual_keyboard_manager_v1."
+);
+
+/// Start the Computer-Use HTTP server: a bare port listens on all interfaces,
+/// `host:port` scopes it. Idempotent; the PIXELFLUX_CU env var remains the
+/// standalone fallback.
+#[pyfunction]
+fn start_computer_use(bind: String) {
+    crate::computer_use::start_cu_server(&bind);
+}
+
 #[pymodule]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WaylandBackend>()?;
@@ -4080,13 +5713,84 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("X11_CURSOR_CALLBACK", true)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
+    m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;
+    m.add_function(wrap_pyfunction!(start_recording, m)?)?;
+    m.add_function(wrap_pyfunction!(stop_recording, m)?)?;
+    m.add_function(wrap_pyfunction!(recording_status, m)?)?;
+    m.add_function(wrap_pyfunction!(start_computer_use, m)?)?;
+    m.add(
+        "VirtualKeyboardUnavailable",
+        m.py().get_type::<VirtualKeyboardUnavailable>(),
+    )?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
     if let Ok(atexit) = m.py().import("atexit") {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));
     }
+    // Standalone CU entry point: with PIXELFLUX_CU set the server binds at import, serving
+    // X11 (via DISPLAY) until a Wayland compositor registers itself as the backend.
+    crate::computer_use::spawn_cu_from_env();
+    // PIXELFLUX_RECORD=<path>: start recording from process start (X11 immediately, or as
+    // soon as the in-process Wayland compositor comes up).
+    crate::recorder::autostart_from_env();
 
 
     Ok(())
+}
+
+#[cfg(test)]
+mod output_overlap_tests {
+    //! Invariants of the output-placement intersection predicate: strict interior
+    //! intersection (touching edges never overlap), containment and identity overlap,
+    //! empty/negative rectangles never overlap, and extreme coordinates do not wrap.
+    use super::rects_overlap;
+
+    #[test]
+    fn disjoint_rects_do_not_overlap() {
+        assert!(!rects_overlap((0, 0, 100, 100), (200, 0, 100, 100)));
+        assert!(!rects_overlap((0, 0, 100, 100), (0, 200, 100, 100)));
+    }
+
+    #[test]
+    fn touching_edges_do_not_overlap() {
+        // Right edge of a meets left edge of b, and bottom meets top.
+        assert!(!rects_overlap((0, 0, 100, 100), (100, 0, 100, 100)));
+        assert!(!rects_overlap((0, 0, 100, 100), (0, 100, 100, 100)));
+        // Corner touch only.
+        assert!(!rects_overlap((0, 0, 100, 100), (100, 100, 50, 50)));
+    }
+
+    #[test]
+    fn one_pixel_intrusion_overlaps() {
+        assert!(rects_overlap((0, 0, 100, 100), (99, 0, 100, 100)));
+        assert!(rects_overlap((0, 0, 100, 100), (0, 99, 100, 100)));
+    }
+
+    #[test]
+    fn containment_and_identity_overlap() {
+        assert!(rects_overlap((0, 0, 100, 100), (25, 25, 10, 10)));
+        assert!(rects_overlap((25, 25, 10, 10), (0, 0, 100, 100)));
+        assert!(rects_overlap((5, 5, 50, 50), (5, 5, 50, 50)));
+    }
+
+    #[test]
+    fn empty_or_negative_rects_never_overlap() {
+        assert!(!rects_overlap((10, 10, 0, 50), (0, 0, 100, 100)));
+        assert!(!rects_overlap((10, 10, 50, 0), (0, 0, 100, 100)));
+        assert!(!rects_overlap((10, 10, -5, 5), (0, 0, 100, 100)));
+        assert!(!rects_overlap((0, 0, 100, 100), (10, 10, 0, 0)));
+    }
+
+    #[test]
+    fn negative_origins_overlap_correctly() {
+        assert!(rects_overlap((-50, -50, 100, 100), (0, 0, 100, 100)));
+        assert!(!rects_overlap((-100, -100, 100, 100), (0, 0, 100, 100)));
+    }
+
+    #[test]
+    fn extreme_coordinates_do_not_wrap() {
+        assert!(!rects_overlap((i32::MAX - 10, 0, 10, 10), (i32::MIN, 0, 10, 10)));
+        assert!(rects_overlap((i32::MAX - 10, 0, 10, 10), (i32::MAX - 5, 0, 10, 10)));
+    }
 }
 
 #[cfg(test)]

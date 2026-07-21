@@ -10,7 +10,11 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 wayland-server = { version = "0.31.10", features = ["dlopen"] }
-wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
 crossbeam-channel = "0.5"
 calloop = "0.14"
 turbojpeg = "1.3" 
@@ -31,7 +35,7 @@ libloading = "0.9"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image. Pure-Rust XCB; links the system libxcb.
-x11rb = { version = "0.13", features = ["shm", "xfixes"] }
+x11rb = { version = "0.13", features = ["shm", "xfixes", "xtest", "randr"] }
 image = "=0.25.9"
 # The crate's build.rs probes the FFmpeg found via pkg-config and emits
 # per-version cfgs; one crate version supports FFmpeg 3.0 UP TO the release it
