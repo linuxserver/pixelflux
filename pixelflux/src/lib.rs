@@ -3526,6 +3526,12 @@ fn run_wayland_thread(
                     state.cursor_callback_set = true;
                     if let Some(icon) = state.current_cursor_icon.clone() {
                         state.send_cursor_image(&icon);
+                    } else {
+                        // No client has set a cursor yet. The render path treats
+                        // None as the default theme cursor, so the first consumer
+                        // must receive that same sprite instead of a blank pointer
+                        // until the first client cursor event.
+                        state.send_cursor_image(&CursorImageStatus::Named(Default::default()));
                     }
                 }
                 ThreadCommand::KeyboardKey { scancode, state: key_state_val } => {
